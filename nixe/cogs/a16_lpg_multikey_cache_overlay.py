@@ -1,102 +1,118 @@
-import os, io, asyncio, logging
+#!/usr/bin/env python3
+# a16_lpg_multikey_cache_overlay.py (v13b)
+# Fix: no starred list-unpack inside list literal (Py syntax error). Now uses list() safely.
+# Behavior:
+#   - Uses single sticky thread via lpg_thread_guard
+#   - Edits one pinned message in-place (no thread/message spam)
+#   - No side effects at import; starts on_ready
+#   - Cancels background task on cog unload
+
+import os, asyncio, logging, re
+from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 
-from nixe.helpers import lpg_cache
-from nixe.helpers import sticky_board
-from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes
+from nixe.helpers.lpg_thread_guard import ensure_sticky_thread, ensure_single_pinned
 
-ENABLE = os.getenv("LPG_OVERLAY_ENABLE","1") == "1"
-LUCKY_PULL_GUARD_CHANNELS = [int(x) for x in (os.getenv("LUCKY_PULL_GUARD_CHANNELS","").split(',') if os.getenv("LUCKY_PULL_GUARD_CHANNELS") else [])]
-REDIRECT_CHANNEL_ID = int(os.getenv("LPG_REDIRECT_CHANNEL_ID","0") or "0")
-DEL_THRESHOLD = float(os.getenv("LPG_DELETE_THRESHOLD","0.85"))
-REDIR_THRESHOLD = float(os.getenv("LPG_REDIRECT_THRESHOLD","0.70"))
-GEM_THRESHOLD = float(os.getenv("GEMINI_LUCKY_THRESHOLD","0.75"))
+MARKER = "<nixe:lpg:cache:v1>"
+UPDATE_SEC = int(os.getenv("LPG_CACHE_REFRESH_SEC", "900"))  # 15m default
 
-class LuckyPullMultiKeyOverlay(commands.Cog):
+def _mask_tail(s: str, n: int = 4) -> str:
+    s = (s or "").strip()
+    return ("*" * max(0, len(s) - n)) + s[-n:]
+
+def _split_multi(val: str):
+    if not val:
+        return []
+    return [p for p in re.split(r"[\s,;|]+", val.strip()) if p]
+
+def _gather_gemini_keys():
+    keys = []
+    keys += _split_multi(os.getenv("GEMINI_API_KEY", ""))
+    keys += _split_multi(os.getenv("GEMINI_API_KEY_B", ""))
+    raw = os.getenv("GEMINI_KEYS", "").strip()
+    if raw:
+        if raw.startswith("["):
+            try:
+                import json as _json
+                arr = _json.loads(raw)
+                keys += [str(x).strip() for x in arr if str(x).strip()]
+            except Exception:
+                pass
+        else:
+            keys += [s.strip() for s in raw.split(",") if s.strip()]
+    # dedupe while keeping order
+    seen = set()
+    uniq = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    return uniq
+
+def _collect_state() -> str:
+    keys = _gather_gemini_keys()
+    models = os.getenv("GEMINI_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash")
+    order = os.getenv("LPG_PROVIDER_ORDER", "gemini,groq")
+    img_order = os.getenv("LPG_IMAGE_PROVIDER_ORDER", order)
+    cool = os.getenv("GEMINI_COOLDOWN_SEC", "600")
+    timeout = os.getenv("GEMINI_TIMEOUT_MS", "20000")
+    retries = os.getenv("GEMINI_MAX_RETRIES", "2")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    masked = ", ".join([f"**{_mask_tail(k)}**" for k in keys]) if keys else "none"
+    lines = [
+        f"**Lucky Pull Cache Snapshot**  ·  `{ts}`",
+        "",
+        f"- Provider order: `{order}` (image: `{img_order}`)",
+        f"- Models: `{models}`",
+        f"- Keys: {len(keys)} -> {masked}",
+        f"- Cooldown: `{cool}s` | Timeout: `{timeout}ms` | Retries: `{retries}`",
+        "",
+        "_Auto-updated. This message is edited in-place (no new messages/thread)._",
+    ]
+    return "\n".join(lines)
+
+class LPGMultiKeyCacheOverlay(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.board = sticky_board.StickyBoard(bot, "LPG_CACHE_THREAD_ID", "[LPG-STICKY]", "Lucky Pull Cache")
-        self._bg_task = self.bot.loop.create_task(self._periodic_board())
+        self._task = None
 
-    async def cog_unload(self):
+    def cog_unload(self):
         try:
-            self._bg_task.cancel()
+            if self._task and not self._task.done():
+                self._task.cancel()
         except Exception:
             pass
 
-    async def _periodic_board(self):
-        await self.bot.wait_until_ready()
-        while not self.bot.is_closed():
-            try:
-                lines = lpg_cache.debug_snapshot(40)
-                await self.board.update_lines(lines, footer="Cached last 24h; single sticky embed.")
-            except Exception as e:
-                logging.warning("[lpg_overlay] board update failed: %s", e)
-            await asyncio.sleep(30)
-
-    def _is_guarded_channel(self, ch_id: int) -> bool:
-        return ch_id in LUCKY_PULL_GUARD_CHANNELS if LUCKY_PULL_GUARD_CHANNELS else False
-
     @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if not ENABLE: return
-        if message.author.bot: return
-        ch: discord.abc.MessageableChannel = message.channel
-        if not hasattr(ch, "id"): return
-        if not self._is_guarded_channel(ch.id): return
-        if not message.attachments: return
+    async def on_ready(self):
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._ensure_and_loop())
 
-        # Take first image-like attachment
-        img_att = None
-        for a in message.attachments:
-            if (a.content_type or "").startswith("image"):
-                img_att = a; break
-        if not img_att: return
-
-        try:
-            b = await img_att.read()
-        except Exception:
+    async def _ensure_and_loop(self):
+        th = await ensure_sticky_thread(self.bot)
+        if not th:
+            logging.error("[lpg-cache] Unable to get/create sticky thread")
             return
-
-        # CACHE check first
-        hit = lpg_cache.get(b)
-        if hit:
-            score, provider = hit
-            await self._handle_action(message, score, f"cache:{provider}")
+        msg = await ensure_single_pinned(th, MARKER)
+        if not msg:
+            logging.error("[lpg-cache] Unable to pin cache sticky message")
             return
-
-        # Gemini classify with failover
+        # initial populate
         try:
-            res = await classify_lucky_pull_bytes(b, timeout_ms=int(os.getenv("GEMINI_TIMEOUT_MS","20000")))
+            await msg.edit(content=f"{MARKER}\n{_collect_state()}")
         except Exception as e:
-            logging.warning("[lpg] classify error: %s", e)
-            return
-        score = float(res.get("score", 0.0))
-        provider = str(res.get("provider", "gemini"))
-        lpg_cache.put(b, score, provider)
-        await self._handle_action(message, score, provider)
-
-    async def _handle_action(self, message: discord.Message, score: float, provider: str):
-        if score >= DEL_THRESHOLD:
-            # delete and optionally redirect warning/persona
-            try:
-                await message.delete()
-            except Exception:
-                pass
-            if REDIRECT_CHANNEL_ID:
-                try:
-                    ch = self.bot.get_channel(REDIRECT_CHANNEL_ID) or await self.bot.fetch_channel(REDIRECT_CHANNEL_ID)
-                    await ch.send(f"\u26a0\ufe0f Lucky Pull terdeteksi (score={score:.2f}, via {provider}). Post gambar seperti ini di channel khusus Lucky Pull ya.")
-                except Exception:
-                    pass
-        elif score >= REDIR_THRESHOLD:
-            if REDIRECT_CHANNEL_ID:
-                try:
-                    ch = self.bot.get_channel(REDIRECT_CHANNEL_ID) or await self.bot.fetch_channel(REDIRECT_CHANNEL_ID)
-                    await ch.send(f"\ud83d\udc49 Kemungkinan Lucky Pull (score={score:.2f}, via {provider}). Silakan lanjut di channel khusus.")
-                except Exception:
-                    pass
+            logging.warning("[lpg-cache] initial edit failed: %s", e)
+        # periodic refresh (lightweight, just env snapshot)
+        try:
+            while True:
+                await asyncio.sleep(UPDATE_SEC)
+                await msg.edit(content=f"{MARKER}\n{_collect_state()}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logging.warning("[lpg-cache] refresh failed: %s", e)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(LuckyPullMultiKeyOverlay(bot))
+    await bot.add_cog(LPGMultiKeyCacheOverlay(bot))

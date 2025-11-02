@@ -1,245 +1,191 @@
-# nixe/cogs/lucky_pull_auto.py — fix {channel} placeholder + remove extra pre-delay
-import os, time, json, random, re, logging, asyncio, discord
-from typing import Dict, List, Optional, Tuple
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import os, re, time, random, logging, asyncio
+from typing import Optional, List, Tuple, Dict
+import discord
 from discord.ext import commands
 
 _log = logging.getLogger(__name__)
 
-def _getenv(k,d=""): return os.getenv(k,d)
-def _csv(v): return [x.strip() for x in (v or "").split(",") if x.strip()]
+def _env(k: str, default: str = "") -> str:
+    v = os.getenv(k)
+    return str(v) if v is not None else default
 
-def _parse_float(v, default):
-    try: return float(str(v))
-    except Exception: return default
+def _csv_ids(v: str):
+    out=[]; 
+    for tok in (v or "").replace(" ","").split(","):
+        if tok.isdigit(): out.append(int(tok))
+    return out
 
-def _resolve_threshold(default=0.85):
+def _notice_ttl() -> int:
+    v = _env("LPG_PERSONA_NOTICE_TTL") or _env("LPA_PERSONA_NOTICE_TTL") or "10"
+    try: return max(3, int(v))
+    except: return 10
+
+def _resolve_thr(default: float = 0.85) -> float:
     for k in ("LPA_THRESHOLD_DELETE","GEMINI_LUCKY_THRESHOLD","LPG_LUCKY_THRESHOLD","GROQ_LUCKY_THRESHOLD","LPG_THRESHOLD_DELETE"):
         val = os.getenv(k)
-        if val is not None:
+        if val:
             try: return float(val)
-            except Exception: pass
+            except: pass
     return default
 
-def _expand_vars(text: str, author: discord.Member, channel: discord.abc.GuildChannel)->str:
-    """Replace placeholders for user/channel safely."""
+def _redirect_id() -> Optional[int]:
+    for k in ("LUCKYPULL_REDIRECT_CHANNEL_ID","LPG_REDIRECT_CHANNEL_ID","LPA_REDIRECT_CHANNEL_ID"):
+        v=os.getenv(k)
+        if v and v.isdigit(): return int(v)
+    return None
+
+async def _redirect_mention(bot: commands.Bot, guild: Optional[discord.Guild]) -> str:
+    rid=_redirect_id()
+    if not rid: return "#unknown"
+    ch=None
+    if guild: ch=guild.get_channel(rid)
+    if ch is None:
+        try: ch=await bot.fetch_channel(rid)
+        except: ch=None
+    return getattr(ch,"mention",f"<#{rid}>")
+
+_CHANNEL_TOKEN = re.compile(r"(?:<#\d+>|#\s*[^\s#]*ngobrol[^\s#]*|\bngobrol\b)", re.IGNORECASE)
+
+def _expand_vars(text: str, author: discord.Member, redir_channel: Optional[discord.abc.GuildChannel],
+                 fallback_channel: discord.abc.GuildChannel, redirect_mention: str) -> str:
     if not text: return text
-    out = text
-    user_mention = author.mention if author else "@user"
-    chan_mention = getattr(channel, "mention", "#channel")
-    chan_name = getattr(channel, "name", "channel")
-    parent = getattr(channel, "parent", None)
-    parent_mention = getattr(parent, "mention", chan_mention) if parent else chan_mention
+    out=str(text)
+    user_mention=getattr(author,"mention","@user")
+    chan = redir_channel or fallback_channel
+    chan_m=getattr(chan,"mention","#channel")
+    chan_name=getattr(chan,"name","channel")
+    parent=getattr(chan,"parent",None)
+    parent_m=getattr(parent,"mention",chan_m) if parent else chan_m
+    out=re.sub(r"\{\{\s*user\s*\}\}|\{\s*user\s*\}|<\s*user\s*>|\$user|\$USER|\{USER\}", user_mention, out, flags=re.I)
+    out=re.sub(r"\{\{\s*channel\s*\}\}|\{\s*channel\s*\}|<\s*channel\s*>|\$channel|\$CHANNEL|\{CHANNEL\}", chan_m, out, flags=re.I)
+    out=re.sub(r"\{\{\s*channel_name\s*\}\}|\{\s*channel_name\s*\}", chan_name, out, flags=re.I)
+    out=re.sub(r"\{\{\s*parent\s*\}\}|\{\s*parent\s*\}|<\s*parent\s*>|\{PARENT\}", parent_m, out, flags=re.I)
+    out=_CHANNEL_TOKEN.sub(redirect_mention, out)
+    if user_mention not in out and not re.search(rf"<@!?{getattr(author,'id',0)}>", out):
+        out=f"{user_mention} — {out}"
+    if redirect_mention not in out:
+        if re.search(r"<#\d+>", out): out=re.sub(r"<#\d+>", redirect_mention, out, count=1)
+        else:
+            sep="" if out.endswith((" ","…",".","!","?",":")) else " "
+            out=f"{out}{sep}{redirect_mention}"
+    return out
 
-    # user
-    out = re.sub(r"\{\{\s*user\s*\}\}|\{\s*user\s*\}|<\s*user\s*>|\$user|\$USER|\{USER\}", user_mention, out, flags=re.I)
-    # channel
-    out = re.sub(r"\{\{\s*channel\s*\}\}|\{\s*channel\s*\}|\$channel|\$CHANNEL|\{CHANNEL\}", chan_mention, out, flags=re.I)
-    out = re.sub(r"\{\{\s*channel_name\s*\}\}|\{\s*channel_name\s*\}", chan_name, out, flags=re.I)
-    # parent (for threads)
-    out = re.sub(r"\{\{\s*parent\s*\}\}|\{\s*parent\s*\}|\{PARENT\}", parent_mention, out, flags=re.I)
-    return out.strip()
-
-def _flatten_yandere(obj) -> Dict[str, List[str]]:
-    buckets = {"soft": [], "agro": [], "sharp": []}
-    def put(tone, arr):
-        if not isinstance(arr, list): return
-        for s in arr:
-            s = (s or "").strip()
-            if not s or s.lower() in {"user","username","name"}: continue
-            buckets.setdefault(tone, []).append(s)
+def _normalize_classifier_result(res) -> Tuple[float,str]:
     try:
-        if isinstance(obj, list):
-            put("soft", obj)
-        elif isinstance(obj, dict):
-            for key in ("lucky_pull","lucky","gacha","responses"):
-                if key in obj and isinstance(obj[key], (list, dict)):
-                    sub = _flatten_yandere(obj[key])
-                    for k,v in sub.items(): buckets.setdefault(k, []).extend(v)
-            for tone_key in ("soft","agro","sharp"):
-                put(tone_key, obj.get(tone_key))
+        if isinstance(res, dict):
+            prob=float(res.get("score") or res.get("prob") or res.get("p") or 0.0)
+            via=str(res.get("provider") or res.get("via") or "unknown")
+            return prob, via
+        if isinstance(res,(list,tuple)):
+            n=len(res)
+            if n>=4: return float(res[1]), str(res[2])
+            if n==3: return float(res[0]), str(res[1])
+            if n==2: return float(res[0]), str(res[1])
+            if n==1: return float(res[0]), "unknown"
+        return float(res), "unknown"
     except Exception:
-        pass
-    for k in list(buckets.keys()):
-        seen=set(); ded=[]
-        for s in buckets[k]:
-            if s not in seen: ded.append(s); seen.add(s)
-        buckets[k]=ded
-    return buckets
-
-def _load_persona_lines(path: str) -> Dict[str, List[str]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-        root = obj
-        if isinstance(obj, dict):
-            for key in ("yandere","YANDERE","persona","PERSONA","pool","POOL"):
-                if key in obj and isinstance(obj[key], (dict, list)):
-                    root = obj[key]; break
-        return _flatten_yandere(root)
-    except Exception:
-        return {"soft": [], "agro": [], "sharp": []}
+        return 0.0, "normalize_exception"
 
 class LuckyPullAuto(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot=bot
-        self.enabled=_getenv("LPA_ENABLE","1")=="1"
-        self.delete_on_match=_getenv("LPA_DELETE_ON_MATCH","1")=="1"
-        self.guard=set(_csv(_getenv("LPA_GUARD_CHANNELS","")))
-        self.thr=_resolve_threshold(0.85)
-        self.cool=int(_getenv("LPA_COOLDOWN_SEC","15") or 15)
-        self.exec_mode=_getenv("LPA_EXECUTION_MODE","provider_first")
-        self.defer=_getenv("LPA_DEFER_IF_PROVIDER_DOWN","1")=="1"
-        self.order=_getenv("LPA_PROVIDER_ORDER","gemini,groq")
-        self.kw_gate=_getenv("LPA_REQUIRE_TEXT_KEYWORD","0")=="1"
-
-        # Persona
-        self.persona_on = _getenv("LPG_PERSONA_ENABLE","1")=="1"
-        self.persona_path = _getenv("PERSONA_PROFILE_PATH", _getenv("YANDERE_TEMPLATE_PATH","nixe/config/personas/yandere.json"))
-        self._lines = _load_persona_lines(self.persona_path) if self.persona_on else {"soft": [],"agro":[],"sharp":[]}
-        self._tone_cycle=["soft","agro","sharp"]; self._tone_idx=0
-
-        # Providers
-        self.BR=None; self.H=None
+        self.enabled=_env("LPA_ENABLE","1")=="1"
+        self._ready_until=time.monotonic()+float(_env("LPA_STARTUP_GATE_SEC","1.5"))
+        self.thr=_resolve_thr(0.85)
+        self.ttl=_notice_ttl()
+        self.timeout_ms=int(_env("LUCKYPULL_GEM_TIMEOUT_MS","20000"))
+        self.providers=None
+        self._sem=asyncio.Semaphore(int(_env("LPG_CLASSIFY_CONCURRENCY","1") or "1"))
+        guards=_env("LUCKYPULL_GUARD_CHANNELS") or _env("LPG_GUARD_CHANNELS")
+        self.guard_channels=set(_csv_ids(guards))
+        self.redirect_id=_redirect_id()
+        self._lines={}
         try:
-            from nixe.helpers import lpa_provider_bridge as BR; self.BR=BR
+            from nixe.helpers.persona_loader import load_persona  # type: ignore
+            mode,data,path=load_persona()
+            payload=data.get(mode) if isinstance(data,dict) and mode in data else data
+            if isinstance(payload,dict):
+                for k,arr in payload.items():
+                    if isinstance(arr,list):
+                        self._lines[str(k).lower()]=[str(x) for x in arr if str(x).strip()]
         except Exception: pass
-        try:
-            from nixe.helpers import lpa_heuristics as H; self.H=H
-        except Exception: pass
+        self._tone_cycle=tuple(self._lines.keys()) or ("soft","agro","sharp")
+        self._tone_idx=0
 
-        # Startup wait (>10s), no per-message extra delay
+    def _is_guard(self, ch: discord.abc.GuildChannel) -> bool:
+        try: return int(ch.id) in self.guard_channels
+        except: return False
+
+    async def _classify(self, img_bytes: Optional[bytes], text=None) -> Tuple[float,str]:
         try:
-            self._startup_wait_sec = max(0, int(_getenv("LPA_STARTUP_WAIT_SEC","12") or "12"))
+            from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes as _bridge  # type: ignore
         except Exception:
-            self._startup_wait_sec = 12
-
-        # Non‑blocking provider controls — allow up to 15s provider time
-        self._provider_timeout_ms = int(_getenv("LPA_PROVIDER_TIMEOUT_MS","15000") or "15000")
-        self._provider_conc = max(1, int(_getenv("LPA_PROVIDER_CONCURRENCY","1") or "1"))
-        self._sem = asyncio.Semaphore(self._provider_conc)
-
-        self._t={}
-        self._ready_gate_until = time.monotonic() + 999999  # updated on_ready
-        _log.setLevel(logging.INFO)
-        _log.propagate = True
-
-    @commands.Cog.listener()
-    async def on_ready(self): 
-        self._ready_gate_until = time.monotonic() + float(self._startup_wait_sec)
-
-    def _in(self, ch) -> bool:
-        if not self.guard: return True
+            return 0.0, "classifier_unavailable"
+        if not img_bytes and not (text or ""):
+            return 0.0, "empty"
+        loop=asyncio.get_running_loop()
         try:
-            chid = str(getattr(ch, "id", ""))
-            parent_id = str(getattr(getattr(ch, "parent", None), "id", ""))
-            return (chid in self.guard) or (parent_id and parent_id in self.guard)
-        except Exception:
-            return False
-
-    def _ok(self, ch, au):
-        now=time.time(); k=(ch,au); last=self._t.get(k,0.0)
-        if now-last<self.cool: return False
-        self._t[k]=now; return True
-
-    def _collect_text(self, m: discord.Message)->str:
-        parts=[m.content or ""]
-        for e in m.embeds:
-            if e.title: parts.append(e.title)
-            if e.description: parts.append(e.description)
-            if e.url: parts.append(e.url)
-            if e.footer and e.footer.text: parts.append(e.footer.text)
-            for f in getattr(e, "fields", []) or []:
-                parts.append(f.name or ""); parts.append(f.value or "")
-        for a in m.attachments:
-            if a.filename: parts.append(a.filename)
-        return "\n".join(parts).strip()
-
-    async def _first_image_bytes(self, m: discord.Message):
-        for a in m.attachments:
-            ct = (getattr(a, "content_type", None) or "").lower()
-            name = (a.filename or "").lower()
-            looks_img = ct.startswith("image/") or name.endswith((".png",".jpg",".jpeg",".webp",".gif",".bmp"))
-            if looks_img:
-                try: return await a.read()
-                except Exception: continue
-        return None
-
-    async def _provider_call_to_thread(self, func, *args):
-        """Run blocking provider fn in thread with timeout to avoid heartbeat blocking."""
-        try:
-            timeout = max(0.3, self._provider_timeout_ms/1000.0)
-            return await asyncio.wait_for(asyncio.to_thread(func, *args), timeout=timeout)
+            def _call():
+                return _bridge(img_bytes, text=(text or ""), timeout_ms=self.timeout_ms, providers=self.providers)
+            fut=loop.run_in_executor(None, _call)
+            res=await asyncio.wait_for(fut, timeout=max(1.0, self.timeout_ms/1000.0))
         except asyncio.TimeoutError:
-            return (None, "timeout")
-        except Exception:
-            return (None, "provider_err")
+            _log.warning("[lpa] classify timeout after %dms", self.timeout_ms)
+            return 0.0, "timeout"
+        except Exception as e:
+            _log.warning("[lpa] classify exception: %r", e)
+            return 0.0, "exception"
+        return _normalize_classifier_result(res)
 
-    async def _classify(self, img_bytes: Optional[bytes], text: str) -> Tuple[Optional[float], str]:
-        if not self.BR:
-            return None, "no_bridge"
-        if img_bytes:
-            score, via = await self._provider_call_to_thread(self.BR.classify_with_image_bytes, img_bytes, self.order)
-            if isinstance(score, float): return score, via
-        score, via = await self._provider_call_to_thread(self.BR.classify, text, self.order)
-        if isinstance(score, float): return score, via
-        return None, via
-
-    def _pick_persona_line(self, author: discord.Member, channel: discord.abc.GuildChannel)->str:
-        mp = self._lines or {}
-        for _ in range(3):
+    def _pick_persona_line(self, author, channel, redir_channel, redir_mention) -> str:
+        mp=self._lines or {}
+        for _ in range(len(self._tone_cycle)):
             tone=self._tone_cycle[self._tone_idx % len(self._tone_cycle)]
-            self._tone_idx=(self._tone_idx+1)%len(self._tone_cycle)
+            self._tone_idx=(self._tone_idx+1) % max(1,len(self._tone_cycle))
             arr=mp.get(tone) or []
             if arr:
-                raw = random.choice(arr)
-                line = _expand_vars(raw, author, channel)
+                raw=random.choice(arr)
+                line=_expand_vars(raw, author, redir_channel, channel, redir_mention)
                 if line: return line
         any_lines=[s for v in mp.values() for s in (v or [])]
-        return _expand_vars(random.choice(any_lines), author, channel) if any_lines else ""
+        if any_lines:
+            raw=random.choice(any_lines)
+            return _expand_vars(raw, author, redir_channel, channel, redir_mention)
+        return _expand_vars("psst {user}… pindah ke {channel} ya~", author, redir_channel, channel, redir_mention)
 
     async def on_message_inner(self, m: discord.Message):
-        # Startup gate only
-        if time.monotonic() < self._ready_gate_until:
-            return
-
-        text=self._collect_text(m)
-
+        if time.monotonic() < self._ready_until: return
+        if not m.attachments and not m.embeds and not (m.content or "").strip(): return
+        img_bytes=None
+        try:
+            if m.attachments:
+                img_bytes=await m.attachments[0].read()
+        except Exception: img_bytes=None
         async with self._sem:
-            img_bytes = await self._first_image_bytes(m) if m.attachments else None
-            prob, via = await self._classify(img_bytes, text)
-
-        if prob is None:
-            _log.info(f"[lpa] classify: result=(deferred, --) thr={self.thr:.2f} via={via}")
-            return
-
-        label = "lucky" if prob >= self.thr else "not_lucky"
+            prob, via = await self._classify(img_bytes, m.content or "")
+        label="lucky" if prob >= self.thr else "not_lucky"
         _log.info(f"[lpa] classify: result=({label}, {prob:.3f}) thr={self.thr:.2f} via={via}")
-
-        if self.kw_gate and not m.attachments:
-            if self.H:
-                try:
-                    _, kw, _ = self.H.score_text_basic(text)
-                    if kw == 0: return
-                except Exception:
-                    return
-
-        if prob >= self.thr and self.delete_on_match:
-            try:
-                await m.delete()
-                _log.info(f"[lpa] fast-deleted a message in {m.channel.id} (reason=lucky pull)")
-            except Exception:
-                return
-            if self.persona_on:
-                line = self._pick_persona_line(m.author, m.channel)
-                if line:
-                    try: await m.channel.send(line)
-                    except Exception: pass
+        if label!="lucky": return
+        redir_mention=await _redirect_mention(self.bot, m.guild)
+        redir_channel=None
+        try:
+            if self.redirect_id:
+                redir_channel=await self.bot.fetch_channel(self.redirect_id)
+        except Exception: redir_channel=None
+        line=self._pick_persona_line(m.author, m.channel, redir_channel, redir_mention)
+        try: await m.channel.send(line, delete_after=self.ttl)
+        except Exception: pass
+        if _env("LUCKYPULL_DELETE_ON_GUARD","1")=="1":
+            try: await m.delete()
+            except Exception: pass
 
     @commands.Cog.listener()
     async def on_message(self, m: discord.Message):
-        if not self.enabled or not m.guild or m.author.bot: return
-        if not self._in(m.channel): return
-        if not self._ok(m.channel.id, m.author.id): return
+        if not self.enabled or m.author.bot or not m.guild: return
+        if not isinstance(m.channel, discord.TextChannel): return
+        if not self._is_guard(m.channel): return
         await self.on_message_inner(m)
 
 async def setup(bot: commands.Bot):

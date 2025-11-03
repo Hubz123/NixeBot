@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import os
+import json
 import os, re, time, random, logging, asyncio
 from typing import Optional, List, Tuple, Dict
 import discord
@@ -90,6 +92,69 @@ def _normalize_classifier_result(res) -> Tuple[float,str]:
 
 class LuckyPullAuto(commands.Cog):
     def __init__(self, bot: commands.Bot):
+        ##[LPA:ENV_PRECEDENCE] begin
+        def _read_ids(key):
+            v = os.getenv(key, "") or ""
+            ids = []
+            for s in v.split(","):
+                s = s.strip()
+                if s.isdigit():
+                    try: ids.append(int(s))
+                    except: pass
+            return ids
+
+        # Guards: union of all aliases
+        guards = set(_read_ids("LPG_GUARD_CHANNELS")) | set(_read_ids("LPA_GUARD_CHANNELS")) | set(_read_ids("LUCKYPULL_GUARD_CHANNELS"))
+        if guards:
+            self.guard_channels = tuple(sorted(guards))
+
+        # Redirect channel precedence
+        rid = os.getenv("LPA_REDIRECT_CHANNEL_ID") or os.getenv("LPG_REDIRECT_CHANNEL_ID") or os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or ""
+        try: self.redirect_channel_id = int(rid) if rid and str(rid).isdigit() else getattr(self, "redirect_channel_id", 0)
+        except: pass
+        self.redirect_id = getattr(self, "redirect_channel_id", 0)
+
+        # Provider order precedence
+        prov = (os.getenv("LPA_PROVIDER_ORDER") or os.getenv("LPG_PROVIDER_ORDER") or os.getenv("LP_PROVIDER_ORDER") or "gemini,groq")
+        self.providers = tuple([p.strip() for p in prov.split(",") if p.strip()])
+
+        # Threshold precedence
+        def _f(x, d=None):
+            try: return float(x)
+            except: return d
+        thr_del = _f(os.getenv("LPA_THRESHOLD_DELETE"), None)
+        if thr_del is None:
+            thr_del = _f(os.getenv("GEMINI_LUCKY_THRESHOLD"), None)
+        if thr_del is None:
+            thr_del = _f(os.getenv("LPG_GEMINI_THRESHOLD"), None)
+        self.thr = thr_del if thr_del is not None else getattr(self, "thr", 0.85)
+
+        # Timeout precedence (ms)
+        tms = (os.getenv("LPA_PROVIDER_TIMEOUT_MS") or os.getenv("LUCKYPULL_GEM_TIMEOUT_MS") or os.getenv("GEMINI_TIMEOUT_MS") or "20000")
+        try: self.timeout_ms = int(tms)
+        except: self.timeout_ms = getattr(self, "timeout_ms", 20000)
+
+        # Minimum image bytes (default 8192)
+        try: self.min_image_bytes = int(os.getenv("PHISH_MIN_IMAGE_BYTES", "8192"))
+        except: self.min_image_bytes = 8192
+        
+        # Negative keywords for FP guard (from config): LPG_NEGATIVE_TEXT
+        try:
+            _neg_src = os.getenv("LPG_NEGATIVE_TEXT", "").strip()
+            _neg_list = []
+            if _neg_src:
+                if (_neg_src.startswith("[") and _neg_src.endswith("]")):
+                    # JSON array
+                    _neg_list = [str(x).strip().lower() for x in json.loads(_neg_src) if str(x).strip()]
+                else:
+                    # comma/pipe/newline separated
+                    tmp = _neg_src.replace("|", ",").replace("\n", ",")
+                    _neg_list = [s.strip().lower() for s in tmp.split(",") if s.strip()]
+            self.neg_words = tuple(dict.fromkeys(_neg_list))
+        except Exception:
+            self.neg_words = tuple()
+        ##[LPA:ENV_PRECEDENCE] end
+        
         self.bot=bot
         self.enabled=_env("LPA_ENABLE","1")=="1"
         self._ready_until=time.monotonic()+float(_env("LPA_STARTUP_GATE_SEC","1.5"))
@@ -115,8 +180,17 @@ class LuckyPullAuto(commands.Cog):
         self._tone_idx=0
 
     def _is_guard(self, ch: discord.abc.GuildChannel) -> bool:
-        try: return int(ch.id) in self.guard_channels
-        except: return False
+        try:
+            # direct channel match
+            if int(getattr(ch, 'id', 0)) in self.guard_channels:
+                return True
+            # thread under a guarded parent channel
+            parent = getattr(ch, 'parent', None)
+            if parent and int(getattr(parent, 'id', 0)) in self.guard_channels:
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _classify(self, img_bytes: Optional[bytes], text=None) -> Tuple[float,str]:
         try:
@@ -127,9 +201,12 @@ class LuckyPullAuto(commands.Cog):
             return 0.0, "empty"
         try:
             # Call bridge directly; await if coroutine (async-friendly)
-            res = _bridge(img_bytes, text=(text or ""), timeout_ms=self.timeout_ms, providers=self.providers)
+            res = _bridge(img_bytes)
+            timeout_ms = int(os.getenv("LPA_PROVIDER_TIMEOUT_MS", os.getenv("LUCKYPULL_GEM_TIMEOUT_MS", "45000")))
             if hasattr(res, "__await__"):
-                res = await res
+                import asyncio
+                res = await asyncio.wait_for(res, timeout=timeout_ms/1000.0)
+
         except asyncio.TimeoutError:
             _log.warning("[lpa] classify timeout after %dms", self.timeout_ms)
             return 0.0, "timeout"
@@ -156,16 +233,32 @@ class LuckyPullAuto(commands.Cog):
 
     async def on_message_inner(self, m: discord.Message):
         if time.monotonic() < self._ready_until: return
-        if not m.attachments and not m.embeds and not (m.content or "").strip(): return
+        if not m.attachments: return  # image-only: ignore text-only or embed-only
         img_bytes=None
         try:
             if m.attachments:
                 img_bytes=await m.attachments[0].read()
+                if not img_bytes or len(img_bytes) < self.min_image_bytes:
+                    return
+                # require >= 8KB to avoid preview thumbnails
+                if not img_bytes or len(img_bytes) < 8192:
+                    return
+                if not img_bytes or len(img_bytes) < 2048:
+                    return  # too small to be reliable
         except Exception: img_bytes=None
         async with self._sem:
-            prob, via = await self._classify(img_bytes, m.content or "")
-        label="lucky" if prob >= self.thr else "not_lucky"
-        _log.info(f"[lpa] classify: result=({label}, {prob:.3f}) thr={self.thr:.2f} via={via}")
+            prob, via = await self._classify(img_bytes, None)
+        fname = ""
+        try:
+            fname = (m.attachments[0].filename or "").lower()
+        except Exception:
+            pass
+        # Use configured negatives (LPG_NEGATIVE_TEXT) to raise threshold
+        _neg = getattr(self, "neg_words", tuple())
+        _neg_hit = any((w in fname) for w in _neg) if _neg else False
+        eff_thr = self.thr + (0.05 if _neg_hit else 0.0)
+        label="lucky" if prob >= eff_thr else "not_lucky"
+        _log.info(f"[lpa] classify: result=({label}, {prob:.3f}) thr={eff_thr:.2f} via={via} neg_hit={_neg_hit} neg_words={len(_neg)} file={fname}")
         if label!="lucky": return
         redir_mention=await _redirect_mention(self.bot, m.guild)
         redir_channel=None
@@ -183,9 +276,28 @@ class LuckyPullAuto(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, m: discord.Message):
         if not self.enabled or m.author.bot or not m.guild: return
-        if not isinstance(m.channel, discord.TextChannel): return
-        if not self._is_guard(m.channel): return
+        ch = getattr(m, 'channel', None)
+        # Accept TextChannel or Thread; use parent of thread for guard check
+        try:
+            from discord import TextChannel, Thread
+            is_text = isinstance(ch, TextChannel)
+            is_thread = isinstance(ch, Thread)
+        except Exception:
+            is_text = hasattr(ch, 'id') and hasattr(ch, 'guild')
+            is_thread = hasattr(ch, 'parent') and getattr(ch, 'parent', None) is not None
+        if not (is_text or is_thread):
+            return
+        guard_ch = ch.parent if is_thread else ch
+        if not self._is_guard(guard_ch): return
         await self.on_message_inner(m)
+
+    @commands.Cog.listener('on_ready')
+    async def _on_ready(self):
+        try:
+            _log.warning('[lpa] ready guards=%s redirect=%s ttl=%ss',
+                          sorted(list(self.guard_channels)), self.redirect_id, self.ttl)
+        except Exception:
+            pass
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LuckyPullAuto(bot))

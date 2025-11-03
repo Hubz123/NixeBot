@@ -1,5 +1,5 @@
-
 #!/usr/bin/env python3
+# nixe/helpers/gemini_bridge.py (v16) — model sanitize + tiny-image guard + clearer 400 mapping
 import os, time, asyncio, logging, base64, re, json as _json
 from typing import Optional, Dict
 
@@ -13,20 +13,8 @@ _SEMA: Optional[asyncio.Semaphore] = None
 _STATE: Dict[str, Dict[str, float]] = {}
 
 def _split_keys(val: str):
-    return [p for p in re.split(r"[\s,;|]+", val.strip()) if p] if val else []
-
-def _load_list(name: str, default=None):
-    v = os.getenv(name)
-    if not v:
-        return default or []
-    v = v.strip()
-    if v.startswith("["):
-        try:
-            arr = _json.loads(v)
-            return [str(x).strip() for x in arr if str(x).strip()]
-        except Exception:
-            pass
-    return [s.strip() for s in v.split(",") if s.strip()]
+    import re as _re
+    return [p for p in _re.split(r"[\s,;|]+", val.strip()) if p] if val else []
 
 def _load_gemini_keys():
     keys = []
@@ -45,58 +33,71 @@ def _load_gemini_keys():
         return [s.strip() for s in raw.split(",") if s.strip()]
     return []
 
+def _sanitize_models(raw: str):
+    if not raw:
+        return []
+    models = []
+    raw = raw.strip()
+    if raw.startswith("["):
+        try:
+            arr = _json.loads(raw)
+            models = [str(x) for x in arr]
+        except Exception:
+            models = [raw]
+    else:
+        models = [s for s in re.split(r"[\s,]+", raw) if s]
+    cleaned = []
+    for m in models:
+        m = str(m).lower().strip()
+        m = re.sub(r"[^a-z0-9.\-_/]", "", m)
+        if m.startswith("models/"):
+            m = m[len("models/"):]
+        cleaned.append(m)
+    seen = set(); out = []
+    for m in cleaned:
+        if m and m not in seen:
+            seen.add(m); out.append(m)
+    return out
+
 def _sema(n: int) -> asyncio.Semaphore:
     global _SEMA
     if _SEMA is None:
         _SEMA = asyncio.Semaphore(max(1, n))
     return _SEMA
 
-def _now():
-    return time.time()
+def _now(): return time.time()
 
 def _pick_key(keys):
     now = _now()
     for k in keys:
-        st = _STATE.get(k) or {"cooldown_until": 0, "fail": 0}
+        st = _STATE.get(k) or {"cooldown_until": 0}
         if st.get("cooldown_until", 0) <= now:
             return k
     return None
 
 def _cooldown_key(key, seconds):
-    st = _STATE.setdefault(key, {"cooldown_until": 0, "fail": 0})
-    st["fail"] = st.get("fail", 0) + 1
+    st = _STATE.setdefault(key, {"cooldown_until": 0})
     st["cooldown_until"] = _now() + max(1, int(seconds))
-
-def _visible_tail(k):
-    return (k or "none")[-4:]
-
-def _get_models():
-    models = _load_list("GEMINI_MODELS", ["gemini-2.5-flash-lite", "gemini-2.5-flash"])
-    return models or ["gemini-2.5-flash-lite"]
 
 def _as_b64img(b):
     return {"mime_type": "image/jpeg", "data": base64.b64encode(b).decode("ascii")}
 
 def _negative_phrases():
-    defaults = [
-        "save data","card count","obtained equipment","loadout","deck","inventory",
-        "preset","save slot","stage select","quest","mission","profile","edit loadout"
-    ]
-    return [s.lower() for s in _load_list("LPG_NEGATIVE_TEXT", defaults)]
+    v = os.getenv("LPG_NEGATIVE_TEXT", "")
+    if v.startswith("["):
+        try: return [s.lower() for s in _json.loads(v)]
+        except Exception: pass
+    return [s.strip().lower() for s in v.split(",") if s.strip()]
 
 def _strict_prompt():
-    negatives = "; ".join(_negative_phrases())
+    negatives = "; ".join(_negative_phrases() or [])
     parts = [
-        "Task: Determine if the IMAGE is a gacha pull RESULT screen (e.g., Wish/Warp/10-pull results), not a loadout/deck/inventory screen.\n",
-        "Decide using these RULES:\n",
-        "1) Positive evidence required (at least ONE): overlays like 'Obtained', 'Result', 'Wish', 'Warp', 'x10 Pull', 'Tap to reveal/Skip', or a reveal/result panel showing newly acquired items/characters.\n",
-        "2) Hard negatives — if ANY of these words/phrases appear anywhere in the UI, it is NOT a pull result: ",
+        "Task: Determine if the IMAGE is a gacha pull RESULT screen (not loadout/deck/inventory).\n",
+        "Rules:\n",
+        "1) Positive evidence: overlays like 'Obtained', 'Result', 'Wish', 'Warp', 'x10 Pull', 'Skip/Tap to reveal', or a result panel for newly acquired items.\n",
+        "2) Hard negatives — if ANY of these appear anywhere, it is NOT a pull result: ",
         negatives + ".\n",
-        "3) Return output STRICTLY as compact JSON only (no prose): ",
-        "{\"ok\":true|false,\"score\":0..1,\"reason\":\"short_snake_case\"}\n",
-        "   - ok=true only if rule (1) is met and rule (2) is not triggered.\n",
-        "   - score is your confidence.\n",
-        "   - reason is a short label like has_obtained_overlay, loadout_ui, inventory_screen, uncertain.\n",
+        "Output JSON only: {\"ok\":true|false,\"score\":0..1,\"reason\":\"short\"}\n",
     ]
     return "".join(parts)
 
@@ -117,47 +118,48 @@ async def _gemini_call_image(img, api_key, model, timeout_ms):
         raise RuntimeError("gemini_timeout")
     except Exception as e:
         msg = str(e).lower()
+        if "unable to process input image" in msg or "invalid image" in msg:
+            raise RuntimeError("gemini_unprocessable_image")
         if ("429" in msg) or ("rate" in msg and "limit" in msg):
             raise RuntimeError("gemini_rate_limit")
         raise
-
-    # Extract JSON object from response text
     text = ""
-    try:
-        text = resp.text or ""
-    except Exception:
-        text = ""
-    # find first JSON-like block
-    start = text.find("{")
-    end = text.rfind("}")
+    try: text = resp.text or ""
+    except Exception: text = ""
+    start, end = text.find("{"), text.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return False, 0.0, "non_json_response"
-    blob = text[start:end+1]
     try:
-        data = _json.loads(blob)
+        data = _json.loads(text[start:end+1])
     except Exception:
         return False, 0.0, "json_parse_error"
-
     ok = bool(data.get("ok", False))
     score = float(data.get("score", 0.0))
     reason = str(data.get("reason", "uncertain"))
-
-    # Guard by negatives in reason text
     negs = _negative_phrases()
     if any(x in reason.lower() for x in negs):
         ok = False
     return ok, max(0.0, min(1.0, score)), reason
 
-async def classify_lucky_pull_bytes(img: bytes, timeout_ms: int = 20000, context: str = "lpg"):
+async def classify_lucky_pull_bytes(img: bytes, timeout_ms: int = None, context: str = "lpg"):
+    min_bytes = int(os.getenv("LPG_MIN_IMAGE_BYTES", "4096"))
+    if not img or len(img) < min_bytes:
+        ln = 0 if not img else len(img)
+        return {"ok": False, "score": 0.0, "provider": "gemini", "reason": f"image_too_small(len={ln})"}
+
     if context == "phish" and os.getenv("PHISH_PROVIDER", "groq").lower() == "groq":
         return {"ok": False, "score": 0.0, "provider": "gemini", "reason": "blocked_by_provider_policy"}
     keys = _load_gemini_keys()
     if not keys:
         return {"ok": False, "score": 0.0, "provider": "gemini", "reason": "no_api_key"}
-    models = _get_models()
+    raw_models = os.getenv("GEMINI_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash")
+    models = _sanitize_models(raw_models) or ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
     cooldown = int(os.getenv("GEMINI_COOLDOWN_SEC", "600"))
-    retries = int(os.getenv("GEMINI_MAX_RETRIES", "2"))
+    retries = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
     maxc = int(os.getenv("GEMINI_MAX_CONCURRENT", "1"))
+    tmo = int(timeout_ms or int(os.getenv("GEMINI_TIMEOUT_MS", "12000")))
+
+    logging.info("[gemini] models=%s", ",".join(models))
     async with _sema(maxc):
         err = None
         for attempt in range(retries + 1):
@@ -165,17 +167,22 @@ async def classify_lucky_pull_bytes(img: bytes, timeout_ms: int = 20000, context
             if not key:
                 return {"ok": False, "score": 0.0, "provider": "gemini", "reason": "all_keys_on_cooldown"}
             model = models[min(attempt, len(models) - 1)]
+            logging.info("[gemini] classify attempt=%s model=%s key=****%s", attempt, model, key[-4:])
             try:
-                ok, score, reason = await _gemini_call_image(img, key, model, timeout_ms)
+                ok, score, reason = await _gemini_call_image(img, key, model, tmo)
+                logging.info("[gemini] result ok=%s score=%.2f reason=%s", ok, score, reason)
                 return {"ok": bool(ok), "score": float(score), "provider": f"gemini:{model}", "reason": str(reason)}
             except RuntimeError as e:
                 msg = str(e)
                 if "gemini_rate_limit" in msg:
-                    logging.warning("[gemini] 429 on key ****%s -> cooldown=%ss", _visible_tail(key), cooldown)
+                    logging.warning("[gemini] 429 on key ****%s -> cooldown=%ss", key[-4:], cooldown)
                     _cooldown_key(key, cooldown); err = "429"; continue
                 if "gemini_timeout" in msg:
-                    logging.warning("[gemini] timeout on key ****%s", _visible_tail(key))
+                    logging.warning("[gemini] timeout key ****%s tmo=%sms", key[-4:], tmo)
                     err = "timeout"; continue
-                logging.warning("[gemini] error on key ****%s: %s", _visible_tail(key), msg)
+                if "gemini_unprocessable_image" in msg:
+                    logging.warning("[gemini] unprocessable image")
+                    err = "unprocessable_image"; break
+                logging.warning("[gemini] error key ****%s: %s", key[-4:], msg)
                 err = msg; continue
         return {"ok": False, "score": 0.0, "provider": f"gemini:{models[0]}", "reason": f"failed:{err or 'unknown'}"}

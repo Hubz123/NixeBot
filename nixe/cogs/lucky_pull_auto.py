@@ -107,6 +107,9 @@ class LuckyPullAuto(commands.Cog):
         guards = set(_read_ids("LPG_GUARD_CHANNELS")) | set(_read_ids("LPA_GUARD_CHANNELS")) | set(_read_ids("LUCKYPULL_GUARD_CHANNELS"))
         if guards:
             self.guard_channels = tuple(sorted(guards))
+        # Optional explicit guard thread ids
+        thr_union = set(_read_ids('LPG_GUARD_THREADS')) | set(_read_ids('LPG_GUARD_THREAD_IDS')) | set(_read_ids('LPG_GUARD_THREAD_CHANNELS'))
+        self.guard_threads = tuple(sorted(thr_union)) if thr_union else tuple()
 
         # Redirect channel precedence
         rid = os.getenv("LPA_REDIRECT_CHANNEL_ID") or os.getenv("LPG_REDIRECT_CHANNEL_ID") or os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or ""
@@ -240,11 +243,6 @@ class LuckyPullAuto(commands.Cog):
                 img_bytes=await m.attachments[0].read()
                 if not img_bytes or len(img_bytes) < self.min_image_bytes:
                     return
-                # require >= 8KB to avoid preview thumbnails
-                if not img_bytes or len(img_bytes) < 8192:
-                    return
-                if not img_bytes or len(img_bytes) < 2048:
-                    return  # too small to be reliable
         except Exception: img_bytes=None
         async with self._sem:
             prob, via = await self._classify(img_bytes, None)
@@ -300,4 +298,14 @@ class LuckyPullAuto(commands.Cog):
             pass
 
 async def setup(bot: commands.Bot):
+    await bot.add_cog(LuckyPullAuto(bot))
+
+
+async def setup(bot):
+    from discord.ext import commands as _cmds
+    try:
+        if bot.get_cog('LuckyPullAuto'):
+            return
+    except Exception:
+        pass
     await bot.add_cog(LuckyPullAuto(bot))

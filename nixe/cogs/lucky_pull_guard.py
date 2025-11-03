@@ -88,6 +88,7 @@ def _pick_tone(score: float, tone_env: str) -> str:
     if score >= 0.85: return "agro"
     return "soft"
 
+
 class LuckyPullGuard(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -104,9 +105,9 @@ class LuckyPullGuard(commands.Cog):
         self.provider_order = _provider_order()
         self.timeout_ms = _env_int_any("LUCKYPULL_GEM_TIMEOUT_MS", "LPA_PROVIDER_TIMEOUT_MS", default=20000)
 
-        self.persona_mode  = os.getenv("LPG_PERSONA_MODE", "yandere")
-        self.persona_tone  = os.getenv("LPG_PERSONA_TONE", "auto")
-
+        # Persona config
+        self.persona_mode = _env_str_any("LPG_PERSONA_MODE", default="soft")
+        self.persona_tone = _env_str_any("LPG_PERSONA_TONE", default="soft")
         self._persona_mode, self._persona_data, self._persona_path = None, {}, None
         try:
             if load_persona:
@@ -130,8 +131,10 @@ class LuckyPullGuard(commands.Cog):
                     self.whitelist_thread_name)
 
     def _is_guard_channel(self, channel: discord.abc.GuildChannel) -> bool:
-        try: return channel and int(channel.id) in self.guard_channels
-        except Exception: return False
+        try:
+            return channel and int(channel.id) in self.guard_channels
+        except Exception:
+            return False
 
     async def _persona_notify(self, message: discord.Message, score: float):
         tone = _pick_tone(score, self.persona_tone)
@@ -142,43 +145,53 @@ class LuckyPullGuard(commands.Cog):
 
         redirect_mention = f"<#{self.redirect_channel_id}>" if self.redirect_channel_id else f"#{message.channel.name}"
         user_mention = message.author.mention if self.mention else str(message.author)
-
-        # Apply placeholders first
-        text = (line.replace("{user}", user_mention)
-                    .replace("{user_name}", str(message.author))
-                    .replace("{channel}", redirect_mention)
-                    .replace("{channel_name}", f"#{message.channel.name}"))
-
-        # Then FORCE any '#ngobrol' / '<#...>' tokens to redirect mention without touching yandere.json
-        text = _CHANNEL_TOKEN.sub(redirect_mention, text)
-
+        text = f"{user_mention} {line}\n→ silakan post Lucky Pull di {redirect_mention}."
         try:
             await message.channel.send(text, reference=message, mention_author=self.mention)
         except Exception:
             await message.channel.send(text)
 
     async def _classify(self, img_bytes: bytes):
+        """Adapter kompatibel untuk bridge async/sync."""
         if classify_bytes is None:
             return False, 0.0, "none", "bridge_unavailable"
         try:
-            return await asyncio.get_event_loop().run_in_executor(
-                None, lambda: classify_bytes(img_bytes, timeout_ms=self.timeout_ms, providers=self.provider_order)
-            )
+            res = classify_bytes(img_bytes)
+            if hasattr(res, "__await__"):
+                res = await res
+            if isinstance(res, dict):
+                ok = bool(res.get("ok"))
+                score = float(res.get("score") or 0.0)
+                provider = str(res.get("provider") or "gemini")
+                reason = str(res.get("reason") or "")
+                return ok, score, provider, reason
+            elif isinstance(res, (tuple, list)) and len(res) >= 4:
+                ok, score, provider, reason = res[:4]
+                return bool(ok), float(score), str(provider), str(reason)
+            else:
+                return False, 0.0, "none", "invalid_return"
         except Exception as e:
             log.error("[lpg] classify error: %s", e)
-            return False, 0.0, "none", "exception"
+            return False, 0.0, "none", f"exception:{e.__class__.__name__}"
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if not self.enable or message.author.bot: return
-        if not self._is_guard_channel(getattr(message, "channel", None)): return
-        if not message.attachments: return
+        if not self.enable or message.author.bot:
+            return
+        if not self._is_guard_channel(getattr(message, "channel", None)):
+            return
+        if not message.attachments:
+            return
 
+        # First image only
         imgs = [a for a in message.attachments if (a.content_type or "").startswith("image/")]
-        if not imgs: return
+        if not imgs:
+            return
         first = imgs[0]
-        try: img_bytes = await first.read()
-        except Exception: return
+        try:
+            img_bytes = await first.read()
+        except Exception:
+            return
 
         ok, score, provider, reason = await self._classify(img_bytes)
         thr = _provider_threshold(provider)
@@ -191,37 +204,23 @@ class LuckyPullGuard(commands.Cog):
         # Persona notice first
         await self._persona_notify(message, score)
 
-        # Redirect: use singleton thread under redirect channel (no PHASH/DB involved)
+        # Redirect: just send to redirect channel/thread (no DB)
         if self.redirect_channel_id:
-            thread = await get_or_create_thread(
-                self.bot,
-                parent_channel_id=self.redirect_channel_id,
-                thread_name=self.whitelist_thread_name,
-                cache_env_key=self.whitelist_cache_env,
-                reason="Lucky Pull whitelist singleton"
-            )
-            target = thread if thread else (self.bot.get_channel(self.redirect_channel_id) or await self.bot.fetch_channel(self.redirect_channel_id))
-
-            files = []
-            for a in imgs:
-                try:
-                    if a.size and a.size > 0:
-                        b = await a.read()
-                        files.append(discord.File(io.BytesIO(b), filename=a.filename))
-                except Exception as e:
-                    log.warning("[lpg] read attach fail: %s", e)
-            desc = "Score **{:.3f}** via `{}`\nReason: {}".format(score, provider, reason)
-            content = (message.author.mention if self.mention else None)
             try:
-                if hasattr(target, "send"):
-                    await target.send(content=content, embed=discord.Embed(title="Lucky Pull", description=desc, color=0xFF66AA), files=files or None)
+                to_chan = message.guild.get_channel(self.redirect_channel_id) or await message.guild.fetch_channel(self.redirect_channel_id)
+                if to_chan:
+                    await to_chan.send(content=f"[redirected] from <#{message.channel.id}> by {message.author.mention}", file=await first.to_file())
+
             except Exception as e:
                 log.error("[lpg] forward failed: %s", e)
 
         # Delete original if policy says so
         if self.delete_on_guard:
-            try: await message.delete(delay=0)
-            except Exception as e: log.error("[lpg] delete failed: %s", e)
+            try:
+                await message.delete(delay=0)
+            except Exception as e:
+                log.error("[lpg] delete failed: %s", e)
+
 
 # IMPORTANT: use async setup & await add_cog if coroutine (fixes RuntimeWarning)
 async def setup(bot: commands.Bot):

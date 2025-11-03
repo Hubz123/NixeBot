@@ -125,12 +125,11 @@ class LuckyPullAuto(commands.Cog):
             return 0.0, "classifier_unavailable"
         if not img_bytes and not (text or ""):
             return 0.0, "empty"
-        loop=asyncio.get_running_loop()
         try:
-            def _call():
-                return _bridge(img_bytes, text=(text or ""), timeout_ms=self.timeout_ms, providers=self.providers)
-            fut=loop.run_in_executor(None, _call)
-            res=await asyncio.wait_for(fut, timeout=max(1.0, self.timeout_ms/1000.0))
+            # Call bridge directly; await if coroutine (async-friendly)
+            res = _bridge(img_bytes, text=(text or ""), timeout_ms=self.timeout_ms, providers=self.providers)
+            if hasattr(res, "__await__"):
+                res = await res
         except asyncio.TimeoutError:
             _log.warning("[lpa] classify timeout after %dms", self.timeout_ms)
             return 0.0, "timeout"

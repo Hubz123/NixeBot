@@ -1,2 +1,1 @@
-# nixe/__init__.py
-__all__ = []
+# nixe package marker

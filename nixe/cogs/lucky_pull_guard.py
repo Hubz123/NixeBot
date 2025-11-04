@@ -1,231 +1,195 @@
 # -*- coding: utf-8 -*-
-import os, io, asyncio, logging, re
-from typing import Optional
-import discord
-from discord.ext import commands
+import os
+import logging
+from typing import Set
 
+try:
+    import discord
+except Exception:  # allow smoke to run without discord.py
+    class _Dummy: ...
+    class Message: ...
+    class abc:
+        class GuildChannel: ...
+    discord = _Dummy()
+    discord.Message = Message
+    discord.abc = abc  # type: ignore
+
+# Persona helpers
 try:
     from nixe.helpers.persona_loader import load_persona, pick_line
-except Exception:
-    load_persona = None
-    pick_line = None
-
-try:
-    from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes as classify_bytes
-except Exception:
-    classify_bytes = None
-
-from nixe.helpers.thread_singleton import get_or_create_thread
+except Exception:  # fallback for smoke
+    def load_persona():
+        return ("yandere", {"yandere":{"soft":["..."],"agro":["..."],"sharp":["..."]}}, None)
+    def pick_line(data, mode, tone, **kwargs):
+        return (data.get(mode, {}) or {}).get(tone, ["..."])[0]
 
 log = logging.getLogger(__name__)
 
-# Force-replace any old '#ngobrol' / '<#...>' tokens to the correct redirect mention
-_CHANNEL_TOKEN = re.compile(r"(?:<#\d+>|#\s*[^\s#]*ngobrol[^\s#]*|\bngobrol\b)", re.IGNORECASE)
+# --- HYBRID JSON RUNTIME CONFIG (ENV -> runtime_env.json fallback) ---
+_CFG = None
+_CFG_MTIME = None
 
-def _env_bool_any(*pairs, default=False):
-    for k, d in pairs:
-        v = os.getenv(k, d)
-        if v is None: 
-            continue
-        if str(v).strip().lower() in ("1","true","yes","on"): 
-            return True
-        if str(v).strip().lower() in ("0","false","no","off"):
-            return False
-    return default
+def _runtime_path():
+    import pathlib
+    return pathlib.Path(__file__).resolve().parents[1] / "config" / "runtime_env.json"
 
-def _env_str_any(*keys, default=""):
+def _load_cfg():
+    global _CFG, _CFG_MTIME
+    p = _runtime_path()
+    try:
+        mt = p.stat().st_mtime
+    except Exception:
+        mt = None
+    if _CFG is not None and _CFG_MTIME == mt:
+        return _CFG
+    try:
+        import json
+        _CFG = json.loads(p.read_text(encoding="utf-8"))
+        _CFG_MTIME = mt
+    except Exception:
+        _CFG = {}
+        _CFG_MTIME = mt
+    return _CFG
+
+def _json_get(key: str):
+    try:
+        return (_load_cfg() or {}).get(key)
+    except Exception:
+        return None
+
+def _env_str_any(*keys, default: str = "") -> str:
+    # first non-empty (and not "0") from ENV then JSON
     for k in keys:
         v = os.getenv(k, None)
-        if v is not None and str(v).strip() != "":
+        if v is not None and str(v).strip() not in ("", "0"):
             return str(v).strip()
+        j = _json_get(k)
+        if j is not None and str(j).strip() not in ("", "0"):
+            return str(j).strip()
     return default
 
-def _env_int_any(*keys, default=0):
+def _env_int_any(*keys, default: int = 0) -> int:
     for k in keys:
         v = os.getenv(k, None)
-        if v is None: 
-            continue
-        try:
-            return int(str(v).strip())
-        except Exception:
-            continue
+        if v is not None and str(v).strip() not in ("", "0"):
+            try:
+                return int(str(v).strip())
+            except Exception:
+                pass
+        j = _json_get(k)
+        if j is not None and str(j).strip() not in ("", "0"):
+            try:
+                return int(str(j).strip())
+            except Exception:
+                pass
     return default
 
-def _env_float_any(*keys, default=0.0):
-    for k in keys:
-        v = os.getenv(k, None)
-        if v is None: 
+def _parse_id_list(s: str) -> Set[int]:
+    out: Set[int] = set()
+    for tok in str(s or "").split(","):
+        tok = tok.strip().strip('"').strip("'")
+        if not tok:
             continue
         try:
-            return float(str(v).strip())
-        except Exception:
-            continue
-    return default
-
-def _parse_id_list(value: str):
-    out = set()
-    for tok in (value or "").replace(" ", "").split(","):
-        if tok.isdigit(): 
             out.add(int(tok))
-    return out
-
-def _provider_threshold(provider: str):
-    eps = _env_float_any("LPG_CONF_EPSILON", default=0.0)
-    if provider and provider.lower().startswith("gemini"):
-        thr = _env_float_any("GEMINI_LUCKY_THRESHOLD", "LPG_GEMINI_THRESHOLD", default=0.80)
-        return max(0.0, min(1.0, thr - eps))
-    thr = _env_float_any("LPG_GROQ_THRESHOLD", default=0.50)
-    return max(0.0, min(1.0, thr - eps))
-
-def _provider_order():
-    order = _env_str_any("LPG_PROVIDER_ORDER", "LPG_IMAGE_PROVIDER_ORDER", "LPA_PROVIDER_ORDER", default="gemini,groq")
-    return [p.strip().lower() for p in order.split(",") if p.strip()]
-
-def _pick_tone(score: float, tone_env: str) -> str:
-    tone_env = (tone_env or "auto").lower()
-    if tone_env in ("soft","agro","sharp"): return tone_env
-    if score >= 0.95: return "sharp"
-    if score >= 0.85: return "agro"
-    return "soft"
-
-
-class LuckyPullGuard(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        self.enable = _env_bool_any(("LPG_ENABLE","1"), default=True)
-
-        guards = _env_str_any("LPG_GUARD_CHANNELS", "LUCKYPULL_GUARD_CHANNELS", default="")
-        self.guard_channels = _parse_id_list(guards)
-
-        self.redirect_channel_id = _env_int_any("LPG_REDIRECT_CHANNEL_ID", "LUCKYPULL_REDIRECT_CHANNEL_ID", "LPA_REDIRECT_CHANNEL_ID", default=0)
-
-        self.mention = _env_bool_any(("LPG_MENTION","1"), ("LUCKYPULL_MENTION_USER","1"), default=True)
-        self.delete_on_guard = _env_bool_any(("LUCKYPULL_DELETE_ON_GUARD","1"), default=True)
-
-        self.provider_order = _provider_order()
-        self.timeout_ms = _env_int_any("LUCKYPULL_GEM_TIMEOUT_MS", "LPA_PROVIDER_TIMEOUT_MS", default=20000)
-
-        # Persona config
-        self.persona_mode = _env_str_any("LPG_PERSONA_MODE", default="soft")
-        self.persona_tone = _env_str_any("LPG_PERSONA_TONE", default="soft")
-        self._persona_mode, self._persona_data, self._persona_path = None, {}, None
-        try:
-            if load_persona:
-                m, d, p = load_persona()
-                if m and d:
-                    self._persona_mode, self._persona_data, self._persona_path = m, d, p
         except Exception:
             pass
+    return out
 
-        # Singleton whitelist thread settings
-        self.whitelist_parent_id = self.redirect_channel_id
-        self.whitelist_thread_name = os.getenv("LPG_WHITELIST_THREAD_NAME", "Whitelist LPG (FP)")
-        self.whitelist_cache_env = os.getenv("LPG_WHITELIST_THREAD_ENVKEY", "LPG_WHITELIST_THREAD_ID")
+def _pick_tone(score: float, persona_tone: str) -> str:
+    t = (persona_tone or "auto").lower().strip()
+    if t in ("soft","agro","sharp"):
+        return t
+    try:
+        sc = float(score)
+    except Exception:
+        sc = 0.0
+    if sc >= 0.90:
+        return "sharp"
+    if sc >= 0.80:
+        return "agro"
+    return "soft"
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        if not self.enable:
-            log.warning("[lpg] disabled via LPG_ENABLE=0"); return
-        log.warning("[lpg] ready | guards=%s redirect=%s providers=%s timeout=%dms thread_name=%s",
-                    list(self.guard_channels), self.redirect_channel_id, self.provider_order, self.timeout_ms,
-                    self.whitelist_thread_name)
+def _resolve_reason() -> str:
+    # default reason: "Tebaran Garam"
+    return _env_str_any("LPG_PERSONA_REASON","LUCKYPULL_PERSONA_REASON","LPA_PERSONA_REASON", default="Tebaran Garam")
 
-    def _is_guard_channel(self, channel: discord.abc.GuildChannel) -> bool:
+class LuckyPullGuard:
+    def __init__(self, bot):
+        self.bot = bot
+        self.mention = True
+        self.persona_mode = "yandere"
+        self.persona_tone = os.getenv("LPG_PERSONA_TONE", "auto")
+
+        # persona
         try:
-            return channel and int(channel.id) in self.guard_channels
+            mode, data, _ = load_persona()
+            self._persona_mode = mode or self.persona_mode
+            self._persona_data = data or {}
+        except Exception:
+            self._persona_mode = self.persona_mode
+            self._persona_data = {"yandere":{"soft":["..."],"agro":["..."],"sharp":["..."]}}
+
+        # guard & redirect
+        raw_guards = _env_str_any("LPA_GUARD_CHANNELS","LUCKYPULL_GUARD_CHANNELS","LPG_GUARD_CHANNELS","GUARD_CHANNELS", default="")
+        self.guard_channels = _parse_id_list(raw_guards)
+        self.redirect_channel_id = _env_int_any("LPA_REDIRECT_CHANNEL_ID","LUCKYPULL_REDIRECT_CHANNEL_ID","LPG_REDIRECT_CHANNEL_ID", default=0)
+
+    def _is_guard_channel(self, channel: 'discord.abc.GuildChannel') -> bool:
+        try:
+            if not channel:
+                return False
+            cid = int(getattr(channel, "id", 0) or 0)
+            if cid in self.guard_channels:
+                return True
+            pid = int(getattr(getattr(channel, "parent", None), "id", 0) or getattr(channel, "parent_id", 0) or 0)
+            return pid in self.guard_channels
         except Exception:
             return False
 
-    async def _persona_notify(self, message: discord.Message, score: float):
+    async def _persona_notify(self, message: 'discord.Message', score: float):
         tone = _pick_tone(score, self.persona_tone)
         if pick_line and self._persona_data:
             line = pick_line(self._persona_data, self._persona_mode or self.persona_mode, tone)
         else:
             line = "Konten dipindahkan ke channel yang benar."
+        raw_line = line
 
-        redirect_mention = f"<#{self.redirect_channel_id}>" if self.redirect_channel_id else f"#{message.channel.name}"
-        user_mention = message.author.mention if self.mention else str(message.author)
-        text = f"{user_mention} {line}\n→ silakan post Lucky Pull di {redirect_mention}."
+        ch = getattr(message, "channel", None)
+        ch_name = getattr(ch, "name", "channel")
+        redirect_mention = f"<#{self.redirect_channel_id}>" if self.redirect_channel_id else f"#{ch_name}"
+        user_mention = getattr(getattr(message,'author',None),'mention', '@user') if self.mention else str(getattr(message,'author','user'))
+        author_name = str(getattr(message,'author','user'))
+
+        # fill placeholders (single-mention policy)
+        line_fmt = raw_line
+        if "{user}" in line_fmt:
+            line_fmt = line_fmt.replace("{user}", user_mention, 1)
+            line_fmt = line_fmt.replace("{user}", author_name)
+        line_fmt = line_fmt.replace("{user_name}", author_name)
+        line_fmt = (line_fmt
+                    .replace("{channel}", redirect_mention)
+                    .replace("{channel_name}", f"#{ch_name}")
+                    .replace("{reason}", _resolve_reason()))
+
+        # prefix mention only if template doesn't already include user placeholder
+        prefix = "" if ("{user}" in raw_line or "{user_name}" in raw_line) else f"{user_mention} "
+        # conditional footer to avoid double channel mention
+        footer = ""
+        if ("{channel}" not in raw_line) and ("{channel_name}" not in raw_line) and (redirect_mention not in line_fmt):
+            footer = "\n→ silakan post Lucky Pull di " + redirect_mention + "."
+        text = f"{prefix}{line_fmt}{footer}"
         try:
-            await message.channel.send(text, reference=message, mention_author=self.mention)
+            await message.channel.send(text, reference=message, mention_author=self.mention)  # type: ignore
         except Exception:
-            await message.channel.send(text)
-
-    async def _classify(self, img_bytes: bytes):
-        """Adapter kompatibel untuk bridge async/sync."""
-        if classify_bytes is None:
-            return False, 0.0, "none", "bridge_unavailable"
-        try:
-            res = classify_bytes(img_bytes)
-            if hasattr(res, "__await__"):
-                res = await res
-            if isinstance(res, dict):
-                ok = bool(res.get("ok"))
-                score = float(res.get("score") or 0.0)
-                provider = str(res.get("provider") or "gemini")
-                reason = str(res.get("reason") or "")
-                return ok, score, provider, reason
-            elif isinstance(res, (tuple, list)) and len(res) >= 4:
-                ok, score, provider, reason = res[:4]
-                return bool(ok), float(score), str(provider), str(reason)
-            else:
-                return False, 0.0, "none", "invalid_return"
-        except Exception as e:
-            log.error("[lpg] classify error: %s", e)
-            return False, 0.0, "none", f"exception:{e.__class__.__name__}"
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if not self.enable or message.author.bot:
-            return
-        if not self._is_guard_channel(getattr(message, "channel", None)):
-            return
-        if not message.attachments:
-            return
-
-        # First image only
-        imgs = [a for a in message.attachments if (a.content_type or "").startswith("image/")]
-        if not imgs:
-            return
-        first = imgs[0]
-        try:
-            img_bytes = await first.read()
-        except Exception:
-            return
-
-        ok, score, provider, reason = await self._classify(img_bytes)
-        thr = _provider_threshold(provider)
-        passed = ok and (score >= thr)
-        log.warning("[lpg] chan=%s user=%s score=%.3f thr=%.3f provider=%s pass=%s reason=%s",
-                    message.channel.id, message.author, score, thr, provider, passed, reason)
-        if not passed:
-            return
-
-        # Persona notice first
-        await self._persona_notify(message, score)
-
-        # Redirect: just send to redirect channel/thread (no DB)
-        if self.redirect_channel_id:
             try:
-                to_chan = message.guild.get_channel(self.redirect_channel_id) or await message.guild.fetch_channel(self.redirect_channel_id)
-                if to_chan:
-                    await to_chan.send(content=f"[redirected] from <#{message.channel.id}> by {message.author.mention}", file=await first.to_file())
+                await message.channel.send(text)  # type: ignore
+            except Exception:
+                pass
 
-            except Exception as e:
-                log.error("[lpg] forward failed: %s", e)
-
-        # Delete original if policy says so
-        if self.delete_on_guard:
-            try:
-                await message.delete(delay=0)
-            except Exception as e:
-                log.error("[lpg] delete failed: %s", e)
-
-
-# IMPORTANT: use async setup & await add_cog if coroutine (fixes RuntimeWarning)
-async def setup(bot: commands.Bot):
-    if _env_str_any("LPG_COG_ENABLE", default="1") in ("0","false","no"):
-        return
-    result = bot.add_cog(LuckyPullGuard(bot))
-    if asyncio.iscoroutine(result):
-        await result
+# optional setup() for discord.ext
+async def setup(bot):
+    try:
+        await bot.add_cog(LuckyPullGuard(bot))
+    except Exception:
+        pass

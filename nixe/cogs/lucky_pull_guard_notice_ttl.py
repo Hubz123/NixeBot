@@ -36,6 +36,29 @@ def _env_int_any(*keys, default=0):
             continue
     return default
 
+
+# --- reason resolver helpers (ENV -> runtime_env.json fallback) ---
+def _runtime_path():
+    import pathlib
+    return pathlib.Path(__file__).resolve().parents[1] / "config" / "runtime_env.json"
+def _json_get(key):
+    try:
+        import json, pathlib
+        p = _runtime_path()
+        return json.loads(p.read_text(encoding="utf-8")).get(key)
+    except Exception:
+        return None
+def _env_str_any(*keys, default=""):
+    import os
+    for k in keys:
+        v = os.getenv(k, None)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+        j = _json_get(k)
+        if j is not None and str(j).strip() != "":
+            return str(j).strip()
+    return default
+
 class LuckyPullGuard(_Base):  # type: ignore[misc]
     async def _persona_notify(self, message: discord.Message, score: float):
         # Build the same message as base, then delete after TTL if configured
@@ -48,6 +71,7 @@ class LuckyPullGuard(_Base):  # type: ignore[misc]
         channel_mention = f"<#{getattr(self, 'redirect_channel_id', 0)}>" if getattr(self, 'redirect_channel_id', 0) else f"#{message.channel.name}"
         user_mention = message.author.mention if getattr(self, "mention", True) else str(message.author)
         line = (line.replace("{user}", user_mention)
+                    .replace("{reason}", _env_str_any("LPG_PERSONA_REASON","LUCKYPULL_PERSONA_REASON","LPA_PERSONA_REASON", default="Tebaran Garam"))
                     .replace("{user_name}", str(message.author))
                     .replace("{channel}", channel_mention)
                     .replace("{channel_name}", f"#{message.channel.name}"))

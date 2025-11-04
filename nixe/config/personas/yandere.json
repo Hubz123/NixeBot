@@ -1,37 +1,66 @@
 {
-  "soft": [
-  "hei {user}~ salah kamar nih. taruhnya di {channel} ya, please 💙",
-  "hihi {user}, ini aku simpan dulu ya. next time ke {channel} ya sayang ✨",
-  "{user}, lucu banget—tapi pindah ke {channel} dulu ya ❤️",
-  "psst {user}… pamer yang ini di {channel} aja ya~",
-  "sayang {user}, biar rapi, drop-nya di {channel} ya 💫",
-  "eh {user}, ke {channel} dulu yuk. di sini bukan tempat gacha~",
-  "{user}, kasih lihatnya di {channel} ya. makasih manis 🫶",
-  "maaf ya {user}, mommy hapus dulu. terus pindah ke {channel} ya 🌸",
-  "ayo {user}, kita jaga channel ini. pamer di {channel} ya ✨",
-  "{user}, ikut aturan ya. upload ulang di {channel} 🤍",
-  "thanks {user}~ lanjutkan di {channel} ya, biar rapi 💖"
-],
-  "agro": [
-  "oi {user}. pamer gacha di sini? salah channel. ke {channel} sana.",
-  "{user}, baca nama channelnya. bukan buat lucky-pull. pindah ke {channel}.",
-  "hapus. {user}, kirim ke {channel} kalau mau pamer.",
-  "{user}… mau kuikat di {channel} atau gimana? next time di sana.",
-  "salah tempat lagi? {user} ke {channel}. sekarang.",
-  "{user}, stop spam. pindahkan ke {channel}.",
-  "jelas-jelas bukan tempatnya. {user}, ke {channel}.",
-  "{user}, aturan server jelas. gacha → {channel}. pindah."
+  "version": 3,
+  "persona": "nixe-yandere",
+  "locale": "id-ID",
+  "placeholders": [
+    "user",
+    "channel",
+    "reason"
   ],
-  "sharp": [
-  "{user}, nurut. Pindah ke {channel}. Sekarang.",
-  "{user}, aku yang tentukan tempatmu. Ke {channel}.",
-  "{user}, jangan uji sabarku. {channel}.",
-  "{user}, diam. Pindahkan ke {channel}.",
-  "{user}, patuhi aku. {channel}.",
-  "{user}, jangan bikin aku mengulang. {channel}.",
-  "{user}, jangan cari perhatian di sini. {channel}.",
-  "{user}, taati aturanku. {channel}.",
-  "{user}, cukup. {channel}.",
-  "{user}, tetap di tempat yang KUKATAKAN: {channel}."
-  ]
+  "select": {
+    "strategy": "random"
+  },
+  "groups": {
+    "soft": [
+      "eh {user}~ ❤️ ini salah kamar, ya. aku bereskan dulu supaya {channel} tetap rapi~ (alasan: {reason})",
+      "hai {user}… kiriman itu lebih cocok di channel khusus. aku hapus pelan-pelan ya~ (alasan: {reason})",
+      "ssst {user}, {channel} butuh rapi. aku bersihkan dulu ya~ (alasan: {reason})",
+      "demi ketertiban {channel}, postinganmu aku turunkan dengan lembut, oke? (alasan: {reason})",
+      "maaf ya {user}~ tolong pakai channel yang tepat lain kali. sekarang aku rapikan dulu. (alasan: {reason})",
+      "eh {user} sayang… itu untuk {channel} ya. aku rapikan dulu~ (alasan: {reason})",
+      "maaf ya {user}~ lain kali share-nya di {channel} supaya rapi. (alasan: {reason})",
+      "{user}, biar enak dibaca semua, pindah ke {channel} ya~ (alasan: {reason})",
+      "aku simpan yang ini dulu, {user}. tempatnya di {channel} yaa~ (alasan: {reason})",
+      "psst, {user}… {channel} lebih cocok. aku bantu arahkan ke sana~ (alasan: {reason})",
+      "{user} manis, tapi salah kamar. ke {channel} ya, aku udah bereskan. (alasan: {reason})",
+      "biar timeline estetik, {user} taruhnya di {channel} ya~ (alasan: {reason})",
+      "aku nggak marah kok, {user}. cuma pengen rapi. {channel} ya tempatnya~ (alasan: {reason})",
+      "makasih pengertiannya, {user}. yang ini sudah kubersihkan. {channel} next time~ (alasan: {reason})",
+      "eh lucu banget, {user}. taruhnya di {channel} ya biar nggak tenggelam~ (alasan: {reason})"
+    ],
+    "agro": [
+      "hei {user}—aturan itu ada untuk ditaati. ini salah tempat, aku bersihkan. (alasan: {reason})",
+      "{user}, {channel} bukan buat itu. kiriman di-take down sekarang. patuhi deskripsi channel. (alasan: {reason})",
+      "ups, salah kamar, {user}. sudah aku sapu. jangan diulang. (alasan: {reason})",
+      "ketertiban duluan, {user}. konten salah tempat = bersih. (alasan: {reason})",
+      "peringatan, {user}: gunakan channel yang sesuai. yang ini sudah kuhapus. (alasan: {reason})",
+      "{user}, pindah ke {channel}. sekarang. (alasan: {reason})",
+      "oi {user}. pamer gacha di sini? salah channel. ke {channel} sana.",
+      "jangan acak-acakan. {channel} untuk konten begitu, {user}. (alasan: {reason})",
+      "peraturan berlaku. {user} → {channel}. (alasan: {reason})",
+      "{user}… mau kuikat di {channel} atau gimana? next time di sana.",
+      "langsung ke {channel}, {user}. jangan ngeyel. (alasan: {reason})",
+      "salah tempat lagi? {user} ke {channel}. sekarang.",
+      "ulang lagi di {channel}, {user}. yang ini sudah diangkat. (alasan: {reason})",
+      "{user}, baca deskripsi. {channel} wadahnya. (alasan: {reason})",
+      "ingat aturan, {user}: {channel}. (alasan: {reason})"
+    ],
+    "sharp": [
+      "moderasi: kiriman off-topic dihapus. {user}, pindahkan ke kanal yang benar. (alasan: {reason})",
+      "aturan ditegakkan. kontenmu tidak sesuai {channel} → dihapus. (alasan: {reason})",
+      "hapus otomatis: {reason}. {user}, baca panduan channel.",
+      "notifikasi: pelanggaran tata letak. kiriman dibersihkan. (alasan: {reason})",
+      "{user}, kontenmu melenceng dari tema. sudah dihapus. gunakan kanal yang tepat. (alasan: {reason})",
+      "hapus: {reason}. {user} → {channel}.",
+      "moderasi: salah kanal. {user} ke {channel}. (alasan: {reason})",
+      "dibersihkan. gunakan {channel}. (alasan: {reason})",
+      "{user}, rute yang benar: {channel}. (alasan: {reason})",
+      "notifikasi: pindah ke {channel}. (alasan: {reason})",
+      "konten tak sesuai. sudah dihapus. {channel}. (alasan: {reason})",
+      "gunakan kanal tepat: {channel}. {user}. (alasan: {reason})",
+      "rapikan: {user} ke {channel}. (alasan: {reason})",
+      "geser ke {channel}. selesai. (alasan: {reason})",
+      "aturan ringkas: {channel} untuk konten ini. (alasan: {reason})"
+    ]
+  }
 }

@@ -1,87 +1,65 @@
-# -*- coding: utf-8 -*-
-"""
-a16_lpa_classifier_unpack_overlay_v2
-------------------------------------
-Hotfix yang *tidak mengubah* config/format lain:
-- Monkey‑patch LuckyPullAuto._classify() supaya SELALU mengembalikan (prob, via) dua‑tuple.
-- Menerima output bridge (4/3/2 tuple, dict, float) dan menormalkan.
-- Menerima argumen `text` **sebagai positional maupun keyword** (def _patched_classify(self, img_bytes, text=None)).
-"""
-from __future__ import annotations
 
-import asyncio
-import logging
-from typing import Any, Tuple
-
-log = logging.getLogger(__name__)
-
-def _to_prob_via(res: Any) -> Tuple[float, str]:
-    # dict
-    if isinstance(res, dict):
-        try: prob = float(res.get("score") or res.get("prob") or res.get("p") or 0.0)
-        except Exception: prob = 0.0
-        via  = str(res.get("provider") or res.get("via") or "unknown")
-        return prob, via
-    # tuple/list
-    if isinstance(res, (list, tuple)):
-        n = len(res)
-        if n >= 4:
-            # (ok, score, provider, reason)
-            try: return float(res[1]), str(res[2])
-            except Exception: return 0.0, "invalid_result"
-        if n == 3:
-            # (score, provider, reason)
-            try: return float(res[0]), str(res[1])
-            except Exception: return 0.0, "invalid_result"
-        if n == 2:
-            # (score, provider)
-            try: return float(res[0]), str(res[1])
-            except Exception: return 0.0, "invalid_result"
-        if n == 1:
-            # (score,)
-            try: return float(res[0]), "unknown"
-            except Exception: return 0.0, "invalid_result"
-    # single numeric
-    try:
-        return float(res), "unknown"
-    except Exception:
-        pass
-    return 0.0, "invalid_result"
+import logging, inspect, asyncio
+from discord.ext import commands
 
 async def setup(bot):
+    log = logging.getLogger(__name__)
     try:
         from nixe.cogs import lucky_pull_auto as _lpa
     except Exception as e:
-        log.warning("[lpa-unpack-v2] lucky_pull_auto not available: %r", e)
+        log.warning("[lpa-unpack-v2] setup: cannot import lucky_pull_auto: %r", e)
         return
 
+    # Resolve classifier function with fallback chain
+    _cls = None
     try:
-        from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes as _bridge
-    except Exception as e:
-        _bridge = None
-        log.warning("[lpa-unpack-v2] gemini bridge not available: %r", e)
+        from nixe.helpers.lpa_provider_bridge import classify_with_image_bytes as _cls  # sync
+        log.debug("[lpa-unpack-v2] using lpa_provider_bridge.classify_with_image_bytes")
+    except Exception as e1:
+        log.warning("[lpa-unpack-v2] provider bridge import failed: %r; trying gemini_bridge...", e1)
+        try:
+            from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes as _cls  # async
+            log.debug("[lpa-unpack-v2] fallback to gemini_bridge.classify_lucky_pull_bytes")
+        except Exception as e2:
+            log.warning("[lpa-unpack-v2] gemini bridge not available: %r", e2)
+            _cls = None
 
-    if not hasattr(_lpa, "LuckyPullAuto"):
-        log.warning("[lpa-unpack-v2] LuckyPullAuto class not found; no patch applied")
-        return
+    def _to_prob_via(res):
+        try:
+            if isinstance(res, tuple):
+                if len(res) >= 2 and isinstance(res[1], str):
+                    p = float(res[0]) if isinstance(res[0], (int, float)) else 0.0
+                    return max(0.0, min(1.0, p)), res[1]
+                if len(res) >= 1:
+                    p = float(res[0]) if isinstance(res[0], (int, float)) else 0.0
+                    return max(0.0, min(1.0, p)), "gemini"
+            if isinstance(res, dict):
+                p = float(res.get("score", 0.0))
+                via = str(res.get("provider") or res.get("via") or "gemini")
+                return max(0.0, min(1.0, p)), via
+            if isinstance(res, (int, float)):
+                p = float(res)
+                return max(0.0, min(1.0, p)), "gemini"
+        except Exception:
+            pass
+        return 0.0, "invalid"
 
     async def _patched_classify(self, img_bytes, text=None):
-        """Return exactly (prob, via) to match legacy call sites (supports positional `text`)."""
-        if _bridge is None:
+        if _cls is None:
             return 0.0, "classifier_unavailable"
-        loop = asyncio.get_running_loop()
         try:
-            def _call():
+            res = _cls(img_bytes)
+            if inspect.isawaitable(res):
                 timeout_ms = getattr(self, "timeout_ms", 20000)
-                providers = getattr(self, "providers", None)
-                return _bridge(img_bytes, text=text or "", timeout_ms=timeout_ms, providers=providers)
-            res = await loop.run_in_executor(None, _call)
+                try:
+                    res = await asyncio.wait_for(res, timeout_ms/1000.0)
+                except asyncio.TimeoutError:
+                    return 0.0, "timeout"
         except Exception as e:
             log.warning("[lpa-unpack-v2] bridge call failed: %r", e)
             return 0.0, "exception"
         try:
-            prob, via = _to_prob_via(res)
-            return float(prob), str(via)
+            return _to_prob_via(res)
         except Exception as e:
             log.warning("[lpa-unpack-v2] normalize failed: %r (res=%r)", e, res)
             return 0.0, "normalize_exception"

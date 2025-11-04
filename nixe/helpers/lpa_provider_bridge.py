@@ -68,3 +68,8 @@ def classify(text: str, order: str = ""):
             if isinstance(score, float): return score, f"{name}:{fn_name}"
             last = f"{name}:{status}"; break
     return None, last
+
+
+# Guarantee tuple return even in unexpected paths
+def _tuple_return(prob: Any, via: Any) -> Tuple[float, str]:
+    return _norm_prob(prob), str(via)

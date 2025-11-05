@@ -1,139 +1,131 @@
 
-import os
-import asyncio
-import logging
-import re
-import json
-import pathlib
+from __future__ import annotations
+import os, io, asyncio, logging, collections, contextlib
 import discord
 from discord.ext import commands
+from nixe.helpers.lp_gemini_helper import is_gemini_enabled
+from nixe.helpers.lp_gemini_async import is_lucky_pull_async
+from nixe.helpers.persona_gate import should_run_persona
 
-_log = logging.getLogger(__name__)
+log = logging.getLogger("nixe.cogs.lucky_pull_auto")
 
-# ---- Hybrid config (no format change) ----
-_CFG = None
-_CFG_MTIME = None
-def _cfg_path():
-    return pathlib.Path(__file__).resolve().parents[1] / "config" / "runtime_env.json"
-
-def _load_cfg():
-    global _CFG, _CFG_MTIME
-    p = _cfg_path()
-    try:
-        mt = p.stat().st_mtime
-    except Exception:
-        mt = None
-    if _CFG is None or mt != _CFG_MTIME:
+def _parse_id_list(v: str) -> list[int]:
+    if not v: return []
+    s = v.strip()
+    if s.startswith("[") and s.endswith("]"):
+        import json as _json
         try:
-            _CFG = json.loads(p.read_text(encoding="utf-8"))
+            arr = _json.loads(s)
+            return [int(x) for x in arr if str(x).isdigit()]
         except Exception:
-            _CFG = {}
-        _CFG_MTIME = mt
-    return _CFG
-
-def _env(k: str, d: str|None=None) -> str:
-    cfg = _load_cfg()
-    v = cfg.get(k, None)
-    if v is None or str(v) == "":
-        v = os.getenv(k, None)
-    return str(v) if v not in (None, "") else (d or "")
-
-def _parse_id_list(val: str) -> set[int]:
-    ids: set[int] = set()
-    for tok in re.split(r"[\s,]+", str(val or "")):
-        if not tok: continue
-        try: ids.add(int(tok))
-        except Exception: pass
-    return ids
-
-# ---- Gemini helper (no Groq here) ----
-try:
-    from nixe.helpers.lp_gemini_helper import is_lucky_pull, is_gemini_enabled
-except Exception:
-    def is_gemini_enabled() -> bool: return False
-    def is_lucky_pull(image_bytes: bytes, threshold: float = 0.65): return (False, 0.0, "helper_missing")
+            pass
+    return [int(x) for x in s.replace(" ","").split(",") if x.strip().isdigit()]
 
 class LuckyPullAuto(commands.Cog):
+    """High-throughput Lucky Pull guard with asyncio.Queue + workers"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.enabled = True
-        self.thr = float(_env("GEMINI_LUCKY_THRESHOLD", "0.75"))
-        raw = (_env("LPA_GUARD_CHANNELS","") or _env("LUCKYPULL_GUARD_CHANNELS","")
-               or _env("LPG_GUARD_CHANNELS","") or _env("GUARD_CHANNELS",""))
-        self.guard_channels = _parse_id_list(raw)
+        super().__init__()
+        self.thr = float(os.getenv("GEMINI_LUCKY_THRESHOLD","0.85"))
+        self.redirect_id = int(os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID","0") or "0")
+        self.guard_ids = set(_parse_id_list(os.getenv("LUCKYPULL_GUARD_CHANNELS","") or os.getenv("LPG_GUARD_CHANNELS","")))
+        self.delete_on_guard = True
+        self.strict_on_guard = os.getenv("LPG_STRICT_ON_GUARD","1") == "1"
+        # throughput
+        self._workers_n = int(os.getenv("LPG_CONCURRENCY","2"))
+        self._timeout_sec = float(os.getenv("LUCKYPULL_TIMEOUT_SEC","5"))
+        self._queue_max = int(os.getenv("LPG_QUEUE_MAX","32"))
+        self._queue: asyncio.Queue[discord.Message] = asyncio.Queue(maxsize=self._queue_max)
+        self._workers: list[asyncio.Task] = []
+        self._recent = collections.deque(maxlen=256)
+        self.bot.loop.create_task(self._bootstrap())
 
-    # Parent-aware guard test
-    def _is_guard_channel(self, channel):
+    async def _bootstrap(self):
+        await asyncio.sleep(0.2)
+        for i in range(max(1, self._workers_n)):
+            t = self.bot.loop.create_task(self._worker(i))
+            self._workers.append(t)
+        log.warning("[lpa] started %d workers | thr=%.2f timeout=%.1fs queue_max=%d",
+                    len(self._workers), self.thr, self._timeout_sec, self._queue_max)
+
+    def cog_unload(self):
+        for t in self._workers:
+            t.cancel()
+
+    def _is_guard_channel(self, ch: discord.abc.GuildChannel) -> bool:
+        return ch and int(getattr(ch,"id",0)) in self.guard_ids
+
+    async def _maybe_redirect(self, message: discord.Message):
+        if not self.redirect_id:
+            return
         try:
-            if not channel: return False
-            cid = int(getattr(channel, "id", 0) or 0)
-            if cid in self.guard_channels: return True
-            pid = int(getattr(getattr(channel, "parent", None), "id", 0) or getattr(channel, "parent_id", 0) or 0)
-            return pid in self.guard_channels
-        except Exception:
-            return False
+            ch = message.guild.get_channel(self.redirect_id) or await self.bot.fetch_channel(self.redirect_id)
+            mention = ch.mention if ch else f"<#{self.redirect_id}>"
+            await message.channel.send(
+                f"{message.author.mention}, silakan post Lucky Pull di {mention}.",
+                delete_after=10
+            )
+        except Exception as e:
+            log.debug("[lpa] redirect failed: %r", e)
 
-    async def _first_image_bytes(self, message: discord.Message) -> bytes:
+    async def _classify_lucky_bytes(self, img: bytes) -> tuple[bool,float,str]:
         try:
-            for att in getattr(message, 'attachments', []) or []:
-                name = (getattr(att, 'filename', '') or '').lower()
-                ctype = getattr(att, 'content_type', '') or ''
-                if ctype.startswith('image/') or name.endswith(('.png','.jpg','.jpeg','.webp','.gif')):
-                    try: return await att.read()
-                    except Exception: pass
-        except Exception:
-            pass
-        return b''
+            ok, score, reason = await asyncio.wait_for(
+                is_lucky_pull_async(img, threshold=self.thr),
+                timeout=self._timeout_sec
+            )
+            return bool(ok), float(score), str(reason)
+        except Exception as e:
+            return False, 0.0, f"error:{e}"
 
-    async def _handle_lucky_pull(self, message: discord.Message) -> bool:
-        # Gemini-only classification
-        if not is_gemini_enabled():
-            return False
-        img = await self._first_image_bytes(message)
-        if not img or len(img) < 4096:
-            return False
-        ok, score, _ = is_lucky_pull(img, threshold=self.thr)
+    async def _handle_single(self, message: discord.Message):
+        if not message.attachments:
+            return
+        try:
+            data = await message.attachments[0].read()
+        except Exception as e:
+            log.debug("[lpa] read attach failed: %r", e)
+            return
+        ok, score, _ = await self._classify_lucky_bytes(data)
         if not ok:
-            return False
-        # delete offending message
-        try: await message.delete()
-        except Exception: pass
-        # wait persona ready then notify
-        cg = self.bot.get_cog('LuckyPullGuard')
-        if not cg:
-            for _ in range(10):  # ~3s
-                await asyncio.sleep(0.3)
-                cg = self.bot.get_cog('LuckyPullGuard')
-                if cg: break
-        if cg and hasattr(cg, '_persona_notify'):
+            return
+        ctx = {"kind": "lucky", "ok": ok, "score": score, "provider": "gemini"}
+        persona_ok, _ = should_run_persona(ctx)
+        try:
+            if self.delete_on_guard:
+                await message.delete()
+        except Exception as e:
+            log.debug("[lpa] delete failed: %r", e)
+        await self._maybe_redirect(message)
+        if persona_ok:
+            with contextlib.suppress(Exception):
+                await message.channel.send(
+                    f"{message.author.mention}, kontenmu melenceng dari tema. sudah dihapus. gunakan kanal yang tepat. (alasan: Lucky Pull)",
+                    delete_after=10
+                )
+
+    async def _worker(self, idx: int):
+        while True:
+            msg = await self._queue.get()
             try:
-                await cg._persona_notify(message, score)  # type: ignore
-                return True
-            except Exception:
-                pass
-        return False
+                await self._handle_single(msg)
+            except Exception as e:
+                log.warning("[lpa] worker-%d error: %r", idx, e)
+            finally:
+                self._queue.task_done()
 
     @commands.Cog.listener("on_message")
-    async def on_message(self, m: discord.Message):
-        if not self.enabled or getattr(m.author, "bot", False) or not getattr(m, "guild", None):
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not isinstance(message.channel, discord.TextChannel):
             return
-        ch = getattr(m, "channel", None)
-        if not self._is_guard_channel(ch):
+        if not is_gemini_enabled():
             return
-        # Gemini-only Lucky Pull
+        if not self._is_guard_channel(message.channel):
+            return
+        if message.id in self._recent:
+            return
+        self._recent.append(message.id)
         try:
-            handled = await self._handle_lucky_pull(m)
-            if handled: return
-        except Exception:
-            pass
-        # If you keep an 'on_message_inner' in overlays, still delegate
-        if hasattr(self, 'on_message_inner'):
-            try: await self.on_message_inner(m)  # type: ignore
-            except Exception as e: _log.exception("[lpa] on_message_inner failed: %s", e)
-
-    @commands.Cog.listener("on_ready")
-    async def _on_ready(self):
-        _log.info("[lpa] re-assert INFO after ready")
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(LuckyPullAuto(bot))
+            self._queue.put_nowait(message)
+        except asyncio.QueueFull:
+            log.warning("[lpa] queue full (size=%d), dropping message %d", self._queue.qsize(), message.id)

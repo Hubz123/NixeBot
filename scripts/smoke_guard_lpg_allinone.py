@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 import os, sys, argparse, json, binascii
@@ -20,8 +21,7 @@ from nixe.helpers.env_hybrid import load_hybrid
 from nixe.helpers.persona_gate import should_run_persona
 
 def _hex8(b: bytes) -> str:
-    import binascii as _b
-    try: return _b.hexlify(b[:8]).decode("ascii")
+    try: return binascii.hexlify(b[:8]).decode("ascii")
     except Exception: return ""
 
 def _read_bytes(path: str) -> bytes:
@@ -54,7 +54,6 @@ def _simulate_classify(img_path: str) -> dict:
 
 def _first_touchdown_cog_present() -> bool:
     try:
-        # typical path
         return Path(_project_root or ".").joinpath("nixe/cogs/a00_phish_first_touchdown_autoban.py").exists()
     except Exception:
         return False
@@ -62,9 +61,36 @@ def _first_touchdown_cog_present() -> bool:
 def _env_bool(key: str, default: str="0") -> bool:
     return os.getenv(key, default) == "1"
 
+def _parse_guard_channels() -> list[int]:
+    raw = os.getenv("LUCKYPULL_GUARD_CHANNELS") or os.getenv("LPG_GUARD_CHANNELS") or ""
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        import json as _json
+        try:
+            arr = _json.loads(raw)
+            return [int(x) for x in arr if str(x).isdigit()]
+        except Exception:
+            pass
+    return [int(x) for x in raw.replace(" ","").split(",") if x.strip().isdigit()]
+
+def _burst_timeline(n: int, classify_sec: float, workers: int):
+    free_at = [0.0]*max(1,workers)
+    out = []
+    for i in range(n):
+        k = min(range(len(free_at)), key=lambda j: free_at[j])
+        start = free_at[k]
+        finish = start + classify_sec
+        free_at[k] = finish
+        out.append((i+1, start, finish))
+    makespan = max((f for _,_,f in out), default=0.0)
+    return out, makespan
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--img", default=None)
+    ap.add_argument("--as-channel", type=int, default=None)
+    ap.add_argument("--burst", type=int, default=0)
+    ap.add_argument("--classify-sec", type=float, default=0.8)
     args = ap.parse_args()
 
     status = load_hybrid()
@@ -76,6 +102,10 @@ def main():
     print(f"[POLICY] Persona only for: {os.getenv('LPG_PERSONA_ONLY_FOR','lucky')}")
     print(f"[POLICY] Persona allowed providers: {os.getenv('LPG_PERSONA_ALLOWED_PROVIDERS','gemini')}")
 
+    if args.as_channel:
+        guards = _parse_guard_channels()
+        print(f"\n[CHANNEL] simulate channel={args.as_channel} | guard_channels={guards} | in_guard={args.as_channel in guards}")
+
     if args.img:
         res = _simulate_classify(args.img)
         src_info = f"[SMOKE] src={os.path.basename(args.img)} len={res.get('len',0)} hex8={res.get('hex8','')} (ffd8=jpeg?={'ffd8' in res.get('hex8','')})"
@@ -84,7 +114,6 @@ def main():
         print(src_info)
         print(f"[{tag}] ok={res['ok']} score={res['score']:.2f} provider={res['provider']} via={res['via']} reason={res['reason']}")
 
-        # Persona decision preview
         okp, why = should_run_persona({
             "kind": res["kind"], "provider": res["provider"],
             "is_phish": res["kind"]=="phish",
@@ -94,7 +123,6 @@ def main():
         print("\n=== PERSONA DECISION (from classify) ===")
         print(f"persona -> {okp} ({why})")
 
-        # ---- DRY-RUN MODERATION DECISION ----
         print("\n=== DECISION (dry-run) ===")
         if res["kind"] == "phish":
             ft_present = _first_touchdown_cog_present()
@@ -109,13 +137,21 @@ def main():
             action = "BAN" if (ft_present or policy_autoban) else "FLAG_ONLY"
             print(f"action={action} reason='{reason}' delete_message_days={delete_days} embed_ttl={ttl}s first_touchdown_cog={ft_present} policy_autoban={policy_autoban}")
         elif res["kind"] == "lucky":
-            # Lucky Pull: delete only (if guard configured)
-            guard_channels = os.getenv("LUCKYPULL_GUARD_CHANNELS") or os.getenv("LPG_GUARD_CHANNELS") or ""
+            guard_channels = _parse_guard_channels()
             redirect = os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or os.getenv("LPG_REDIRECT_CHANNEL_ID") or ""
-            action = "DELETE" if guard_channels else "NONE"
-            print(f"action={action} guard_channels={guard_channels or '[]'} redirect={redirect or '-'}")
+            in_guard = (args.as_channel in guard_channels) if args.as_channel else bool(guard_channels)
+            action = "DELETE" if in_guard else "NONE"
+            print(f"action={action} guard_channels={guard_channels or '[]'} redirect={redirect or '-'} as_channel={args.as_channel} in_guard={in_guard}")
         else:
             print("action=NONE")
+
+    if args.burst and args.burst > 0:
+        workers = int(os.getenv("LPG_CONCURRENCY","2") or "2")
+        t, makespan = _burst_timeline(args.burst, classify_sec=max(0.1, args.classify_sec), workers=workers)
+        print("\n=== BURST SIMULATION (Lucky Pull) ===")
+        print(f"jobs={args.burst} workers={workers} classify~{args.classify_sec:.2f}s => finishes~{makespan:.2f}s")
+        for (j,st,ft) in t:
+            print(f"  #{j:02d} start={st:5.2f}s finish={ft:5.2f}s")
 
     print("\n=== SUMMARY ===")
     print("result=OK (dry-run; no Discord actions executed)")

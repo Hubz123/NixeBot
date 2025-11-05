@@ -1,111 +1,109 @@
 
+# nixe/helpers/env_hybrid.py — STRICT HYBRID LOADER (restored)
+# Priority: runtime_env.json for configs; .env ONLY for *_API_KEY/*_TOKEN (and similar secrets).
 from __future__ import annotations
-import os, json, re
+import os, json, logging, re
 from pathlib import Path
-from typing import Dict
 
-RUNTIME_JSON_CANDIDATES = [
-    "nixe/config/runtime_env.json",
-    "config/runtime_env.json",
-    "nixe/runtime_env.json",
-]
+LOG = logging.getLogger("nixe.helpers.env_hybrid")
 
-ALLOWED_TOKEN_KEYS = {
-    "DISCORD_TOKEN", "BOT_TOKEN",
-    "GEMINI_API_KEY", "GROQ_API_KEY",
-    "GOOGLE_API_KEY", "OPENAI_API_KEY",
-}
-TOKEN_KEY_REGEX = re.compile(r".*(_API_KEY|_TOKEN)$", re.I)
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    # .../nixe/helpers -> project root is 2 levels up
+    return here.parent.parent.parent
 
-def _is_token_key(k: str) -> bool:
-    ku = k.upper()
-    return (ku in ALLOWED_TOKEN_KEYS) or bool(TOKEN_KEY_REGEX.fullmatch(ku))
-
-def _find_upwards(start: Path, name: str) -> Path|None:
-    cur = start.resolve()
-    for _ in range(14):
-        p = cur / name
-        if p.exists(): return p
-        if cur.parent == cur: break
-        cur = cur.parent
-    return None
-
-def _find_runtime_json(start: Path) -> Path|None:
-    for cand in RUNTIME_JSON_CANDIDATES:
-        p = _find_upwards(start, cand)
-        if p: return p
-    return None
-
-def _read_runtime_json(p: Path) -> Dict[str, str]:
-    try:
-        raw = p.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        if isinstance(data, dict):
-            out = {}
-            for k, v in data.items():
-                if v is None: continue
-                if isinstance(v, (str, int, float, bool)):
-                    out[str(k)] = str(v)
-            return out
-    except Exception:
-        pass
-    return {}
-
-def _find_env_file(start: Path) -> Path|None:
-    return _find_upwards(start, ".env")
-
-def _parse_env_file(p: Path) -> Dict[str, str]:
-    out: Dict[str,str] = {}
-    try:
-        for raw in p.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"): continue
-            if "=" not in line: continue
-            k, v = line.split("=", 1)
-            key = k.strip(); val = v.strip().strip('"').strip("'")
-            if key: out[key] = val
-    except Exception:
-        pass
-    return out
-
-def load_hybrid(start_dir: str|None=None) -> dict:
+def _read_json_with_fallback(main: Path) -> tuple[dict, str, int]:
     """
-    Policy:
-    - runtime_env.json is AUTHORITATIVE for all non-token configs
-    - .env ONLY overrides for *_API_KEY/*_TOKEN and a small allowlist of token names
+    Try to read main JSON; if it fails, try main.with_suffix('.fixed.json').
+    Returns: (data, used_path, err_code)  err_code=0 ok, 1 parse-fix used, 2 failed
     """
-    start = Path(start_dir or os.getcwd())
+    def _load(p: Path):
+        with p.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    used = str(main)
+    try:
+        data = _load(main)
+        return data, used, 0
+    except Exception as e1:
+        LOG.warning("[env-hybrid] runtime_env.json parse failed: %r", e1)
+        fx = main.with_suffix(".fixed.json")
+        if fx.exists():
+            try:
+                data = _load(fx)
+                used = str(fx)
+                LOG.warning("[env-hybrid] using fallback: %s", fx)
+                return data, used, 1
+            except Exception as e2:
+                LOG.error("[env-hybrid] fallback parse failed: %r", e2)
+        # last resort: single missing-comma heuristic for a common case
+        try:
+            raw = main.read_text(encoding="utf-8", errors="ignore")
+            fixed = re.sub(r'("LPG_DEDUP_DISABLE_LEGACY"\s*:\s*"1")\s*\n\s*("LPA_STRICT_MIN")', r"\1,\n  \2", raw)
+            data = json.loads(fixed)
+            used = str(main) + " (auto-fixed)"
+            LOG.warning("[env-hybrid] applied auto-fix for missing comma after LPG_DEDUP_DISABLE_LEGACY")
+            return data, used, 1
+        except Exception:
+            pass
+        return {}, used, 2
 
-    rj_path = _find_runtime_json(start)
-    rj_data = _read_runtime_json(rj_path) if rj_path else {}
-    exported_json = 0
-    tokens_skipped = 0
-    for k, v in rj_data.items():
-        if _is_token_key(k):
-            if k not in os.environ:
-                os.environ[k] = v; exported_json += 1
-            else:
-                tokens_skipped += 1
-        else:
-            os.environ[k] = v; exported_json += 1
+def _load_env_file(root: Path) -> tuple[dict, str]:
+    envp = os.getenv("ENV_FILE_PATH") or str(root / ".env")
+    d = {}
+    try:
+        with open(envp, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s:
+                    continue
+                k, v = s.split("=", 1)
+                d[k.strip()] = v.strip()
+        return d, envp
+    except Exception:
+        return {}, envp
 
-    env_path = _find_env_file(start)
-    env_data = _parse_env_file(env_path) if env_path else {}
-    exported_env_tokens = 0
-    for k, v in env_data.items():
-        if _is_token_key(k):
-            os.environ[k] = v; exported_env_tokens += 1
+def _export_env(cfg: dict, penv: dict) -> tuple[int, int]:
+    """
+    Export to process env:
+    - All non-secret configs from runtime_env.json
+    - ONLY *_API_KEY/*_TOKEN secrets from .env
+    Returns: (#exported from json, #exported from env)
+    """
+    exp_json = exp_env = 0
+    for k, v in cfg.items():
+        if v is None:
+            continue
+        # Do not override any _API_KEY/_TOKEN here; keep secrets for .env
+        if k.endswith("_API_KEY") or k.endswith("_TOKEN") or k.endswith("_SECRET"):
+            continue
+        os.environ[k] = str(v)
+        exp_json += 1
+    for k, v in penv.items():
+        if k.endswith("_API_KEY") or k.endswith("_TOKEN") or k.endswith("_SECRET"):
+            os.environ[k] = str(v)
+            exp_env += 1
+    return exp_json, exp_env
 
-    return {
-        "runtime_env_json_path": str(rj_path) if rj_path else None,
-        "runtime_env_json_keys": len(rj_data),
-        "runtime_env_exported_total": exported_json,
-        "runtime_env_tokens_skipped": tokens_skipped,
-        "env_file_path": str(env_path) if env_path else None,
-        "env_file_keys": len(env_data),
-        "env_exported_tokens": exported_env_tokens,
-        "policy": "priority: runtime_env.json for configs; .env ONLY for *_API_KEY/*_TOKEN",
+def load_hybrid() -> dict:
+    root = _repo_root()
+    # Where is runtime_env.json?
+    rp = os.getenv("RUNTIME_ENV_PATH") or str(root / "nixe" / "config" / "runtime_env.json")
+    cfg, used_json_path, err = _read_json_with_fallback(Path(rp))
+    penv, envp = _load_env_file(root)
+    exp_json, exp_env = _export_env(cfg, penv)
+
+    status = {
+        "runtime_env_json_path": used_json_path,
+        "runtime_env_json_keys": len(cfg),
+        "runtime_env_exported_total": exp_json,
+        "runtime_env_tokens_skipped": sum(1 for k in cfg.keys() if k.endswith("_API_KEY") or k.endswith("_TOKEN") or k.endswith("_SECRET")),
+        "env_file_path": envp,
+        "env_file_keys": len(penv),
+        "env_exported_tokens": sum(1 for k in penv.keys() if k.endswith("_API_KEY") or k.endswith("_TOKEN") or k.endswith("_SECRET")),
+        "policy": "priority: runtime_env.json for configs; .env ONLY for *_API_KEY/*_TOKEN/*_SECRET",
         "GEMINI_API_KEY": bool(os.getenv("GEMINI_API_KEY")),
         "GROQ_API_KEY": bool(os.getenv("GROQ_API_KEY")),
-        "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN") or os.getenv("BOT_TOKEN")),
+        "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
+        "error": (None if err == 0 else ("fallback-used" if err == 1 else "parse-failed"))
     }
+    return status

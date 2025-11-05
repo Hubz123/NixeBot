@@ -1,3 +1,12 @@
+
+# --- bootstrap path for local runs ---
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+_PROJ = _os.path.abspath(_os.path.join(_ROOT, ".."))
+if _PROJ not in _sys.path:
+    _sys.path.insert(0, _PROJ)
+# -------------------------------------
+
 #!/usr/bin/env python3
 import os, sys, importlib
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

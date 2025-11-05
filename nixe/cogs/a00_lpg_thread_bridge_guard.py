@@ -1,0 +1,173 @@
+from __future__ import annotations
+import os, logging, asyncio
+import discord
+from discord.ext import commands
+from nixe.helpers.persona_loader import load_persona, pick_line
+from nixe.helpers.persona_gate import should_run_persona
+try:
+    from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes
+except Exception:
+    classify_lucky_pull_bytes = None
+
+log = logging.getLogger("nixe.cogs.a00_lpg_thread_bridge_guard")
+
+def _parse_ids(val: str) -> list[int]:
+    if not val: return []
+    out = []
+    for part in str(val).replace(";",",").split(","):
+        s = part.strip()
+        if not s: continue
+        try: out.append(int(s))
+        except: pass
+    return out
+
+def _cid(ch) -> int:
+    try: return int(getattr(ch,"id",0) or 0)
+    except: return 0
+
+def _pid(ch) -> int:
+    try: return int(getattr(ch,"parent_id",0) or 0)
+    except: return 0
+
+def _norm_tone(t: str) -> str:
+    t = (t or "").lower().strip()
+    if t in ("soft","agro","sharp"): return t
+    if t in ("harsh","hard"): return "agro"
+    if t in ("gentle","calm","auto",""): return "soft"
+    return "soft"
+
+class LPGThreadBridgeGuard(commands.Cog):
+    """Lucky Pull guard (thread-aware) — fully env-aligned.
+    - Only deletes when image is classified as Lucky (Gemini) unless LPG_REQUIRE_CLASSIFY=0.
+    - Persona strictly follows LPG_PERSONA_* / PERSONA_* in runtime_env.json.
+    - Wiring keys read-only; format preserved.
+    """
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.enabled = os.getenv("LPG_BRIDGE_ENABLE","1") == "1"
+        self.strict  = (os.getenv("LPG_STRICT_ON_GUARD") or os.getenv("LUCKYPULL_STRICT_ON_GUARD") or os.getenv("STRICT_ON_GUARD") or "1") == "1"
+        self.redirect_id = int(os.getenv("LPG_REDIRECT_CHANNEL_ID") or os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or "0")
+        self.guard_ids = set(_parse_ids(os.getenv("LPG_GUARD_CHANNELS","") or os.getenv("LUCKYPULL_GUARD_CHANNELS","")))
+        self.timeout = float(os.getenv("LPG_TIMEOUT_SEC", os.getenv("LUCKYPULL_TIMEOUT_SEC","10")))
+        self.thr = float(os.getenv("GEMINI_LUCKY_THRESHOLD","0.85"))
+        self.require_classify = (os.getenv("LPG_REQUIRE_CLASSIFY") or "1") == "1"
+        try:
+            self.max_bytes = int(os.getenv("LPG_MAX_BYTES") or 8_000_000)
+        except Exception:
+            self.max_bytes = 8_000_000
+
+        # Persona
+        self.persona_enable = (os.getenv("LPG_PERSONA_ENABLE") or os.getenv("PERSONA_ENABLE") or "1") == "1"
+        self.persona_mode = os.getenv("LPG_PERSONA_MODE") or os.getenv("PERSONA_MODE") or "yandere"
+        self.persona_tone = _norm_tone(os.getenv("LPG_PERSONA_TONE") or os.getenv("PERSONA_TONE") or os.getenv("PERSONA_GROUP") or "soft")
+        self.persona_reason = os.getenv("LPG_PERSONA_REASON") or os.getenv("PERSONA_REASON") or "Tebaran Garam"
+        self.persona_context = (os.getenv("LPG_PERSONA_CONTEXT") or "lucky").strip().lower()
+        try:
+            self.persona_delete_after = float(os.getenv("LPG_PERSONA_DELETE_AFTER") or os.getenv("PERSONA_DELETE_AFTER") or "12")
+        except Exception:
+            self.persona_delete_after = 12.0
+        # Persona scoping from runtime_env
+        self.persona_only_for = [s.strip().lower() for s in str(os.getenv("LPG_PERSONA_ONLY_FOR","")).split(",") if s.strip()]
+        self.persona_allowed_providers = [s.strip().lower() for s in str(os.getenv("LPG_PERSONA_ALLOWED_PROVIDERS","")).split(",") if s.strip()]
+
+        log.warning("[lpg-thread-bridge] enabled=%s guards=%s redirect=%s thr=%.2f strict=%s timeout=%.1fs require_classify=%s | persona: enable=%s mode=%s tone=%s reason=%s only_for=%s allow_prov=%s",
+                    self.enabled, sorted(self.guard_ids), self.redirect_id, self.thr, self.strict, self.timeout, self.require_classify,
+                    self.persona_enable, self.persona_mode, self.persona_tone, self.persona_reason, self.persona_only_for, self.persona_allowed_providers)
+
+    def _in_guard(self, ch) -> bool:
+        return (_cid(ch) in self.guard_ids) or (_pid(ch) in self.guard_ids and _pid(ch) != 0)
+
+    def _is_image(self, att: discord.Attachment) -> bool:
+        ct = (getattr(att,"content_type",None) or "").lower()
+        if ct.startswith("image/"): return True
+        name = (getattr(att,"filename","") or "").lower()
+        return name.endswith((".png",".jpg",".jpeg",".webp",".bmp",".gif"))
+
+    async def _classify(self, message: discord.Message) -> tuple[bool, float, str, str]:
+        if not classify_lucky_pull_bytes:
+            return (False, 0.0, "none", "classifier_missing")
+        imgs = [a for a in (message.attachments or []) if self._is_image(a)]
+        if not imgs: return (False, 0.0, "none", "no_image")
+        try:
+            data = await imgs[0].read()
+            if not data: return (False, 0.0, "none", "empty_bytes")
+            if len(data) > self.max_bytes: data = data[: self.max_bytes]
+            res = await asyncio.wait_for(classify_lucky_pull_bytes(data), timeout=self.timeout)
+            ok = False; score = 0.0; provider = "unknown"; reason = ""
+            if isinstance(res, tuple) and len(res) >= 4:
+                ok, score, provider, reason = res[0], float(res[1] or 0), str(res[2]), str(res[3])
+            elif isinstance(res, dict):
+                ok = bool(res.get("ok", False))
+                score = float(res.get("score", 0))
+                provider = str(res.get("provider", "unknown"))
+                reason = str(res.get("reason", ""))
+            return (ok and score >= self.thr, score, provider, reason or "classified")
+        except asyncio.TimeoutError:
+            return (False, 0.0, "timeout", "classify_timeout")
+        except Exception as e:
+            log.warning("[lpg-thread-bridge] classify error: %r", e)
+            return (False, 0.0, "error", "classify_exception")
+
+    async def _delete_redirect_persona(self, message: discord.Message, provider_hint: str | None = None):
+        # Delete
+        try:
+            await message.delete()
+            log.info("[lpg-thread-bridge] message deleted | user=%s ch=%s", getattr(message.author,"id",None), _cid(message.channel))
+        except Exception as e:
+            log.debug("[lpg-thread-bridge] delete failed: %r", e)
+        # Redirect mention
+        mention = None
+        try:
+            if self.redirect_id:
+                ch = message.guild.get_channel(self.redirect_id) or await self.bot.fetch_channel(self.redirect_id)
+                mention = ch.mention if ch else f"<#{self.redirect_id}>"
+        except Exception as e:
+            log.debug("[lpg-thread-bridge] redirect resolve failed: %r", e)
+        # Persona
+        text = None; persona_ok = False
+        try:
+            if self.persona_enable and should_run_persona(self.persona_context):
+                if self.persona_only_for and self.persona_context not in self.persona_only_for:
+                    raise RuntimeError("persona_context_not_allowed")
+                if self.persona_allowed_providers and (provider_hint or "").lower() not in self.persona_allowed_providers:
+                    raise RuntimeError("persona_provider_not_allowed")
+                data = load_persona()
+                text = pick_line(data, mode=self.persona_mode, tone=self.persona_tone,
+                                 user=getattr(message.author,"mention","@user"), channel=mention or "", reason=self.persona_reason)
+                persona_ok = True
+        except Exception as e:
+            log.debug("[lpg-thread-bridge] persona load/guard failed: %r", e)
+
+        if not text:
+            base = f"{getattr(message.author,'mention','@user')}, *Lucky Pull* terdeteksi."
+            text = base + (f" Ke {mention} ya." if mention else "")
+
+        try:
+            await message.channel.send(text, delete_after=self.persona_delete_after if persona_ok else 10)
+            if mention: log.info("[lpg-thread-bridge] redirect -> %s", mention)
+            log.info("[lpg-thread-bridge] persona notice sent (gate=%s)", "ok" if persona_ok else "skip")
+        except Exception as e:
+            log.debug("[lpg-thread-bridge] notice send failed: %r", e)
+
+    @commands.Cog.listener("on_message")
+    async def on_message(self, message: discord.Message):
+        if not self.enabled: return
+        if not message or (getattr(message,"author",None) and message.author.bot): return
+        ch = getattr(message,"channel",None)
+        if not ch: return
+        cid = _cid(ch); pid = _pid(ch)
+        if not self._in_guard(ch): return
+        # Must have image
+        if not any(self._is_image(a) for a in (message.attachments or [])): return
+        # Require classification by default
+        provider_hint = None
+        if self.require_classify:
+            lucky, score, provider, reason = await self._classify(message)
+            log.info("[lpg-thread-bridge] classify: lucky=%s score=%.3f via=%s reason=%s", lucky, score, provider, reason)
+            provider_hint = (provider or "").lower()
+            if not lucky: return
+        log.info("[lpg-thread-bridge] STRICT_ON_GUARD delete | ch=%s parent=%s type=%s", cid, pid, type(ch).__name__ if ch else None)
+        await self._delete_redirect_persona(message, provider_hint=provider_hint)
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(LPGThreadBridgeGuard(bot))

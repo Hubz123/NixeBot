@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 import os, json
 
+class _SafeDict(dict):
+    def __missing__(self, k):
+        return '{' + str(k) + '}'
+
+
 def _repo_root():
     here = os.path.abspath(os.path.dirname(__file__))
     return os.path.abspath(os.path.join(here, "..", ".."))
@@ -64,11 +69,16 @@ def load_persona():
     return None, {}, None
 
 def pick_line(data, mode, tone, **kwargs):
-    mode = mode if (mode in data) else (next(iter(data.keys())) if data else "yandere")
-    tones = data.get(mode, {})
-    tone = tone if tone in ("soft","agro","sharp") else "soft"
-    bucket = tones.get(tone) or tones.get("soft") or []
+    # Select bucket
+    mode = mode if (isinstance(data, dict) and mode in data) else (next(iter(data.keys())) if isinstance(data, dict) and data else 'yandere')
+    tones = data.get(mode, {}) if isinstance(data, dict) else {}
+    tone = tone if tone in ('soft','agro','sharp') else 'soft'
+    bucket = tones.get(tone) or tones.get('soft') or []
     if not bucket:
-        return "..."
+        return '...'
     import random
-    return random.choice(bucket)
+    raw = random.choice(bucket)
+    try:
+        return str(raw).format_map(_SafeDict(**kwargs))
+    except Exception:
+        return str(raw)

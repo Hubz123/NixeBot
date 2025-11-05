@@ -7,10 +7,18 @@ import discord
 def _cfg_name() -> str:
     return os.getenv("LPG_THREAD_NAME", "nixe-lpg-sticky")
 def _cfg_parent_id() -> int:
-    try:
-        return int(os.getenv("LPG_CACHE_THREAD_ID", "0"))
-    except Exception:
-        return 0
+    # Never fallback to Lucky Pull; use dedicated IDs only.
+    for key in ("LPG_CACHE_THREAD_ID", "LPG_PARENT_CHANNEL_ID", "LPG_WHITELIST_PARENT_CHANNEL_ID"):
+        v = os.getenv(key)
+        if v:
+            try:
+                vid = int(str(v).strip())
+                if vid > 0:
+                    return vid
+            except Exception:
+                continue
+    return 0
+
 def _cfg_auto_dedup() -> bool:
     return os.getenv("LPG_DEDUP_CLOSE", "1") == "1"
 async def _list_threads(parent: discord.TextChannel) -> List[discord.Thread]:

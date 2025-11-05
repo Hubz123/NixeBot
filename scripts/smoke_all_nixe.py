@@ -13,6 +13,9 @@ Usage:
     [--fix-inplace] [--fix-to fixed.json]
 """
 from __future__ import annotations
+
+# scripts/smoke_all_nixe.py
+
 import os, sys, json, re
 
 # ---------- helpers: relaxed json loader ----------

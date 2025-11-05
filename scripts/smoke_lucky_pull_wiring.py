@@ -1,3 +1,12 @@
+
+# --- bootstrap path for local runs ---
+import os as _os, sys as _sys
+_ROOT = _os.path.dirname(_os.path.abspath(__file__))
+_PROJ = _os.path.abspath(_os.path.join(_ROOT, ".."))
+if _PROJ not in _sys.path:
+    _sys.path.insert(0, _PROJ)
+# -------------------------------------
+
 # -*- coding: utf-8 -*-
 """
 Smoke: Lucky Pull wiring (guard scope + redirect + persona notify dry-run)

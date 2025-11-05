@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # -*- coding: utf-8 -*-
 """
 smoke_runtime_providers.py
@@ -18,6 +19,9 @@ smoke_runtime_providers.py
 Exit code: 0 jika tes lolos, 1 jika gagal.
 """
 from __future__ import annotations
+
+# -*- coding: utf-8 -*-
+
 import os, sys, io, json, argparse, time, urllib.request, importlib
 
 

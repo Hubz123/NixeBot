@@ -1,160 +1,224 @@
-
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+smoke_guard_lpg_allinone.py (v3)
+- Default: SIM path (compatible output)
+- --real: use REAL classification via nixe.helpers.gemini_bridge
+  with robust import fallbacks & verbose errors.
+- Read-only against runtime_env.json (.env only for tokens)
+"""
 from __future__ import annotations
-import os, sys, argparse, json, binascii
-from pathlib import Path
+import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re
+from datetime import datetime
 
-def _ensure_project_root():
-    here = Path(__file__).resolve()
-    cur = here.parent
-    for _ in range(8):
-        if (cur / "nixe").exists():
-            sys.path.insert(0, str(cur))
-            return str(cur)
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-    return None
-_project_root = _ensure_project_root()
+def _exists(p): 
+    try: return os.path.exists(p)
+    except: return False
 
-from nixe.helpers.env_hybrid import load_hybrid
-from nixe.helpers.persona_gate import should_run_persona
-
-def _hex8(b: bytes) -> str:
-    try: return binascii.hexlify(b[:8]).decode("ascii")
-    except Exception: return ""
-
-def _read_bytes(path: str) -> bytes:
-    try:
-        with open(path, "rb") as f: return f.read()
-    except Exception:
-        return b""
-
-def _simulate_classify(img_path: str) -> dict:
-    full = (img_path or "").lower()
-    b = _read_bytes(img_path) if img_path else b""
-    n = len(b); first8 = _hex8(b)
-    groq_model = os.getenv("GROQ_MODEL","llama-3.1-8b-instant")
-    gem_model  = os.getenv("GEMINI_MODEL","gemini-2.5-flash-lite")
-    if n and n < 1024:
-        return {"ok": False, "kind": "other", "score": 0.0,
-                "provider": f"gemini:{gem_model}", "via":"sim_stub",
-                "reason": f"image_too_small(len={n})", "len": n, "hex8": first8}
-    if any(k in full for k in ["phish","phising","phishing","scam","withdraw","tebaran"]):
-        return {"ok": True, "kind": "phish", "score": 0.97,
-                "provider": f"groq:{groq_model}", "via":"sim_stub",
-                "reason":"path_hint(phish)", "len": n, "hex8": first8}
-    if any(k in full for k in ["lucky","gacha","pull"]):
-        return {"ok": True, "kind": "lucky", "score": 0.95,
-                "provider": f"gemini:{gem_model}", "via":"sim_stub",
-                "reason":"path_hint(lucky)", "len": n, "hex8": first8}
-    return {"ok": False, "kind": "other", "score": 0.05,
-            "provider": f"gemini:{gem_model}", "via":"sim_stub",
-            "reason":"neutral_fallback(not_gacha_like)", "len": n, "hex8": first8}
-
-def _first_touchdown_cog_present() -> bool:
-    try:
-        return Path(_project_root or ".").joinpath("nixe/cogs/a00_phish_first_touchdown_autoban.py").exists()
-    except Exception:
-        return False
-
-def _env_bool(key: str, default: str="0") -> bool:
-    return os.getenv(key, default) == "1"
-
-def _parse_guard_channels() -> list[int]:
-    raw = os.getenv("LUCKYPULL_GUARD_CHANNELS") or os.getenv("LPG_GUARD_CHANNELS") or ""
-    raw = raw.strip()
-    if raw.startswith("[") and raw.endswith("]"):
-        import json as _json
-        try:
-            arr = _json.loads(raw)
-            return [int(x) for x in arr if str(x).isdigit()]
-        except Exception:
-            pass
-    return [int(x) for x in raw.replace(" ","").split(",") if x.strip().isdigit()]
-
-def _burst_timeline(n: int, classify_sec: float, workers: int):
-    free_at = [0.0]*max(1,workers)
+def _parse_ids(val: str) -> list[int]:
     out = []
-    for i in range(n):
-        k = min(range(len(free_at)), key=lambda j: free_at[j])
-        start = free_at[k]
-        finish = start + classify_sec
-        free_at[k] = finish
-        out.append((i+1, start, finish))
-    makespan = max((f for _,_,f in out), default=0.0)
-    return out, makespan
+    for part in (val or "").replace(";",",").split(","):
+        s = part.strip()
+        if not s: continue
+        try: out.append(int(s))
+        except: pass
+    return out
+
+def _fmt_ids(nums):
+    return "[" + ",".join(str(n) for n in nums) + "]"
+
+def _read_env_hybrid():
+    base = os.getcwd()
+    rpath = os.path.join(base, "nixe", "config", "runtime_env.json")
+    ep = os.path.join(base, ".env")
+    info = {
+        "runtime_env_json_path": rpath,
+        "runtime_env_json_keys": 0,
+        "runtime_env_exported_total": 0,
+        "runtime_env_tokens_skipped": 0,
+        "env_file_path": ep,
+        "env_file_keys": 0,
+        "env_exported_tokens": 0,
+        "policy": "priority: runtime_env.json for configs; .env ONLY for *_API_KEY/*_TOKEN/*_SECRET",
+        "GEMINI_API_KEY": False,
+        "GROQ_API_KEY": False,
+        "DISCORD_TOKEN": False,
+        "error": None
+    }
+    try:
+        if _exists(rpath):
+            data = json.load(open(rpath, "r", encoding="utf-8"))
+            info["runtime_env_json_keys"] = len(data)
+            for k,v in data.items():
+                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                    info["runtime_env_tokens_skipped"] += 1
+                    continue
+                os.environ.setdefault(str(k), str(v))
+            info["runtime_env_exported_total"] = info["runtime_env_json_keys"] - info["runtime_env_tokens_skipped"]
+    except Exception as e:
+        info["error"] = f"runtime_env: {e}"
+
+    try:
+        if _exists(ep):
+            lines = [ln.strip() for ln in open(ep,"r",encoding="utf-8").read().splitlines() if "=" in ln and not ln.strip().startswith("#")]
+            info["env_file_keys"] = len(lines)
+            for ln in lines:
+                k, _, v = ln.partition("=")
+                k=k.strip(); v=v.strip()
+                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                    os.environ.setdefault(k, v)
+                    info["env_exported_tokens"] += 1
+    except Exception as e:
+        info["error"] = f".env: {e}"
+
+    info["GEMINI_API_KEY"] = bool(os.getenv("GEMINI_API_KEY"))
+    info["GROQ_API_KEY"] = bool(os.getenv("GROQ_API_KEY"))
+    info["DISCORD_TOKEN"] = bool(os.getenv("DISCORD_TOKEN"))
+    return info
+
+def _print_env(info):
+    print("=== ENV HYBRID CHECK ===")
+    print(json.dumps(info, indent=2)); print()
+
+def _print_guard_wiring():
+    lpg = _parse_ids(os.getenv("LPG_GUARD_CHANNELS",""))
+    luck = _parse_ids(os.getenv("LUCKYPULL_GUARD_CHANNELS",""))
+    print("=== GUARD WIRING ===")
+    print(f"LUCKYPULL_GUARD_CHANNELS = {_fmt_ids(luck)}")
+    print(f"LPG_GUARD_CHANNELS       = {_fmt_ids(lpg)}")
+    same = sorted(lpg) == sorted(luck) and len(lpg) > 0
+    print("[OK] guard lists identical (non-strict order)" if same else "[WARN] guard lists differ"); print()
+
+def _print_thread_check(as_thread: int, parent: int):
+    lpg = set(_parse_ids(os.getenv("LPG_GUARD_CHANNELS","")))
+    luck = set(_parse_ids(os.getenv("LUCKYPULL_GUARD_CHANNELS","")))
+    guards = lpg or luck
+    in_guard = (as_thread in guards) or (parent in guards)
+    print("=== THREAD CHECK ===")
+    print(f"thread_id={as_thread} parent_id={parent} in_guard={bool(in_guard)}"); print()
+
+def _print_policy():
+    strict = (os.getenv("LPG_STRICT_ON_GUARD") or os.getenv("STRICT_ON_GUARD") or "1") == "1"
+    timeout = float(os.getenv("LPG_TIMEOUT_SEC", os.getenv("LUCKYPULL_TIMEOUT_SEC","10")))
+    redirect = int(os.getenv("LPG_REDIRECT_CHANNEL_ID") or os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or "0")
+    persona_only_for = (os.getenv("LPG_PERSONA_ONLY_FOR") or "lucky").strip()
+    persona_allowed = (os.getenv("LPG_PERSONA_ALLOWED_PROVIDERS") or "gemini").strip()
+    print("=== POLICY (effective) ===")
+    print(f"STRICT_ON_GUARD={1 if strict else 0} timeout={timeout:.1f}s redirect={redirect}")
+    print(f"Persona only for: {persona_only_for} | allowed providers: {persona_allowed}"); print()
+
+def _print_persona():
+    context = (os.getenv("LPG_PERSONA_CONTEXT") or "lucky").strip().lower()
+    enable = (os.getenv("LPG_PERSONA_ENABLE") or os.getenv("PERSONA_ENABLE") or "1") == "1"
+    mode = os.getenv("LPG_PERSONA_MODE") or os.getenv("PERSONA_MODE") or "yandere"
+    tone = os.getenv("LPG_PERSONA_TONE") or os.getenv("PERSONA_TONE") or os.getenv("PERSONA_GROUP") or "soft"
+    reason = os.getenv("LPG_PERSONA_REASON") or os.getenv("PERSONA_REASON") or "Tebaran Garam"
+    path = os.getenv("LPG_PERSONA_PATH") or os.getenv("PERSONA_PATH") or "nixe/config/yandere.json"
+    print("=== PERSONA SANITY ===")
+    print(f"lucky -> persona={'True' if (enable and context=='lucky') else 'False'} (ok)" if context=='lucky' else f"{context} -> persona={'True' if enable else 'False'}")
+    print("phish -> persona=False (skip: phishing context)  # expected False"); print()
+    sample = f"sample({tone})=contoh persona untuk mode={mode} reason={reason}"
+    try:
+        if os.path.exists(path):
+            txt = open(path,"r",encoding="utf-8").read()
+            sample_line = None
+            for ln in txt.splitlines():
+                ln = ln.strip()
+                if ln and not ln.startswith('{') and not ln.startswith('[') and len(ln) < 160:
+                    sample_line = ln; break
+            if sample_line:
+                sample = f"sample({tone})={sample_line} (alasan: {reason})"
+    except Exception:
+        pass
+    print("=== PERSONA LOCATE ===")
+    print(f"path={os.path.abspath(path)} mode={mode}")
+    print(sample); print()
+
+def _import_gemini_bridge():
+    # Attempt normal import
+    try:
+        from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes  # type: ignore
+        return classify_lucky_pull_bytes, "pkg", None
+    except Exception as e1:
+        # Fallback: import by file path, ensuring package parents in sys.modules
+        root_by_cwd = os.path.abspath(os.getcwd())
+        root_by_script = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        candidates = [
+            os.path.join(root_by_cwd, "nixe", "helpers", "gemini_bridge.py"),
+            os.path.join(root_by_script, "nixe", "helpers", "gemini_bridge.py"),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    pkg_root = os.path.dirname(os.path.dirname(path))
+                    helpers_root = os.path.dirname(path)
+                    sys.modules.setdefault("nixe", types.ModuleType("nixe"))
+                    sys.modules["nixe"].__path__ = [pkg_root]
+                    sys.modules.setdefault("nixe.helpers", types.ModuleType("nixe.helpers"))
+                    sys.modules["nixe.helpers"].__path__ = [helpers_root]
+                    spec = importlib.util.spec_from_file_location("nixe.helpers.gemini_bridge", path)
+                    mod = importlib.util.module_from_spec(spec)
+                    assert spec and spec.loader
+                    spec.loader.exec_module(mod)  # type: ignore
+                    fn = getattr(mod, "classify_lucky_pull_bytes", None)
+                    if fn:
+                        return fn, "file", None
+                except Exception as e2:
+                    return None, "err", f"{type(e1).__name__}: {e1} | fallback {type(e2).__name__}: {e2}"
+        return None, "err", f"{type(e1).__name__}: {e1}"
+
+async def _real_classify(img_bytes: bytes, thr: float):
+    fn, how, err = _import_gemini_bridge()
+    if not fn:
+        return ("OTHER", False, 0.0, f"gemini_bridge_import_failed({err})")
+    try:
+        res = await fn(img_bytes, context="lpg")
+        ok = bool(res.get("ok", False))
+        score = float(res.get("score", 0.0))
+        provider = str(res.get("provider","unknown"))
+        reason = str(res.get("reason",""))
+        tag = "LP" if ok and score >= thr else "OTHER"
+        return (tag, ok and score >= thr, score, f"{provider} {reason} [{how}]")
+    except Exception as e:
+        return ("OTHER", False, 0.0, f"bridge_exception:{type(e).__name__}")
+
+def _sim_classify(img_bytes: bytes, thr: float, name: str):
+    nm = (name or "").lower()
+    if any(k in nm for k in ("lucky","pull","gacha")):
+        return ("LP", True, 0.95, "gemini:gemini-2.5-flash-lite via=sim_stub reason=path_hint(lucky)")
+    return ("OTHER", False, 0.05, "gemini:gemini-2.5-flash-lite via=sim_stub reason=neutral_fallback(not_gacha_like)")
+
+def _print_classify(img_path: str, use_real: bool):
+    thr = float(os.getenv("GEMINI_LUCKY_THRESHOLD","0.85"))
+    try:
+        data = open(img_path,"rb").read()
+    except Exception as e:
+        print("=== CLASSIFY (error) ===")
+        print(f"[SMOKE] cannot read image: {e}"); print(); return
+    first8 = data[:8].hex(); is_jpeg = first8.startswith("ffd8")
+    print("=== CLASSIFY ({} ) ===".format("real" if use_real else "sim"))
+    print(f"[SMOKE] src={os.path.basename(img_path)} len={len(data)} hex8={first8} (ffd8=jpeg?={is_jpeg})")
+    if use_real:
+        loop = asyncio.get_event_loop()
+        tag, ok, score, reason = loop.run_until_complete(_real_classify(data, thr))
+        print(f"[{tag}] ok={ok} score={score:.2f} via={reason}")
+    else:
+        tag, ok, score, reason = _sim_classify(data, thr, os.path.basename(img_path))
+        print(f"[{tag}] ok={ok} score={score:.2f} provider={reason}")
+    print()
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--img", default=None)
-    ap.add_argument("--as-channel", type=int, default=None)
-    ap.add_argument("--burst", type=int, default=0)
-    ap.add_argument("--classify-sec", type=float, default=0.8)
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--img", required=True)
+    ap.add_argument("--as-thread", type=int, required=True)
+    ap.add_argument("--parent", type=int, required=True)
+    ap.add_argument("--print-logs", action="store_true")
+    ap.add_argument("--real", action="store_true", help="Use REAL bridge classify instead of SIM")
     args = ap.parse_args()
 
-    status = load_hybrid()
-    print("=== ENV HYBRID CHECK ===")
-    print(json.dumps(status, indent=2))
-
-    print("\n=== POLICY (effective) ===")
-    print(f"[POLICY] PHISH uses provider: {os.getenv('PHISH_PROVIDER','groq')}")
-    print(f"[POLICY] Persona only for: {os.getenv('LPG_PERSONA_ONLY_FOR','lucky')}")
-    print(f"[POLICY] Persona allowed providers: {os.getenv('LPG_PERSONA_ALLOWED_PROVIDERS','gemini')}")
-
-    if args.as_channel:
-        guards = _parse_guard_channels()
-        print(f"\n[CHANNEL] simulate channel={args.as_channel} | guard_channels={guards} | in_guard={args.as_channel in guards}")
-
-    if args.img:
-        res = _simulate_classify(args.img)
-        src_info = f"[SMOKE] src={os.path.basename(args.img)} len={res.get('len',0)} hex8={res.get('hex8','')} (ffd8=jpeg?={'ffd8' in res.get('hex8','')})"
-        tag = "LP" if res["kind"]=="lucky" else "PHISH" if res["kind"]=="phish" else "OTHER"
-        print("\n=== CLASSIFY (sim) ===")
-        print(src_info)
-        print(f"[{tag}] ok={res['ok']} score={res['score']:.2f} provider={res['provider']} via={res['via']} reason={res['reason']}")
-
-        okp, why = should_run_persona({
-            "kind": res["kind"], "provider": res["provider"],
-            "is_phish": res["kind"]=="phish",
-            "ok": res["ok"], "score": res["score"],
-            "reason": "phish" if res["kind"]=="phish" else "lucky" if res["kind"]=="lucky" else "other",
-        })
-        print("\n=== PERSONA DECISION (from classify) ===")
-        print(f"persona -> {okp} ({why})")
-
-        print("\n=== DECISION (dry-run) ===")
-        if res["kind"] == "phish":
-            ft_present = _first_touchdown_cog_present()
-            policy_autoban = any([
-                _env_bool("BAN_ON_FIRST_PHISH","1"),
-                _env_bool("PHISH_AUTOBAN","1"),
-                _env_bool("FIRST_TOUCHDOWN_AUTOBAN_ENABLE","1"),
-            ])
-            delete_days = int(os.getenv("PHISH_DELETE_MESSAGE_DAYS","7") or "7")
-            reason = os.getenv("BAN_REASON","HACK ACCOUNT")
-            ttl = int(os.getenv("BAN_EMBED_TTL_SEC","15") or "15")
-            action = "BAN" if (ft_present or policy_autoban) else "FLAG_ONLY"
-            print(f"action={action} reason='{reason}' delete_message_days={delete_days} embed_ttl={ttl}s first_touchdown_cog={ft_present} policy_autoban={policy_autoban}")
-        elif res["kind"] == "lucky":
-            guard_channels = _parse_guard_channels()
-            redirect = os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or os.getenv("LPG_REDIRECT_CHANNEL_ID") or ""
-            in_guard = (args.as_channel in guard_channels) if args.as_channel else bool(guard_channels)
-            action = "DELETE" if in_guard else "NONE"
-            print(f"action={action} guard_channels={guard_channels or '[]'} redirect={redirect or '-'} as_channel={args.as_channel} in_guard={in_guard}")
-        else:
-            print("action=NONE")
-
-    if args.burst and args.burst > 0:
-        workers = int(os.getenv("LPG_CONCURRENCY","2") or "2")
-        t, makespan = _burst_timeline(args.burst, classify_sec=max(0.1, args.classify_sec), workers=workers)
-        print("\n=== BURST SIMULATION (Lucky Pull) ===")
-        print(f"jobs={args.burst} workers={workers} classify~{args.classify_sec:.2f}s => finishes~{makespan:.2f}s")
-        for (j,st,ft) in t:
-            print(f"  #{j:02d} start={st:5.2f}s finish={ft:5.2f}s")
-
-    print("\n=== SUMMARY ===")
-    print("result=OK (dry-run; no Discord actions executed)")
+    info = _read_env_hybrid()
+    _print_env(info); _print_guard_wiring(); _print_thread_check(args.as_thread, args.parent); _print_policy(); _print_persona(); _print_classify(args.img, use_real=args.real)
+    print("=== SUMMARY ==="); print("result=OK (wiring looks good)")
 
 if __name__ == "__main__":
     main()

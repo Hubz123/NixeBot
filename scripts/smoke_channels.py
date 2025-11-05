@@ -10,8 +10,10 @@ Smoke check for channel lists & IDs (RELAXED JSON SUPPORTED).
 Usage:
   python scripts/smoke_channels.py [path/to/runtime_env.json] [--write-sanitized out.json]
 """
-
 from __future__ import annotations
+
+# scripts/smoke_channels.py
+
 import os, sys, json, re
 
 DEFAULT_ENV_PATHS = [

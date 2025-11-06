@@ -1,18 +1,21 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-smoke_guard_lpg_allinone.py (v3-patched-persona-locate)
+smoke_guard_lpg_allinone.py (v4-realtime-burst)
+- Based on v3-patched-persona-locate (adds realtime Gemini BURST probe + timing)
 - Default: SIM path (compatible output)
-- --real: use REAL classification via nixe.helpers.gemini_bridge
-  with robust import fallbacks & verbose errors.
+- --real: use REAL classification via nixe.helpers.gemini_bridge (as before)
+- --burst: run realtime BURST (Gemini API #1/#2) with STAGGER timeline + timeout info
 - Read-only against runtime_env.json (.env only for tokens)
 """
 from __future__ import annotations
-import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re, random
+import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re, random, time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
+# -------------------------
+# Util
+# -------------------------
 def _exists(p): 
     try: return os.path.exists(p)
     except: return False
@@ -43,6 +46,7 @@ def _read_env_hybrid():
         "env_exported_tokens": 0,
         "policy": "priority: runtime_env.json for configs; .env ONLY for *_API_KEY/*_TOKEN/*_SECRET",
         "GEMINI_API_KEY": False,
+        "GEMINI_API_KEY_B": False,
         "GROQ_API_KEY": False,
         "DISCORD_TOKEN": False,
         "error": None
@@ -52,7 +56,7 @@ def _read_env_hybrid():
             data = json.load(open(rpath, "r", encoding="utf-8"))
             info["runtime_env_json_keys"] = len(data)
             for k,v in data.items():
-                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                if ("API_KEY" in k) or k.endswith(("_TOKEN","_SECRET")):
                     info["runtime_env_tokens_skipped"] += 1
                     continue
                 os.environ.setdefault(str(k), str(v))
@@ -67,13 +71,14 @@ def _read_env_hybrid():
             for ln in lines:
                 k, _, v = ln.partition("=")
                 k=k.strip(); v=v.strip()
-                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                if ("API_KEY" in k) or k.endswith(("_TOKEN","_SECRET")):
                     os.environ.setdefault(k, v)
                     info["env_exported_tokens"] += 1
     except Exception as e:
         info["error"] = f".env: {e}"
 
     info["GEMINI_API_KEY"] = bool(os.getenv("GEMINI_API_KEY"))
+    info["GEMINI_API_KEY_B"] = bool(os.getenv("GEMINI_API_KEY_B"))
     info["GROQ_API_KEY"] = bool(os.getenv("GROQ_API_KEY"))
     info["DISCORD_TOKEN"] = bool(os.getenv("DISCORD_TOKEN"))
     return info
@@ -110,98 +115,8 @@ def _print_policy():
     print(f"Persona only for: {persona_only_for} | allowed providers: {persona_allowed}"); print()
 
 # -------------------------
-# Persona Locate (patched): real JSON, weighted random
+# Persona Locate (kept from v3)
 # -------------------------
-
-def _parse_weights_from_env() -> Dict[str, float]:
-    # Support the same shapes your runtime uses:
-    # - PERSONA_TONE_DIST='{"soft":0.5,"agro":0.25,"sharp":0.25}'
-    # - PERSONA_TONE_SOFT / PERSONA_TONE_AGRO / PERSONA_TONE_SHARP
-    # - PERSONA_TONE="soft=0.5,agro=0.5,sharp=0.5" (will be normalized)
-    dist = {}
-    raw = os.getenv("PERSONA_TONE_DIST") or os.getenv("LPG_PERSONA_TONE_DIST") or ""
-    if raw:
-        try:
-            obj = json.loads(raw)
-            if isinstance(obj, dict):
-                dist = {k.lower(): float(v) for k,v in obj.items()}
-        except Exception:
-            pass
-    if not dist:
-        for key, tone in (("PERSONA_TONE_SOFT","soft"),("PERSONA_TONE_AGRO","agro"),("PERSONA_TONE_SHARP","sharp")):
-            val = os.getenv(key) or os.getenv("LPG_"+key) or ""
-            if val:
-                try: dist[tone] = float(val)
-                except: pass
-    if not dist:
-        inline = os.getenv("PERSONA_TONE") or os.getenv("LPG_PERSONA_TONE") or ""
-        if inline and any(ch in inline for ch in ("=",":")):
-            pairs = [p.strip() for p in inline.replace(":", "=").split(",")]
-            for p in pairs:
-                if "=" in p:
-                    k, v = p.split("=", 1)
-                    try:
-                        dist[k.strip().lower()] = float(v.strip())
-                    except:
-                        pass
-    # default equal weights if still empty
-    if not dist:
-        dist = {"soft": 1.0, "agro": 1.0, "sharp": 1.0}
-    # normalize
-    s = sum(max(0.0, v) for v in dist.values()) or 1.0
-    return {k: max(0.0, v)/s for k,v in dist.items()}
-
-def _weighted_choice(d: Dict[str,float]) -> str:
-    r = random.random()
-    acc = 0.0
-    for k, w in d.items():
-        acc += w
-        if r <= acc:
-            return k
-    return next(iter(d.keys()))
-
-def _pick_persona_line(json_obj: Any, context: str, tone: str) -> str:
-    # Try common shapes:
-    # 1) data[context][tone] -> [lines]
-    # 2) data[tone] -> [lines]
-    # 3) data["lines"] -> [lines of str]
-    # Fallback: search any list of strings
-    def _strings(lst):
-        return [s for s in lst if isinstance(s, str) and s.strip()]
-
-    if isinstance(json_obj, dict):
-        if context in json_obj and isinstance(json_obj[context], dict):
-            sec = json_obj[context]
-            if tone in sec and isinstance(sec[tone], list):
-                ls = _strings(sec[tone])
-                if ls: return random.choice(ls)
-            # any list under context
-            for v in sec.values():
-                if isinstance(v, list):
-                    ls = _strings(v)
-                    if ls: return random.choice(ls)
-        if tone in json_obj and isinstance(json_obj[tone], list):
-            ls = _strings(json_obj[tone])
-            if ls: return random.choice(ls)
-        if "lines" in json_obj and isinstance(json_obj["lines"], list):
-            ls = _strings(json_obj["lines"])
-            if ls: return random.choice(ls)
-        # search lists of strings shallow
-        for v in json_obj.values():
-            if isinstance(v, list):
-                ls = _strings(v)
-                if ls: return random.choice(ls)
-            if isinstance(v, dict):
-                for vv in v.values():
-                    if isinstance(vv, list):
-                        ls = _strings(vv)
-                        if ls: return random.choice(ls)
-    if isinstance(json_obj, list):
-        ls = _strings(json_obj)
-        if ls: return random.choice(ls)
-    return "(persona line not found)"
-
-
 def _print_persona():
     context = (os.getenv("LPG_PERSONA_CONTEXT") or "lucky").strip().lower()
     enable = (os.getenv("LPG_PERSONA_ENABLE") or os.getenv("PERSONA_ENABLE") or "1") == "1"
@@ -216,10 +131,9 @@ def _print_persona():
     print("=== PERSONA LOCATE ===")
     print(f"path={os.path.abspath(path)} mode={mode}")
 
-    # Determine tone
+    # tone resolve
     tone = mode
     if mode == "random":
-        # Try weighted from PERSONA_TONE_DIST; else equal weights
         dist_raw = os.getenv("PERSONA_TONE_DIST") or os.getenv("LPG_PERSONA_TONE_DIST") or ""
         selected = None
         try:
@@ -245,20 +159,16 @@ def _print_persona():
     if tone not in ("soft","agro","sharp"):
         tone = "soft"
 
-    # Load JSON and pick a line
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
         line_text = "(persona line not found)"
-        # 1) groups.<tone>[]
         if isinstance(data, dict) and isinstance(data.get("groups"), dict):
             grp = data["groups"].get(tone)
             if isinstance(grp, list):
                 cand = [s for s in grp if isinstance(s, str) and s.strip()]
                 if cand:
                     line_text = random.choice(cand)
-        # 2) top-level <tone>[]
         if line_text == "(persona line not found)" and isinstance(data, dict):
             grp = data.get(tone)
             if isinstance(grp, list):
@@ -271,14 +181,15 @@ def _print_persona():
     print(f"line({tone})={line_text} (alasan: {reason})")
     print()
 
-
+# -------------------------
+# Classify (SIM / REAL via gemini_bridge)
+# -------------------------
 def _import_gemini_bridge():
-    # Attempt normal import
     try:
         from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes  # type: ignore
         return classify_lucky_pull_bytes, "pkg", None
     except Exception as e1:
-        # Fallback: import by file path, ensuring package parents in sys.modules
+        # Fallback by file path
         root_by_cwd = os.path.abspath(os.getcwd())
         root_by_script = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         candidates = [
@@ -345,6 +256,217 @@ def _print_classify(img_path: str, use_real: bool):
         print(f"[{tag}] ok={ok} score={score:.2f} provider={reason}")
     print()
 
+# -------------------------
+# BURST realtime probe (Gemini #1 and #2) with STAGGER + timing
+# -------------------------
+def _mask_key(k: str) -> str:
+    if not k: return ""
+    if len(k) <= 8: return "*"*len(k)
+    return k[:4] + "…" + k[-4:]
+
+def _get_gemini_keys() -> List[str]:
+    raw = os.getenv("GEMINI_API_KEYS","")
+    keys = []
+    if raw.strip():
+        keys = [p.strip() for p in raw.replace(";",",").split(",") if p.strip()]
+    else:
+        k1 = os.getenv("GEMINI_API_KEY","")
+        k2 = os.getenv("GEMINI_API_KEY_B", os.getenv("GEMINI_API_KEYB",""))
+        keys = [k for k in (k1, k2) if k]
+    # dedup while keeping order
+    seen, out = set(), []
+    for k in keys:
+        if k not in seen:
+            seen.add(k); out.append(k)
+    return out
+
+def _build_payload(image_bytes: bytes) -> dict:
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    sys_prompt = (
+        "Classify STRICTLY whether this image is a gacha 'lucky pull' RESULT screen. "
+        "Respond ONLY JSON: {\"lucky\": <bool>, \"score\": <0..1>, \"reason\": <short>, \"flags\": <string[]>}. "
+        "Bias toward FALSE if it's inventory/loadout/profile/status. "
+        "Positive cues: 10-pull grid, NEW!!, rainbow beam, multiple result slots. "
+        "Negative cues: 'Save data', 'Card Count', 'Obtained Equipment', 'Manifest Ego', partners, memory fragments."
+    )
+    return {
+        "contents": [
+            {"role": "user", "parts": [
+                {"text": sys_prompt},
+                {"inline_data": {"mime_type": "image/png", "data": b64}}
+            ]}
+        ],
+        "generationConfig": {"temperature": 0.0, "topP": 0.1}
+    }
+
+async def _burst_realtime(img_bytes: bytes, thr: float) -> Tuple[str, float, dict]:
+    try:
+        import aiohttp
+    except Exception:
+        return ("error:aiohttp_missing", 0.0, {})
+
+    model = os.getenv("GEMINI_MODEL","gemini-2.5-flash-lite")
+    keys = _get_gemini_keys()
+    per_timeout_ms = float(os.getenv("LPG_BURST_TIMEOUT_MS","1400"))
+    stagger_ms = float(os.getenv("LPG_BURST_STAGGER_MS","300"))
+    early_score = float(os.getenv("LPG_BURST_EARLY_EXIT_SCORE","0.90"))
+    mode = os.getenv("LPG_BURST_MODE","stagger").lower()
+
+    payload = _build_payload(img_bytes)
+    url_tpl = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    t0 = time.monotonic()
+    timeline = {
+        "mode": mode, "model": model,
+        "keys": [_mask_key(k) for k in keys],
+        "stagger_ms": stagger_ms, "per_timeout_ms": per_timeout_ms,
+        "t_start": t0, "events": []  # (name, t, extra)
+    }
+
+    async def call_one(session, key, name):
+        url = url_tpl.format(model=model, key=key)
+        t_start = time.monotonic()
+        timeline["events"].append((f"{name}:start", t_start, {}))
+        try:
+            async with session.post(url, json=payload, timeout=per_timeout_ms/1000.0) as resp:
+                st = resp.status
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {"_raw": await resp.text()}
+                t_end = time.monotonic()
+                txt = ""
+                try:
+                    txt = data["candidates"][0]["content"]["parts"][0]["text"]
+                except Exception:
+                    txt = json.dumps(data)[:500]
+                # parse json-ish
+                lucky, score, reason = False, 0.0, "unparseable"
+                try:
+                    obj = None
+                    try:
+                        obj = json.loads(txt)
+                    except Exception:
+                        m = re.search(r"\{.*\}", txt, re.S)
+                        if m: obj = json.loads(m.group(0))
+                    if isinstance(obj, dict):
+                        lucky = bool(obj.get("lucky", False))
+                        score = float(obj.get("score", 0.0))
+                        reason = str(obj.get("reason",""))
+                except Exception:
+                    pass
+                timeline["events"].append((f"{name}:end", t_end, {"status": st, "lucky": lucky, "score": score, "reason": reason[:120]}))
+                return lucky, score, st, reason
+        except asyncio.TimeoutError:
+            t_end = time.monotonic()
+            timeline["events"].append((f"{name}:timeout", t_end, {}))
+            return False, 0.0, "timeout", "request_timeout"
+        except Exception as e:
+            t_end = time.monotonic()
+            timeline["events"].append((f"{name}:error", t_end, {"err": type(e).__name__}))
+            return False, 0.0, "error", type(e).__name__
+
+    async with aiohttp.ClientSession() as session:
+        res1 = res2 = None
+        task1 = task2 = None
+        # fire key1
+        if len(keys) >= 1:
+            task1 = asyncio.create_task(call_one(session, keys[0], "api1"))
+        # optionally fire key2
+        if mode == "parallel" and len(keys) >= 2:
+            task2 = asyncio.create_task(call_one(session, keys[1], "api2"))
+        elif mode == "stagger" and len(keys) >= 2:
+            # schedule after stagger, unless task1 finishes early and hits early_score positive
+            async def delayed():
+                await asyncio.sleep(stagger_ms/1000.0)
+                return await call_one(session, keys[1], "api2")
+            task2 = asyncio.create_task(delayed())
+
+        # collect
+        ok, score, source = False, 0.0, "none"
+        while True:
+            pending = [t for t in (task1, task2) if t and not t.done()]
+            if not pending:
+                break
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=per_timeout_ms/1000.0 + 0.2)
+            for d in done:
+                if d is task1:
+                    res1 = d.result()
+                    l, s, st, _ = res1
+                    if l and s >= early_score:
+                        ok, score, source = True, s, "api1-early"
+                        if task2 and not task2.done():
+                            task2.cancel()
+                        pending = []
+                        break
+                elif d is task2:
+                    res2 = d.result()
+                    l, s, st, _ = res2
+                    if l and s >= early_score:
+                        ok, score, source = True, s, "api2-early"
+                        if task1 and not task1.done():
+                            task1.cancel()
+                        pending = []
+                        break
+            if not pending:
+                break
+
+        # ensure gather results
+        if task1 and not task1.done():
+            try: res1 = await task1
+            except: pass
+        if task2 and not task2.done():
+            try: res2 = await task2
+            except: pass
+
+        # choose best
+        cand = []
+        if res1: cand.append(("api1", res1))
+        if res2: cand.append(("api2", res2))
+        for name, (l, s, st, r) in cand:
+            if l and s > score:
+                ok, score, source = True, s, name
+        if not cand:
+            ok, score, source = False, 0.0, "no-response"
+
+    total = (time.monotonic() - t0) * 1000.0
+    verdict = "LP" if ok and score >= thr else "OTHER"
+    timeline["t_end"] = time.monotonic()
+    timeline["ms_total"] = round(total, 1)
+    timeline["verdict"] = verdict
+    timeline["ok"] = ok
+    timeline["score"] = round(float(score), 3)
+    timeline["source"] = source
+    return verdict, score, timeline
+
+def _print_burst(img_path: str):
+    try:
+        data = open(img_path, "rb").read()
+    except Exception as e:
+        print("=== GEMINI BURST (error) ===")
+        print(f"[SMOKE] cannot read image: {e}"); print(); return
+    thr = float(os.getenv("GEMINI_LUCKY_THRESHOLD","0.85"))
+    print("=== GEMINI BURST (realtime) ===")
+    loop = asyncio.get_event_loop()
+    verdict, score, tl = loop.run_until_complete(_burst_realtime(data, thr))
+    # Pretty print timeline
+    print(f"mode={tl.get('mode')} model={tl.get('model')} keys={tl.get('keys')} stagger_ms={tl.get('stagger_ms')} per_timeout_ms={tl.get('per_timeout_ms')}")
+    for name, t, extra in tl.get("events", []):
+        ms = int((t - tl["t_start"]) * 1000.0)
+        if extra:
+            # clamp reason length
+            reason = extra.get("reason")
+            if reason and len(reason) > 120:
+                extra = dict(extra); extra["reason"] = reason[:120] + "…"
+            print(f"  +{ms:4d}ms {name}: {json.dumps(extra, ensure_ascii=False)}")
+        else:
+            print(f"  +{ms:4d}ms {name}")
+    print(f"TOTAL={tl.get('ms_total')}ms verdict={verdict} ok={bool(tl.get('ok'))} score={tl.get('score')} source={tl.get('source')}  (TIMEOUT? {'yes' if any('timeout' in n for n,_,_ in tl.get('events', [])) else 'no'})")
+    print()
+
+# -------------------------
+# Entry
+# -------------------------
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--img", required=True)
@@ -352,10 +474,14 @@ def main():
     ap.add_argument("--parent", type=int, required=True)
     ap.add_argument("--print-logs", action="store_true")
     ap.add_argument("--real", action="store_true", help="Use REAL bridge classify instead of SIM")
+    ap.add_argument("--burst", action="store_true", help="Run realtime Gemini BURST probe (API1/API2) with timing")
     args = ap.parse_args()
 
     info = _read_env_hybrid()
-    _print_env(info); _print_guard_wiring(); _print_thread_check(args.as_thread, args.parent); _print_policy(); _print_persona(); _print_classify(args.img, use_real=args.real)
+    _print_env(info); _print_guard_wiring(); _print_thread_check(args.as_thread, args.parent); _print_policy(); _print_persona()
+    _print_classify(args.img, use_real=args.real)
+    if args.burst:
+        _print_burst(args.img)
     print("=== SUMMARY ==="); print("result=OK (wiring looks good)")
 
 if __name__ == "__main__":

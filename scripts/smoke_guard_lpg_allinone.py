@@ -1,15 +1,17 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-smoke_guard_lpg_allinone.py (v3)
+smoke_guard_lpg_allinone.py (v3-patched-persona-locate)
 - Default: SIM path (compatible output)
 - --real: use REAL classification via nixe.helpers.gemini_bridge
   with robust import fallbacks & verbose errors.
 - Read-only against runtime_env.json (.env only for tokens)
 """
 from __future__ import annotations
-import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re
+import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re, random
 from datetime import datetime
+from typing import Any, Dict, List
 
 def _exists(p): 
     try: return os.path.exists(p)
@@ -107,32 +109,168 @@ def _print_policy():
     print(f"STRICT_ON_GUARD={1 if strict else 0} timeout={timeout:.1f}s redirect={redirect}")
     print(f"Persona only for: {persona_only_for} | allowed providers: {persona_allowed}"); print()
 
+# -------------------------
+# Persona Locate (patched): real JSON, weighted random
+# -------------------------
+
+def _parse_weights_from_env() -> Dict[str, float]:
+    # Support the same shapes your runtime uses:
+    # - PERSONA_TONE_DIST='{"soft":0.5,"agro":0.25,"sharp":0.25}'
+    # - PERSONA_TONE_SOFT / PERSONA_TONE_AGRO / PERSONA_TONE_SHARP
+    # - PERSONA_TONE="soft=0.5,agro=0.5,sharp=0.5" (will be normalized)
+    dist = {}
+    raw = os.getenv("PERSONA_TONE_DIST") or os.getenv("LPG_PERSONA_TONE_DIST") or ""
+    if raw:
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                dist = {k.lower(): float(v) for k,v in obj.items()}
+        except Exception:
+            pass
+    if not dist:
+        for key, tone in (("PERSONA_TONE_SOFT","soft"),("PERSONA_TONE_AGRO","agro"),("PERSONA_TONE_SHARP","sharp")):
+            val = os.getenv(key) or os.getenv("LPG_"+key) or ""
+            if val:
+                try: dist[tone] = float(val)
+                except: pass
+    if not dist:
+        inline = os.getenv("PERSONA_TONE") or os.getenv("LPG_PERSONA_TONE") or ""
+        if inline and any(ch in inline for ch in ("=",":")):
+            pairs = [p.strip() for p in inline.replace(":", "=").split(",")]
+            for p in pairs:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    try:
+                        dist[k.strip().lower()] = float(v.strip())
+                    except:
+                        pass
+    # default equal weights if still empty
+    if not dist:
+        dist = {"soft": 1.0, "agro": 1.0, "sharp": 1.0}
+    # normalize
+    s = sum(max(0.0, v) for v in dist.values()) or 1.0
+    return {k: max(0.0, v)/s for k,v in dist.items()}
+
+def _weighted_choice(d: Dict[str,float]) -> str:
+    r = random.random()
+    acc = 0.0
+    for k, w in d.items():
+        acc += w
+        if r <= acc:
+            return k
+    return next(iter(d.keys()))
+
+def _pick_persona_line(json_obj: Any, context: str, tone: str) -> str:
+    # Try common shapes:
+    # 1) data[context][tone] -> [lines]
+    # 2) data[tone] -> [lines]
+    # 3) data["lines"] -> [lines of str]
+    # Fallback: search any list of strings
+    def _strings(lst):
+        return [s for s in lst if isinstance(s, str) and s.strip()]
+
+    if isinstance(json_obj, dict):
+        if context in json_obj and isinstance(json_obj[context], dict):
+            sec = json_obj[context]
+            if tone in sec and isinstance(sec[tone], list):
+                ls = _strings(sec[tone])
+                if ls: return random.choice(ls)
+            # any list under context
+            for v in sec.values():
+                if isinstance(v, list):
+                    ls = _strings(v)
+                    if ls: return random.choice(ls)
+        if tone in json_obj and isinstance(json_obj[tone], list):
+            ls = _strings(json_obj[tone])
+            if ls: return random.choice(ls)
+        if "lines" in json_obj and isinstance(json_obj["lines"], list):
+            ls = _strings(json_obj["lines"])
+            if ls: return random.choice(ls)
+        # search lists of strings shallow
+        for v in json_obj.values():
+            if isinstance(v, list):
+                ls = _strings(v)
+                if ls: return random.choice(ls)
+            if isinstance(v, dict):
+                for vv in v.values():
+                    if isinstance(vv, list):
+                        ls = _strings(vv)
+                        if ls: return random.choice(ls)
+    if isinstance(json_obj, list):
+        ls = _strings(json_obj)
+        if ls: return random.choice(ls)
+    return "(persona line not found)"
+
+
 def _print_persona():
     context = (os.getenv("LPG_PERSONA_CONTEXT") or "lucky").strip().lower()
     enable = (os.getenv("LPG_PERSONA_ENABLE") or os.getenv("PERSONA_ENABLE") or "1") == "1"
-    mode = os.getenv("LPG_PERSONA_MODE") or os.getenv("PERSONA_MODE") or "yandere"
-    tone = os.getenv("LPG_PERSONA_TONE") or os.getenv("PERSONA_TONE") or os.getenv("PERSONA_GROUP") or "soft"
+    mode = (os.getenv("LPG_PERSONA_MODE") or os.getenv("PERSONA_MODE") or "yandere").strip().lower()
     reason = os.getenv("LPG_PERSONA_REASON") or os.getenv("PERSONA_REASON") or "Tebaran Garam"
     path = os.getenv("LPG_PERSONA_PATH") or os.getenv("PERSONA_PATH") or "nixe/config/yandere.json"
+
     print("=== PERSONA SANITY ===")
     print(f"lucky -> persona={'True' if (enable and context=='lucky') else 'False'} (ok)" if context=='lucky' else f"{context} -> persona={'True' if enable else 'False'}")
     print("phish -> persona=False (skip: phishing context)  # expected False"); print()
-    sample = f"sample({tone})=contoh persona untuk mode={mode} reason={reason}"
-    try:
-        if os.path.exists(path):
-            txt = open(path,"r",encoding="utf-8").read()
-            sample_line = None
-            for ln in txt.splitlines():
-                ln = ln.strip()
-                if ln and not ln.startswith('{') and not ln.startswith('[') and len(ln) < 160:
-                    sample_line = ln; break
-            if sample_line:
-                sample = f"sample({tone})={sample_line} (alasan: {reason})"
-    except Exception:
-        pass
+
     print("=== PERSONA LOCATE ===")
     print(f"path={os.path.abspath(path)} mode={mode}")
-    print(sample); print()
+
+    # Determine tone
+    tone = mode
+    if mode == "random":
+        # Try weighted from PERSONA_TONE_DIST; else equal weights
+        dist_raw = os.getenv("PERSONA_TONE_DIST") or os.getenv("LPG_PERSONA_TONE_DIST") or ""
+        selected = None
+        try:
+            if dist_raw:
+                obj = json.loads(dist_raw)
+                if isinstance(obj, dict):
+                    total = sum(float(v) for v in obj.values() if float(v) > 0)
+                    total = total if total > 0 else 1.0
+                    r = random.random() * total
+                    acc = 0.0
+                    for k,v in obj.items():
+                        w = float(v)
+                        if w <= 0: 
+                            continue
+                        acc += w
+                        if r <= acc:
+                            selected = k
+                            break
+        except Exception:
+            selected = None
+        tone = (selected or random.choice(["soft","agro","sharp"])).lower()
+
+    if tone not in ("soft","agro","sharp"):
+        tone = "soft"
+
+    # Load JSON and pick a line
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        line_text = "(persona line not found)"
+        # 1) groups.<tone>[]
+        if isinstance(data, dict) and isinstance(data.get("groups"), dict):
+            grp = data["groups"].get(tone)
+            if isinstance(grp, list):
+                cand = [s for s in grp if isinstance(s, str) and s.strip()]
+                if cand:
+                    line_text = random.choice(cand)
+        # 2) top-level <tone>[]
+        if line_text == "(persona line not found)" and isinstance(data, dict):
+            grp = data.get(tone)
+            if isinstance(grp, list):
+                cand = [s for s in grp if isinstance(s, str) and s.strip()]
+                if cand:
+                    line_text = random.choice(cand)
+    except Exception as e:
+        line_text = f"(persona load err: {e})"
+
+    print(f"line({tone})={line_text} (alasan: {reason})")
+    print()
+
 
 def _import_gemini_bridge():
     # Attempt normal import

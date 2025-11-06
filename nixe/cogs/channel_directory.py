@@ -1,181 +1,156 @@
 
-"""
-Channel Directory (natural trigger) with full TTL for all messages.
-
-- Natural trigger: "nixe channel list" (no "!")
-- Reads config from runtime_env.json (env overlay) and JSON layout file:
-  CHANNEL_DIR_JSON_PATH -> default: nixe/config/channel_directory.json
-- Auto delete ALL messages after CHANNEL_DIR_AUTO_DELETE_SEC (default 10s)
-- Keeps optional ping to user via CHANNEL_DIR_PING_ON_HELP=1
-"""
-
-from __future__ import annotations
+# -*- coding: utf-8 -*-
 import os
-import json
 import re
 import asyncio
 import logging
-from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Optional
 
 import discord
 from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-def _get_env_bool(name: str, default: str = "0") -> bool:
-    v = os.getenv(name, default)
-    return str(v).strip() in ("1", "true", "True", "yes", "on")
+TRIGGERS_DEFAULT = [
+    "nixe channel list",
+    "nixe list channel",
+    "nixe channels",
+    "channel list nixe",
+]
 
-def _get_env_int(name: str, default: str = "0") -> int:
-    try:
-        return int(float(str(os.getenv(name, default)).strip()))
-    except Exception:
-        return int(default)
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return str(v) if v is not None else default
 
-def _color_from_any(v: Optional[str]) -> discord.Color:
-    if not v:
-        return discord.Color.blurple()
-    s = str(v).strip()
+def _parse_ids(s: str) -> List[int]:
+    out: List[int] = []
+    if not s:
+        return out
+    s = s.replace(";", ",")
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except Exception:
+            pass
+    return out
+
+def _mention(i: Optional[int]) -> str:
     try:
-        if s.startswith("#"):
-            return discord.Color(int(s[1:], 16))
-        if s.startswith("0x"):
-            return discord.Color(int(s, 16))
-        return discord.Color(int(s))
+        if not i or int(i) <= 0:
+            return "-"
+        return f"<#{int(i)}>"
     except Exception:
-        return discord.Color.blurple()
+        return "-"
+
+def _join_mentions(ids: List[int]) -> str:
+    if not ids:
+        return "-"
+    return ", ".join(_mention(i) for i in ids)
 
 class ChannelDirectory(commands.Cog):
+    """Plain-text channel directory: 'nixe channel list' (no prefix).
+    Sends up to 3 messages and deletes them (and the trigger) after TTL seconds.
+    """
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Runtime env
-        self.json_path = os.getenv("CHANNEL_DIR_JSON_PATH", "nixe/config/channel_directory.json")
-        self.auto_delete = _get_env_int("CHANNEL_DIR_AUTO_DELETE_SEC", "10")
-        self.ping_on_help = _get_env_bool("CHANNEL_DIR_PING_ON_HELP", "0")
-        self.compact = _get_env_bool("CHANNEL_DIR_COMPACT", "1")
-        # In case user prefers inline JSON via env
-        self.inline_json = os.getenv("CHANNEL_DIR_ITEMS_JSON", "")
+        self.triggers = self._load_triggers()
+        self.ttl = max(1, int(_env("CHANLIST_TTL_SEC", "10")))
+        self.cooldown = max(0, int(_env("CHANLIST_COOLDOWN_SEC", "3")))
+        self._recent: set[int] = set()
+        log.info("[chan-list] ready; ttl=%ss cooldown=%ss triggers=%s", self.ttl, self.cooldown, self.triggers)
 
-        # Pre-load config
-        try:
-            self.config = self._load_config()
-            log.info("[channel-dir] loaded config from %s (sections=%d)",
-                     self.json_path, len(self.config.get("sections", [])))
-        except Exception as e:
-            log.exception("[channel-dir] failed to load config: %s", e)
-            self.config = {"title": "Channel Directory", "sections": []}
+    def _load_triggers(self) -> List[str]:
+        raw = _env("CHANLIST_TRIGGERS", "")
+        if raw.strip():
+            arr = [x.strip().lower() for x in re.split(r"[,\n;]", raw) if x.strip()]
+            if arr:
+                return arr
+        return [t.lower() for t in TRIGGERS_DEFAULT]
 
-    # ---------- helpers ----------
-    def _load_config(self) -> dict:
-        # 1) Try file
-        p = Path(self.json_path)
-        if p.exists():
-            with p.open("r", encoding="utf-8") as f:
-                return json.load(f)
-        # 2) Try inline JSON
-        if self.inline_json:
-            return json.loads(self.inline_json)
-        # 3) Fallback skeleton
-        return {"title": "Channel Directory", "sections": []}
+    # --- wiring helpers (read from env exported by runtime_env.json) ---
+    def _wiring_lpg(self) -> str:
+        guard = _parse_ids(_env("LPG_GUARD_CHANNELS", _env("LUCKYPULL_GUARD_CHANNELS","")))
+        redirect = int(_env("LPG_REDIRECT_CHANNEL_ID", _env("LUCKYPULL_REDIRECT_CHANNEL_ID","0")) or 0)
+        wl_thread = int(_env("LPG_WHITELIST_THREAD_ID", "0") or 0)
+        neg_thread = int(_env("PHASH_IMAGEPHISH_THREAD_ID", "0") or 0)  # reuse inbox thread as FP box if set
+        lines = [
+            f"**Guard** : {_join_mentions(guard)}",
+            f"**Redirect** : {_mention(redirect)}",
+            f"**Whitelist (FP)** : {_mention(wl_thread)}",
+            f"**Mirror Inbox** : {_mention(neg_thread)}",
+        ]
+        return "\n".join(lines)
 
-    def _match_natural_command(self, content: str) -> bool:
-        # Accept: "nixe channel list" / "nixe @channel list" / "nixe channels list"
-        c = content.lower().strip()
-        if "nixe" not in c:
-            return False
-        return bool(re.search(r"\bnixe\b.*\bchannel[s]?\s+list\b", c))
+    def _wiring_phish(self) -> str:
+        db_parent = int(_env("PHASH_DB_PARENT_CHANNEL_ID","0") or 0)
+        db_thread = int(_env("PHASH_DB_THREAD_ID","0") or 0)
+        img_thread = int(_env("PHASH_IMAGEPHISH_THREAD_ID","0") or 0)
+        log_chan = int(_env("NIXE_PHISH_LOG_CHAN_ID", _env("PHISH_LOG_CHAN_ID","0")) or 0)
+        lines = [
+            f"**DB Parent** : {_mention(db_parent)}",
+            f"**DB Thread** : {_mention(db_thread)}",
+            f"**Image Inbox** : {_mention(img_thread)}",
+            f"**Phish Log** : {_mention(log_chan)}",
+        ]
+        return "\n".join(lines)
 
-    def _build_embeds(self, guild: Optional[discord.Guild]) -> List[Tuple[discord.Embed, Optional[discord.ui.View]]]:
-        cfg = self.config or {}
-        title = cfg.get("title") or "Channel Directory"
-        color = _color_from_any(cfg.get("color"))
-        footer = cfg.get("footer") or ""
-        sections = cfg.get("sections") or []
+    def _wiring_misc(self) -> str:
+        log_chan = int(_env("LOG_CHANNEL_ID","0") or 0)
+        casino_scope = _parse_ids(_env("CRYPTO_CASINO_SCOPE",""))
+        protect = [_env("PHASH_DB_THREAD_ID","0"), _env("PHASH_IMAGEPHISH_THREAD_ID","0")]
+        protect = [int(x) for x in protect if str(x).isdigit()]
+        lines = [
+            f"**Log** : {_mention(log_chan)}",
+            f"**Casino Scope** : {_join_mentions(casino_scope)}",
+            f"**Protected** : {_join_mentions(protect)}",
+        ]
+        return "\n".join(lines)
 
-        items: List[Tuple[discord.Embed, Optional[discord.ui.View]]] = []
-
-        for sec in sections:
-            sec_title = str(sec.get("title") or "").strip() or title
-            embed = discord.Embed(title=sec_title, color=color)
-            desc_lines = []
-            for it in sec.get("items", []):
-                # Prefer channel mention by id if available
-                mention = None
-                if "id" in it and guild:
-                    try:
-                        ch = guild.get_channel(int(it["id"])) or guild.get_thread(int(it["id"]))
-                        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.VoiceChannel, discord.StageChannel, discord.CategoryChannel)):
-                            mention = ch.mention
-                    except Exception:
-                        pass
-                mention = mention or it.get("mention") or it.get("name") or "—"
-                note = it.get("note") or it.get("desc") or ""
-                if note:
-                    desc_lines.append(f"• {mention} — {note}")
-                else:
-                    desc_lines.append(f"• {mention}")
-            if desc_lines:
-                embed.description = "\n".join(desc_lines)
-            if footer:
-                embed.set_footer(text=footer)
-            items.append((embed, None))
-        # If no sections, send one fallback embed
-        if not items:
-            embed = discord.Embed(title=title, description="(no items configured)", color=color)
-            if footer:
-                embed.set_footer(text=footer)
-            items.append((embed, None))
-        return items
-
-    async def _send_embeds(self, destination: discord.abc.Messageable, author: Optional[discord.Member] = None):
-        items = self._build_embeds(getattr(destination, "guild", None))
-        ttl = float(self.auto_delete) if self.auto_delete and self.auto_delete > 0 else None
-
-        first_content = None
-        if self.ping_on_help and author is not None:
-            first_content = author.mention
-
-        first = True
-        sent_msgs: List[discord.Message] = []
-        for em, view in items:
-            # Apply delete_after to all messages if ttl set
-            kwargs = {"embed": em}
-            if view is not None:
-                kwargs["view"] = view
-            if first and first_content:
-                kwargs["content"] = first_content
-            if ttl:
-                kwargs["delete_after"] = ttl
-            msg = await destination.send(**kwargs)
-            sent_msgs.append(msg)
-            first = False
-
-        # Safety net for old behavior when ttl missing: delete first only
-        if not ttl and self.auto_delete > 0 and sent_msgs:
+    async def _delete_later(self, *msgs: discord.Message):
+        await asyncio.sleep(self.ttl)
+        for m in msgs:
             try:
-                await asyncio.sleep(self.auto_delete)
-                await sent_msgs[0].delete()
+                await m.delete()
             except Exception:
                 pass
 
-    # ---------- listeners & optional command ----------
-    @commands.Cog.listener("on_message")
-    async def on_message(self, message: discord.Message):
-        if not message or message.author.bot:
-            return
-        if not self._match_natural_command(message.content or ""):
-            return
-        try:
-            await self._send_embeds(message.channel, author=message.author)
-        except Exception as e:
-            log.exception("[channel-dir] failed to send directory: %s", e)
+    def _match_trigger(self, content: str) -> bool:
+        c = content.lower().strip()
+        return any(c == t or c.startswith(t) for t in self.triggers)
 
-    @commands.command(name="channel", help="Show channel list")
-    async def cmd_channel(self, ctx: commands.Context, *, sub: str = ""):
-        # Support legacy "!channel list" if someone still uses it
-        if "list" in (sub or "").lower():
-            await self._send_embeds(ctx.channel, author=getattr(ctx, "author", None))
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # ignore bots & DMs
+        if not message.guild or message.author.bot:
+            return
+        if not self._match_trigger(message.content):
+            return
+        # simple anti-spam per-channel
+        if self.cooldown:
+            if message.channel.id in self._recent:
+                return
+            self._recent.add(message.channel.id)
+            async def _rm():
+                await asyncio.sleep(self.cooldown)
+                self._recent.discard(message.channel.id)
+            asyncio.create_task(_rm())
+
+        # build payloads
+        try:
+            p1 = discord.Embed(title="Nixe • Channel List (LPG)", description=self._wiring_lpg())
+            p2 = discord.Embed(title="Nixe • Channel List (PHISHING)", description=self._wiring_phish(), color=0xE67E22)
+            p3 = discord.Embed(title="Nixe • Channel List (MISC)", description=self._wiring_misc(), color=0x95A5A6)
+            s1 = await message.channel.send(embed=p1)
+            s2 = await message.channel.send(embed=p2)
+            s3 = await message.channel.send(embed=p3)
+            # schedule deletion of bot messages + trigger
+            asyncio.create_task(self._delete_later(message, s1, s2, s3))
+        except Exception as e:
+            log.exception("channel list send failed: %r", e)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(ChannelDirectory(bot))

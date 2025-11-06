@@ -1,14 +1,10 @@
+
 from __future__ import annotations
 import os, asyncio, logging, base64
-from typing import Optional
 from discord.ext import commands, tasks
 
 log = logging.getLogger("nixe.cogs.a16_gemini_keepalive_overlay")
-
-# 1x1 transparent PNG
-_PNG_1x1 = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ZWl2t0AAAAASUVORK5CYII="
-)
+_PNG_1x1 = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/ZWl2t0AAAAASUVORK5CYII=")
 
 class GeminiKeepAlive(commands.Cog):
     def __init__(self, bot: commands.Bot):

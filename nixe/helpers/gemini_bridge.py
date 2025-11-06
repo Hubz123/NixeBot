@@ -1,7 +1,9 @@
+
 from __future__ import annotations
 import os, json, logging, asyncio, re, time, hashlib
 from typing import Dict, Any, List, Tuple
 
+REV = "F4"  # visible in logs
 log = logging.getLogger("nixe.helpers.gemini_bridge")
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -9,10 +11,13 @@ _CONCURRENCY = int(os.getenv("GEMINI_CONCURRENCY", "1"))
 _RPM = max(1, int(os.getenv("GEMINI_RPM", "6")))
 _CACHE_TTL = int(os.getenv("GEMINI_CACHE_TTL_SEC", "600"))
 _SIM = (os.getenv("GEMINI_SIM_HEURISTIC", "0") == "1")
+_NEG_DEBUG = (os.getenv("LPG_NEG_DEBUG","1") == "1")
 
 _SEM = asyncio.Semaphore(_CONCURRENCY)
 _tokens = {"budget": _RPM, "reset": time.monotonic() + 60.0}
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+log.info("[gemini-bridge] rev=%s model=%s conc=%s rpm=%s", REV, GEMINI_MODEL, _CONCURRENCY, _RPM)
 
 def _now() -> float:
     return time.monotonic()
@@ -34,7 +39,6 @@ async def _rate_limit():
 def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()
 
-# ================= ENV HINTS ===================
 def _get_neg_texts() -> List[str]:
     out: List[str] = []
     raw = os.getenv("LPG_NEGATIVE_TEXT")
@@ -48,6 +52,8 @@ def _get_neg_texts() -> List[str]:
     if not out:
         legacy = os.getenv("LPG_NEG_TEXT_PATTERNS", "")
         out = [p.strip().lower() for p in re.split(r"[|,;]", legacy) if p.strip()]
+    if _NEG_DEBUG:
+        log.info("[gemini-bridge] neg_list=%d first=%s", len(out), out[:5])
     return out
 
 def _get_pos_hints() -> List[str]:
@@ -62,7 +68,7 @@ def _build_prompt(context: str) -> str:
         "Respond ONLY in strict JSON with keys: ok (bool), score (0..1), reason (string).",
         "score = confidence that this is a lucky-pull RESULT screen.",
         "POSITIVE cues: result grid of pulls, NEW!! popup, star/rarity, duplicate shards, banner/result panel.",
-        "NEGATIVE cues: inventory, equipment/loadout/build editor, deck/card list, save data/date, settings, shop UI.",
+        "NEGATIVE cues: inventory, equipment/loadout/build editor, deck/card list, save data/date, settings, shop UI."
     ]
     if pos:
         lines.append(f"Additional positive hints: {pos}.")
@@ -71,7 +77,24 @@ def _build_prompt(context: str) -> str:
     if context:
         lines.append(f"Context tag: {context}")
     lines.append("Answer with JSON only.")
-    return "\n".join(lines)
+    return "\\n".join(lines)
+
+def _apply_neg_clamp_from_text(txt: str, ok: bool, score: float, reason: str) -> Dict[str, Any]:
+    neg = _get_neg_texts()
+    hits: List[str] = []
+    if neg:
+        low = (txt or "").lower()
+        hits = [w for w in neg if w and w in low]
+        if hits:
+            prev = score
+            score = min(score, 0.15)
+            if ok and score < 0.5:
+                ok = False
+            tag = ",".join(hits[:5]) + ("+more" if len(hits) > 5 else "")
+            reason = (reason + f"|neg_clamp({tag})").strip("|")
+            if _NEG_DEBUG:
+                log.warning("[gemini-bridge] NEG-CLAMP rev=%s hits=%s prev=%.2f -> %.2f", REV, hits[:5], prev, score)
+    return {"ok": ok, "score": score, "reason": reason}
 
 async def _gemini_call(img_bytes: bytes, key: str, context: str) -> Dict[str, Any]:
     if _SIM:
@@ -91,7 +114,7 @@ async def _gemini_call(img_bytes: bytes, key: str, context: str) -> Dict[str, An
         resp = await asyncio.get_event_loop().run_in_executor(None, lambda: model.generate_content([prompt, img_part]))
         txt = getattr(resp, "text", "") or ""
 
-        # --- Robust JSON parse from any mixed output ---
+        # Try to parse JSON
         data = {}
         try:
             data = json.loads(txt)
@@ -103,27 +126,19 @@ async def _gemini_call(img_bytes: bytes, key: str, context: str) -> Dict[str, An
                 except Exception:
                     data = {}
 
-        if not isinstance(data, dict) or not data:
-            return {"ok": False, "score": 0.0, "reason": "non_json_response", "provider": f"gemini:{GEMINI_MODEL}"}
+        if isinstance(data, dict) and data:
+            ok = bool(data.get("ok", False))
+            score = float(data.get("score", 0.0))
+            reason = str(data.get("reason", "")) or "model_json"
+            out = _apply_neg_clamp_from_text(txt, ok, score, reason)
+            out["provider"] = f"gemini:{GEMINI_MODEL}"
+            return out
 
-        ok = bool(data.get("ok", False))
-        score = float(data.get("score", 0.0))
-        reason = str(data.get("reason", "")) or "model_json"
+        # Non-JSON fallback: clamp using raw text
+        out = _apply_neg_clamp_from_text(txt, False, 0.9, "non_json_response")
+        out["provider"] = f"gemini:{GEMINI_MODEL}"
+        return out
 
-        # --- Strong negative clamp using env list ---
-        neg = _get_neg_texts()
-        hits: List[str] = []
-        if neg:
-            low_txt = txt.lower()
-            hits = [w for w in neg if w and w in low_txt]
-            if hits:
-                score = min(score, 0.15)
-                if ok and score < 0.5:
-                    ok = False
-                tag = ",".join(hits[:3]) + ("+more" if len(hits) > 3 else "")
-                reason = (reason + f"|neg_clamp({tag})").strip("|")
-
-        return {"ok": ok, "score": score, "reason": reason, "provider": f"gemini:{GEMINI_MODEL}"}
     except Exception as e:
         return {"ok": False, "score": 0.0, "reason": f"gemini_error:{type(e).__name__}", "provider": f"gemini:{GEMINI_MODEL}"}
 
@@ -132,8 +147,7 @@ def _gemini_keys() -> List[str]:
     return [k for k in keys if k]
 
 async def classify_lucky_pull_bytes(img_bytes: bytes, context: str = "lpg") -> Dict[str, Any]:
-    # cache check
-    key = _sha1(img_bytes)
+    key = hashlib.sha1(img_bytes).hexdigest()
     now = time.monotonic()
     entry = _cache.get(key)
     if entry and (now - entry[0] <= _CACHE_TTL):
@@ -147,12 +161,10 @@ async def classify_lucky_pull_bytes(img_bytes: bytes, context: str = "lpg") -> D
         for api_key in _gemini_keys():
             for attempt in range(2):
                 res = await _gemini_call(img_bytes, api_key, context)
-                reason = res.get("reason","")
-                if reason != "gemini_sdk_missing":
-                    result = res
+                result = res
+                if res.get("reason","") != "gemini_sdk_missing":
                     break
-                if attempt == 0 and (reason == "non_json_response" or str(reason).startswith("gemini_error")):
-                    await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
             if result.get("reason","") != "gemini_sdk_missing":
                 break
 

@@ -386,66 +386,66 @@ async def _burst_realtime(img_bytes: bytes, thr: float) -> Tuple[str, float, dic
             ok, score, source, _ = await _run_sequential(session, keys, per_timeout_ms, early_score)
         else:
             res1 = res2 = None
-        task1 = task2 = None
-        # fire key1
-        if len(keys) >= 1:
-            task1 = asyncio.create_task(call_one(session, keys[0], "api1"))
-        # optionally fire key2
-        if mode == "parallel" and len(keys) >= 2:
-            task2 = asyncio.create_task(call_one(session, keys[1], "api2"))
-        elif mode == "stagger" and len(keys) >= 2:
-            # schedule after stagger, unless task1 finishes early and hits early_score positive
-            async def delayed():
-                await asyncio.sleep(stagger_ms/1000.0)
-                return await call_one(session, keys[1], "api2")
-            task2 = asyncio.create_task(delayed())
-
-        # collect
-        ok, score, source = False, 0.0, "none"
-        while True:
-            pending = [t for t in (task1, task2) if t and not t.done()]
-            if not pending:
-                break
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=per_timeout_ms/1000.0 + 0.2)
-            for d in done:
-                if d is task1:
-                    res1 = d.result()
-                    l, s, st, _ = res1
-                    if l and s >= early_score:
-                        ok, score, source = True, s, "api1-early"
-                        if task2 and not task2.done():
-                            task2.cancel()
-                        pending = []
+                task1 = task2 = None
+                # fire key1
+                if len(keys) >= 1:
+                    task1 = asyncio.create_task(call_one(session, keys[0], "api1"))
+                # optionally fire key2
+                if mode == "parallel" and len(keys) >= 2:
+                    task2 = asyncio.create_task(call_one(session, keys[1], "api2"))
+                elif mode == "stagger" and len(keys) >= 2:
+                    # schedule after stagger, unless task1 finishes early and hits early_score positive
+                    async def delayed():
+                        await asyncio.sleep(stagger_ms/1000.0)
+                        return await call_one(session, keys[1], "api2")
+                    task2 = asyncio.create_task(delayed())
+        
+                # collect
+                ok, score, source = False, 0.0, "none"
+                while True:
+                    pending = [t for t in (task1, task2) if t and not t.done()]
+                    if not pending:
                         break
-                elif d is task2:
-                    res2 = d.result()
-                    l, s, st, _ = res2
-                    if l and s >= early_score:
-                        ok, score, source = True, s, "api2-early"
-                        if task1 and not task1.done():
-                            task1.cancel()
-                        pending = []
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=per_timeout_ms/1000.0 + 0.2)
+                    for d in done:
+                        if d is task1:
+                            res1 = d.result()
+                            l, s, st, _ = res1
+                            if l and s >= early_score:
+                                ok, score, source = True, s, "api1-early"
+                                if task2 and not task2.done():
+                                    task2.cancel()
+                                pending = []
+                                break
+                        elif d is task2:
+                            res2 = d.result()
+                            l, s, st, _ = res2
+                            if l and s >= early_score:
+                                ok, score, source = True, s, "api2-early"
+                                if task1 and not task1.done():
+                                    task1.cancel()
+                                pending = []
+                                break
+                    if not pending:
                         break
-            if not pending:
-                break
-
-        # ensure gather results
-        if task1 and not task1.done():
-            try: res1 = await task1
-            except: pass
-        if task2 and not task2.done():
-            try: res2 = await task2
-            except: pass
-
-        # choose best
-        cand = []
-        if res1: cand.append(("api1", res1))
-        if res2: cand.append(("api2", res2))
-        for name, (l, s, st, r) in cand:
-            if l and s > score:
-                ok, score, source = True, s, name
-        if not cand:
-            ok, score, source = False, 0.0, "no-response"
+        
+                # ensure gather results
+                if task1 and not task1.done():
+                    try: res1 = await task1
+                    except: pass
+                if task2 and not task2.done():
+                    try: res2 = await task2
+                    except: pass
+        
+                # choose best
+                cand = []
+                if res1: cand.append(("api1", res1))
+                if res2: cand.append(("api2", res2))
+                for name, (l, s, st, r) in cand:
+                    if l and s > score:
+                        ok, score, source = True, s, name
+                if not cand:
+                    ok, score, source = False, 0.0, "no-response"
 
     total = (time.monotonic() - t0) * 1000.0
     verdict = "LP" if ok and score >= thr else "OTHER"

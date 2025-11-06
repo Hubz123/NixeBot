@@ -48,7 +48,7 @@
   "LUCKYPULL_TIMEOUT_SEC": "10",
   "LPG_NEG_DEBUG": "1",
   "--- SEGMENT: LPG False-Positive Clamp ---": "=============================",
-  "LPG_GEMINI_THRESHOLD": "0.80",
+  "LPG_GEMINI_THRESHOLD": "0.88",
   "LPG_CONF_EPSILON": "0.03",
   "LPG_NEGATIVE_TEXT": [
     "build",

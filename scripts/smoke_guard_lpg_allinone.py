@@ -46,7 +46,6 @@ def _read_env_hybrid():
         "env_exported_tokens": 0,
         "policy": "priority: runtime_env.json for configs; .env ONLY for *_API_KEY/*_TOKEN/*_SECRET",
         "GEMINI_API_KEY": False,
-        "GEMINI_API_KEY_B": False,
         "GROQ_API_KEY": False,
         "DISCORD_TOKEN": False,
         "error": None
@@ -56,7 +55,7 @@ def _read_env_hybrid():
             data = json.load(open(rpath, "r", encoding="utf-8"))
             info["runtime_env_json_keys"] = len(data)
             for k,v in data.items():
-                if ("API_KEY" in k) or k.endswith(("_TOKEN","_SECRET")):
+                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
                     info["runtime_env_tokens_skipped"] += 1
                     continue
                 os.environ.setdefault(str(k), str(v))
@@ -71,14 +70,13 @@ def _read_env_hybrid():
             for ln in lines:
                 k, _, v = ln.partition("=")
                 k=k.strip(); v=v.strip()
-                if ("API_KEY" in k) or k.endswith(("_TOKEN","_SECRET")):
+                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
                     os.environ.setdefault(k, v)
                     info["env_exported_tokens"] += 1
     except Exception as e:
         info["error"] = f".env: {e}"
 
     info["GEMINI_API_KEY"] = bool(os.getenv("GEMINI_API_KEY"))
-    info["GEMINI_API_KEY_B"] = bool(os.getenv("GEMINI_API_KEY_B"))
     info["GROQ_API_KEY"] = bool(os.getenv("GROQ_API_KEY"))
     info["DISCORD_TOKEN"] = bool(os.getenv("DISCORD_TOKEN"))
     return info
@@ -312,6 +310,7 @@ async def _burst_realtime(img_bytes: bytes, thr: float) -> Tuple[str, float, dic
     stagger_ms = float(os.getenv("LPG_BURST_STAGGER_MS","300"))
     early_score = float(os.getenv("LPG_BURST_EARLY_EXIT_SCORE","0.90"))
     mode = os.getenv("LPG_BURST_MODE","stagger").lower()
+    fallback_margin_ms = float(os.getenv("LPG_FALLBACK_MARGIN_MS","1200"))
 
     payload = _build_payload(img_bytes)
     url_tpl = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -365,9 +364,28 @@ async def _burst_realtime(img_bytes: bytes, thr: float) -> Tuple[str, float, dic
             t_end = time.monotonic()
             timeline["events"].append((f"{name}:error", t_end, {"err": type(e).__name__}))
             return False, 0.0, "error", type(e).__name__
+    async def _run_sequential(session, keys, per_timeout_ms, early_score):
+        # Fire key#1 first (reduced timeout to leave margin), fallback to key#2 only if needed.
+        t1 = max(800.0, per_timeout_ms - fallback_margin_ms)
+        k1 = keys[0]
+        lucky1, score1, st1, reason1 = await call_one(session, k1, "api1")
+        if lucky1 and score1 >= early_score:
+            return True, score1, "api1-early", reason1
+        need_fb = (st1 in ("timeout","error")) or ("429" in str(reason1)) or (not lucky1)
+        if len(keys) >= 2 and need_fb:
+            k2 = keys[1]
+            lucky2, score2, st2, reason2 = await call_one(session, k2, "api2")
+            if (lucky2 and score2 >= score1) or not lucky1:
+                return lucky2, score2, "api2", reason2
+        return lucky1, score1, "api1", reason1
+
 
     async with aiohttp.ClientSession() as session:
-        res1 = res2 = None
+                # Sequential mode (deadline fallback) for quota saving
+        if mode == "sequential" and len(keys) >= 1:
+            ok, score, source, _ = await _run_sequential(session, keys, per_timeout_ms, early_score)
+        else:
+            res1 = res2 = None
         task1 = task2 = None
         # fire key1
         if len(keys) >= 1:

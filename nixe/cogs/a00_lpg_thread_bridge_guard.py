@@ -49,7 +49,7 @@ class LPGThreadBridgeGuard(commands.Cog):
         self.redirect_id = int(os.getenv("LPG_REDIRECT_CHANNEL_ID") or os.getenv("LUCKYPULL_REDIRECT_CHANNEL_ID") or "0")
         self.guard_ids = set(_parse_ids(os.getenv("LPG_GUARD_CHANNELS","") or os.getenv("LUCKYPULL_GUARD_CHANNELS","")))
         self.timeout = float(os.getenv("LPG_TIMEOUT_SEC", os.getenv("LUCKYPULL_TIMEOUT_SEC","10")))
-        self.thr = float(os.getenv("GEMINI_LUCKY_THRESHOLD","0.85"))
+        self.thr = float(os.getenv("LPG_GEMINI_THRESHOLD") or os.getenv("GEMINI_LUCKY_THRESHOLD","0.85"))
         self.require_classify = (os.getenv("LPG_REQUIRE_CLASSIFY") or "1") == "1"
         try:
             self.max_bytes = int(os.getenv("LPG_MAX_BYTES") or 8_000_000)
@@ -103,6 +103,23 @@ class LPGThreadBridgeGuard(commands.Cog):
                 reason = str(res.get("reason", ""))
             return (ok and score >= self.thr, score, provider, reason or "classified")
         except asyncio.TimeoutError:
+            # Guard hard-timeout hit; do one last-chance BURST retry (short) to avoid false negatives
+            try:
+                from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes_burst as _burst
+            except Exception:
+                try:
+                    from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes as _burst
+                except Exception:
+                    _burst = None
+            if _burst is not None:
+                try:
+                    # 1s per-provider for very quick salvage; adjustable via env
+                    fb_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1200"))
+                    os.environ.setdefault("LPG_BURST_TIMEOUT_MS", str(fb_ms))
+                    ok, score, via, reason = await _burst(data)
+                    return (bool(ok), float(score), str(via or "gemini:lastchance"), f"lastchance({reason})")
+                except Exception:
+                    pass
             return (False, 0.0, "timeout", "classify_timeout")
         except Exception as e:
             log.warning("[lpg-thread-bridge] classify error: %r", e)
@@ -165,7 +182,17 @@ class LPGThreadBridgeGuard(commands.Cog):
             lucky, score, provider, reason = await self._classify(message)
             log.info("[lpg-thread-bridge] classify: lucky=%s score=%.3f via=%s reason=%s", lucky, score, provider, reason)
             provider_hint = (provider or "").lower()
-            if not lucky: return
+            # Assume-lucky on fallback timeouts if explicitly enabled
+            if not lucky:
+                try:
+                    assume = (os.getenv("LPG_ASSUME_LUCKY_ON_FALLBACK","0") == "1")
+                    if assume and isinstance(reason, str) and ("lastchance(" in reason or "shield_fallback(" in reason):
+                        log.warning("[lpg-thread-bridge] assume_lucky_fallback active → forcing redirect (reason=%s)", reason)
+                        lucky = True
+                    else:
+                        return
+                except Exception:
+                    return
         log.info("[lpg-thread-bridge] STRICT_ON_GUARD delete | ch=%s parent=%s type=%s", cid, pid, type(ch).__name__ if ch else None)
         await self._delete_redirect_persona(message, provider_hint=provider_hint)
 

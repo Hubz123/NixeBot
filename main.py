@@ -1,3 +1,22 @@
+
+async def _register_web_shutdown(app):
+    if _gemini_close_now is None:
+        return
+    async def _cleanup(_app):
+        try:
+            await _gemini_close_now()
+        except Exception:
+            pass
+    try:
+        app.on_shutdown.append(_cleanup)
+    except Exception:
+        pass
+
+# --- graceful cleanup for aiohttp session (Render Free SIGTERM) ---
+try:
+    from nixe.helpers.gemini_http_cleanup import close_now as _gemini_close_now
+except Exception:
+    _gemini_close_now = None
 # -*- coding: utf-8 -*-
 """
 NIXE main.py — ready for Render (web service) & local run.
@@ -161,6 +180,7 @@ async def handle_healthz(request: web.Request):
 
 async def start_web(port: int):
     app = web.Application()
+    await _register_web_shutdown(app)
     app.add_routes([web.get("/", handle_root), web.get("/healthz", handle_healthz)])
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

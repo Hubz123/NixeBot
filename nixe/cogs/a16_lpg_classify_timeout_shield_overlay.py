@@ -1,67 +1,80 @@
-
 # -*- coding: utf-8 -*-
 """
-a16_lpg_classify_timeout_shield_overlay
---------------------------------------
-Wraps gemini classify for Lucky Pull so caller never receives a TimeoutError.
-If the original call exceeds a soft timeout or raises, we return a safe
-negative classification quickly.
-
-Env knobs (optional, keep your runtime_env.json format):
-- LPG_CLASSIFY_SOFT_TIMEOUT_MS (default: 1900)
-- LPG_SHIELD_REASON (default: "slow_provider_fallback")
+LPG classify timeout shield (v3, safe-load) — variant a16
+Lihat penjelasan di a00 file.
 """
-
 from __future__ import annotations
-import os
-import asyncio
-import logging
+import os, asyncio, time, logging
 from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-def _ms(name: str, default: int) -> float:
+def _soft_timeout_seconds() -> float:
     try:
-        return float(os.getenv(name, str(default))) / 1000.0
+        base_ms = int(os.getenv("LPG_CLASSIFY_SOFT_TIMEOUT_MS", "1900"))
     except Exception:
-        return default / 1000.0
+        base_ms = 1900
+    try:
+        bridge_force = os.getenv("LPG_BRIDGE_FORCE_BURST", "1") == "1"
+        shield_enable = os.getenv("LPG_SHIELD_ENABLE", "").strip()
+        if bridge_force and shield_enable != "0":
+            per_ms = int(os.getenv("LPG_BURST_TIMEOUT_MS", "3800"))
+            margin_ms = int(os.getenv("LPG_FALLBACK_MARGIN_MS", "1200"))
+            base_ms = max(base_ms, per_ms + margin_ms + 300)
+    except Exception:
+        pass
+    return max(500, base_ms) / 1000.0
 
-SOFT_TIMEOUT = _ms("LPG_CLASSIFY_SOFT_TIMEOUT_MS", 1900)  # ~1.9s
-REASON = os.getenv("LPG_SHIELD_REASON", "slow_provider_fallback")
-
-class _TimeoutShield(commands.Cog):
-    def __init__(self, bot):
+class LPGClassifyTimeoutShieldOverlayV2(commands.Cog):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._orig = None
+        self.soft_timeout = _soft_timeout_seconds()
+        self.allow_quick = os.getenv("LPG_BRIDGE_ALLOW_QUICK_FALLBACK", "0") == "1"
+        self.enabled = os.getenv("LPG_SHIELD_ENABLE", "").strip() != "0"
 
-        # Try to import original function
+    async def cog_load(self):
+        if not self.enabled:
+            log.warning("[lpg-shield] disabled via env (LPG_SHIELD_ENABLE=0)")
+            return
         try:
-            import nixe.helpers.gemini_bridge as gb
-            self._orig = gb.classify_lucky_pull_bytes
+            from nixe.helpers import gemini_bridge as gb
         except Exception as e:
-            self._orig = None
-            log.warning("[lpg-shield] cannot import gemini_bridge: %r", e)
-
-        if self._orig is None:
+            log.warning("[lpg-shield] cannot import gemini_bridge: %r (shield idle)", e)
+            return
+        if not hasattr(gb, "classify_lucky_pull_bytes"):
+            log.warning("[lpg-shield] gemini_bridge.classify_lucky_pull_bytes missing (shield idle)")
             return
 
-        async def safe_classify(*args, **kwargs):
-            """Call original with a soft timeout; never raise timeout upstream."""
+        if self._orig is not None:
+            return
+        self._orig = gb.classify_lucky_pull_bytes
+
+        async def _shielded(image_bytes: bytes, *args, **kwargs):
             try:
-                return await asyncio.wait_for(self._orig(*args, **kwargs), timeout=SOFT_TIMEOUT)
+                return await asyncio.wait_for(
+                    self._orig(image_bytes, *args, **kwargs),
+                    timeout=self.soft_timeout
+                )
             except asyncio.TimeoutError:
-                # Always return a non-lucky result instead of raising
-                return (False, 0.0, "gemini:timeout-shield", REASON)
+                if self.allow_quick:
+                    return False, 0.0, "gemini:quick-fallback", "slow_provider_fallback"
+                return False, 0.0, "none", "shield_timeout"
             except Exception as e:
-                # Never bubble up provider/network errors
-                return (False, 0.0, "gemini:timeout-shield", f"shield_error({type(e).__name__})")
+                return False, 0.0, "none", f"shield_error:{type(e).__name__}"
 
-        # monkeypatch in module so all import sites see shielded version
+        gb.classify_lucky_pull_bytes = _shielded
+        log.info("[lpg-shield/v2] installed; soft_timeout=%.2fs allow_quick=%s", self.soft_timeout, self.allow_quick)
+
+    def cog_unload(self):
         try:
-            import nixe.helpers.gemini_bridge as gb2
-            gb2.classify_lucky_pull_bytes = safe_classify  # type: ignore
-            log.warning("[lpg-shield] enabled (soft=%.3fs)", SOFT_TIMEOUT)
-        except Exception as e:
-            log.warning("[lpg-shield] patch inject failed: %r", e)
+            from nixe.helpers import gemini_bridge as gb
+            if self._orig is not None and hasattr(gb, "classify_lucky_pull_bytes"):
+                gb.classify_lucky_pull_bytes = self._orig
+                log.info("[lpg-shield/v2] restored original classify")
+        except Exception:
+            pass
+        self._orig = None
 
-async def setup(bot):
-    await bot.add_cog(_TimeoutShield(bot))
+async def setup(bot: commands.Bot):
+    await bot.add_cog(LPGClassifyTimeoutShieldOverlayV2(bot))

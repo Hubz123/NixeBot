@@ -285,9 +285,21 @@ async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
     stagger_ms = _env_f("LPG_BURST_STAGGER_MS", 300)
     dedup = _env("LPG_BURST_DEDUP", "1") == "1"
 
-    # inflight de-dup (same bytes): share result
+    # Prepare payload
+    tag = f"gemini:{model}"
+
+    async def _parallel_or_stagger(session):
+        if mode == "parallel" or len(keys) < 2:
+            return await _do_parallel(session, model, keys, image_bytes, per_timeout, early_score, tag)
+        else:
+            if mode == "sequential":
+                return await _do_sequential_deadline(session, model, keys, image_bytes, per_timeout, early_score, tag, int(_env('LPG_FALLBACK_MARGIN_MS','1200')))
+            else:
+                return await _do_stagger(session, model, keys, image_bytes, per_timeout, early_score, tag, stagger_ms)
+
+    # simple inflight de-dup per image digest + mode
+    key = f"{hash(image_bytes)}|{mode}|{per_timeout}|{stagger_ms}"
     if dedup:
-        key = _sha1(image_bytes)
         fut = _INFLIGHT.get(key)
         if fut and not fut.done():
             try:
@@ -295,20 +307,14 @@ async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
                 return res
             except Exception:
                 pass
+        import asyncio
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         _INFLIGHT[key] = fut
         try:
             session = await _get_session()
             await _warmup(session, keys[0] if keys else _env('GEMINI_API_KEY',''))
-            # reuse keep-alive session
-                if mode == "parallel" or len(keys) < 2:
-                    res = await _do_parallel(session, model, keys, image_bytes, per_timeout, early_score, tag)
-                else:
-                    if mode == 'sequential':
-                        res = await _do_sequential_deadline(session, model, keys, image_bytes, per_timeout, early_score, tag, int(_env('LPG_FALLBACK_MARGIN_MS','1200')))
-                    else:
-                        res = await _do_stagger(session, model, keys, image_bytes, per_timeout, early_score, tag, stagger_ms)
+            res = await _parallel_or_stagger(session)
             if not fut.done():
                 fut.set_result(res)
             return res
@@ -316,15 +322,10 @@ async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
             _INFLIGHT.pop(key, None)
     else:
         session = await _get_session()
-            await _warmup(session, keys[0] if keys else _env('GEMINI_API_KEY',''))
-            # reuse keep-alive session
-            if mode == "parallel" or len(keys) < 2:
-                return await _do_parallel(session, model, keys, image_bytes, per_timeout, early_score, tag)
-            else:
-                if mode == 'sequential':
-                    return await _do_sequential_deadline(session, model, keys, image_bytes, per_timeout, early_score, tag, int(_env('LPG_FALLBACK_MARGIN_MS','1200')))
-                else:
-                    return await _do_stagger(session, model, keys, image_bytes, per_timeout, early_score, tag, stagger_ms)
+        await _warmup(session, keys[0] if keys else _env('GEMINI_API_KEY',''))
+        return await _parallel_or_stagger(session)
+
+
 
 
 async def _do_sequential_deadline(session, model, keys, image_bytes, per_timeout, early_score, tag, margin_ms):
@@ -347,3 +348,4 @@ async def _do_sequential_deadline(session, model, keys, image_bytes, per_timeout
         if (lucky2 and score2 >= score) or not lucky:
             return lucky2, score2, tag, f"fallback({st2})"
     return lucky, score, st, reason
+

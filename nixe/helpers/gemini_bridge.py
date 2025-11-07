@@ -1,7 +1,21 @@
 
 from __future__ import annotations
-import os, json, logging, asyncio, re, time, hashlib
+import os
+try:
+    from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes as burst_classify
+except Exception:
+    burst_classify = None, json, logging, asyncio, re, time, hashlib
 from typing import Dict, Any, List, Tuple
+
+# --- burst bridge config (reads same keys as runtime_env.json) ---
+def _burst_cfg():
+    mode = os.getenv("LPG_BURST_MODE", "sequential").lower()
+    timeout_ms = float(os.getenv("LPG_BURST_TIMEOUT_MS", "3800"))
+    early = float(os.getenv("LPG_BURST_EARLY_EXIT_SCORE", "0.90"))
+    margin = float(os.getenv("LPG_FALLBACK_MARGIN_MS", "1200"))
+    stagger = float(os.getenv("LPG_BURST_STAGGER_MS", "400"))
+    return dict(mode=mode, timeout_ms=timeout_ms, early=early, margin=margin, stagger=stagger)
+
 
 REV = "F4"  # visible in logs
 log = logging.getLogger("nixe.helpers.gemini_bridge")

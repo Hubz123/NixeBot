@@ -9,8 +9,14 @@ log = logging.getLogger("nixe.cogs.phish_groq_guard")
 from nixe.helpers.ban_utils import emit_phish_detected
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES","8192"))
 GUARD_IDS = set(int(x) for x in (os.getenv("LPG_GUARD_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
+try:
+    _safe_tid = int(os.getenv("PHISH_DATA_THREAD_ID") or os.getenv("NIXE_PHISH_DATA_THREAD_ID") or "0")
+    if _safe_tid:
+        GUARD_IDS.add(_safe_tid)
+except Exception:
+    pass
 GROQ_KEY = os.getenv("GROQ_API_KEY","")
-MODEL_VISION = os.getenv("GROQ_MODEL_VISION") or os.getenv("GROQ_VISION_MODEL") or (os.getenv("GROQ_MODEL_TEXT") if "vision" in (os.getenv("GROQ_MODEL_TEXT","")) else None) or "llama-3.2-11b-vision-preview"
+MODEL_VISION = os.getenv("GROQ_MODEL_VISION") or "llama-3.2-11b-vision-preview"
 LOG_CHAN_ID = int(os.getenv("PHISH_LOG_CHAN_ID") or os.getenv("NIXE_PHISH_LOG_CHAN_ID") or "0")
 TIMEOUT_MS = int(os.getenv("PHISH_GEMINI_MAX_LATENCY_MS","12000"))
 ENABLE = (os.getenv("PHISH_GROQ_ENABLE","1") == "1")

@@ -10,7 +10,7 @@ log = logging.getLogger("nixe.cogs.phish_ban_embed")
 EMBED_COLOR = int(os.getenv("PHISH_EMBED_COLOR", "16007990"))  # default orange 0xF4511E
 DELETE_AFTER_SECONDS = int(os.getenv("PHISH_EMBED_TTL", "3600"))
 AUTO_BAN = (os.getenv("PHISH_AUTO_BAN","0") == "1")
-DELETE_MESSAGE = (os.getenv("PHISH_DELETE_MESSAGE","1") == "1" or os.getenv("PHISH_DELETE_MESSAGE_DAYS", "") != "")
+DELETE_MESSAGE = (os.getenv("PHISH_DELETE_MESSAGE","1") == "1")
 
 class PhishBanEmbed(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -53,14 +53,18 @@ class PhishBanEmbed(commands.Cog):
                     target = await banlog.get_ban_log_channel(guild)
             except Exception:
                 target = None
-            # fallback to explicit env channel ids
             if not target:
+                # try explicit thread/channel ids from env (thread preferred)
                 try:
-                    env_id = int(os.getenv("NIXE_PHISH_LOG_CHAN_ID") or os.getenv("PHISH_LOG_CHAN_ID") or os.getenv("LOG_CHANNEL_ID") or "0")
-                    if env_id:
-                        target = self.bot.get_channel(env_id) or await self.bot.fetch_channel(env_id)
+                    tgt_id = int(os.getenv("PHISH_LOG_THREAD_ID") or os.getenv("NIXE_PHISH_LOG_THREAD_ID") or os.getenv("GROQ_THREAD_ID") or "0")
                 except Exception:
-                    pass
+                    tgt_id = 0
+                if tgt_id:
+                    try:
+                        tmp = self.bot.get_channel(tgt_id) or await self.bot.fetch_channel(tgt_id)
+                        if tmp: target = tmp
+                    except Exception:
+                        target = None
             if not target:
                 target = channel
 
@@ -68,7 +72,12 @@ class PhishBanEmbed(commands.Cog):
                 await target.send(embed=em, delete_after=DELETE_AFTER_SECONDS)
 
             # Auto delete offending message (best-effort, optional)
-            if DELETE_MESSAGE and channel and mid:
+            SAFE_DATA_THREAD = 0
+            try:
+                SAFE_DATA_THREAD = int(os.getenv("PHISH_DATA_THREAD_ID") or os.getenv("NIXE_PHISH_DATA_THREAD_ID") or "0")
+            except Exception:
+                SAFE_DATA_THREAD = 0
+            if DELETE_MESSAGE and channel and mid and (not SAFE_DATA_THREAD or int(channel.id) != SAFE_DATA_THREAD):
                 try:
                     msg = await channel.fetch_message(int(mid))
                     await msg.delete()
@@ -78,8 +87,7 @@ class PhishBanEmbed(commands.Cog):
             # Auto-ban (optional)
             if AUTO_BAN and guild and user:
                 try:
-                    del_days = int(os.getenv("PHISH_DELETE_MESSAGE_DAYS","0") or "0")
-                    await guild.ban(user, reason=f"Phishing detected: {reason[:140]}", delete_message_days=del_days if del_days>=0 else 0)
+                    await guild.ban(user, reason=f"Phishing detected: {reason[:140]}", delete_message_days=0)
                 except Exception:
                     pass
         except Exception as e:

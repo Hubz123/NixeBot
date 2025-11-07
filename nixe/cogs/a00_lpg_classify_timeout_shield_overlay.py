@@ -1,40 +1,49 @@
 # -*- coding: utf-8 -*-
 """
-LPG classify timeout shield (v3, safe-load)
-- Selalu definisikan Cog class + async setup(bot)
-- Import lengkap (os/asyncio/time/logging/commands)
-- Patching aman: kalau import bridge gagal, Cog tetap load (tanpa patch)
-- SOFT_TIMEOUT dinamis mengikuti BURST budget saat force-burst aktif
-Env (optional):
-- LPG_SHIELD_ENABLE=0            -> nonaktifkan overlay sepenuhnya
-- LPG_CLASSIFY_SOFT_TIMEOUT_MS   -> default 1900
-- LPG_BURST_TIMEOUT_MS           -> default 3800
-- LPG_FALLBACK_MARGIN_MS         -> default 1200
-- LPG_BRIDGE_FORCE_BURST         -> default 1 (aktif)
-- LPG_BRIDGE_ALLOW_QUICK_FALLBACK-> default 0 (matikan quick-fallback)
+LPG classify timeout shield (v4, safe-load, sequential-aware)
+- Import lengkap; selalu ada Cog + async setup(bot); tidak pernah FAIL load
+- Patching aman; jika import bridge gagal -> overlay idle (tanpa patch)
+- SOFT_TIMEOUT dinamis dan sadar mode burst:
+    sequential: 2*per_ms - margin_ms + 800  (cap 9500ms)
+    stagger:    per_ms + stagger_ms + 800    (cap 9500ms)
+    parallel:   per_ms + 700                 (cap 9500ms)
+- Tetap bisa dimatikan total: LPG_SHIELD_ENABLE=0
+Env:
+- LPG_CLASSIFY_SOFT_TIMEOUT_MS (default 1900)
+- LPG_BURST_MODE (sequential|stagger|parallel) default sequential
+- LPG_BURST_TIMEOUT_MS (default 3800)
+- LPG_FALLBACK_MARGIN_MS (default 1200)
+- LPG_BURST_STAGGER_MS (default 400)
+- LPG_BRIDGE_FORCE_BURST (default 1)
+- LPG_BRIDGE_ALLOW_QUICK_FALLBACK (default 0)
+- LPG_SHIELD_ENABLE (set 0 untuk mematikan overlay)
 """
 from __future__ import annotations
-import os, asyncio, time, logging
+import os, asyncio, logging
 from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
 def _soft_timeout_seconds() -> float:
-    # base soft timeout
-    try:
-        base_ms = int(os.getenv("LPG_CLASSIFY_SOFT_TIMEOUT_MS", "1900"))
-    except Exception:
-        base_ms = 1900
-    # stretch jika force-burst aktif
-    try:
-        bridge_force = os.getenv("LPG_BRIDGE_FORCE_BURST", "1") == "1"
-        shield_enable = os.getenv("LPG_SHIELD_ENABLE", "").strip()
-        if bridge_force and shield_enable != "0":
-            per_ms = int(os.getenv("LPG_BURST_TIMEOUT_MS", "3800"))
-            margin_ms = int(os.getenv("LPG_FALLBACK_MARGIN_MS", "1200"))
-            base_ms = max(base_ms, per_ms + margin_ms + 300)
-    except Exception:
-        pass
+    def geti(name, d):
+        try: return int(os.getenv(name, str(d)))
+        except Exception: return d
+    base_ms = geti("LPG_CLASSIFY_SOFT_TIMEOUT_MS", 1900)
+    mode = os.getenv("LPG_BURST_MODE", "sequential").lower()
+    per_ms = geti("LPG_BURST_TIMEOUT_MS", 3800)
+    margin_ms = geti("LPG_FALLBACK_MARGIN_MS", 1200)
+    stagger_ms = geti("LPG_BURST_STAGGER_MS", 400)
+    force = os.getenv("LPG_BRIDGE_FORCE_BURST", "1") == "1"
+    shield_on = os.getenv("LPG_SHIELD_ENABLE", "").strip() != "0"
+
+    if force and shield_on:
+        if mode == "sequential":
+            total = (2*per_ms - margin_ms) + 800
+        elif mode == "stagger":
+            total = per_ms + stagger_ms + 800
+        else:  # parallel
+            total = per_ms + 700
+        base_ms = max(base_ms, min(total, 9500))  # jangan lewati guard 10s
     return max(500, base_ms) / 1000.0
 
 class LPGClassifyTimeoutShieldOverlay(commands.Cog):
@@ -57,9 +66,9 @@ class LPGClassifyTimeoutShieldOverlay(commands.Cog):
         if not hasattr(gb, "classify_lucky_pull_bytes"):
             log.warning("[lpg-shield] gemini_bridge.classify_lucky_pull_bytes missing (shield idle)")
             return
-
         if self._orig is not None:
             return
+
         self._orig = gb.classify_lucky_pull_bytes
 
         async def _shielded(image_bytes: bytes, *args, **kwargs):
@@ -69,11 +78,11 @@ class LPGClassifyTimeoutShieldOverlay(commands.Cog):
                     timeout=self.soft_timeout
                 )
             except asyncio.TimeoutError:
+                # default: JANGAN quick-fallback; beri sinyal shield_timeout
                 if self.allow_quick:
                     return False, 0.0, "gemini:quick-fallback", "slow_provider_fallback"
                 return False, 0.0, "none", "shield_timeout"
             except Exception as e:
-                # Jangan jatuhin Cog; balikin negatif yang aman
                 return False, 0.0, "none", f"shield_error:{type(e).__name__}"
 
         gb.classify_lucky_pull_bytes = _shielded

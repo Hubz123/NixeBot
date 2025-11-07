@@ -168,6 +168,23 @@ async def _call_one(session, model: str, key: str, image_bytes: bytes, timeout_s
     try:
         async with session.post(url, json=payload, timeout=timeout_s) as resp:
             if resp.status != 200:
+                # ## RETRY_ON_429: quick single retry if we still have headroom
+                if resp.status in (429, 503) and timeout_s >= 2.2:
+                    try:
+                        await asyncio.sleep(0.25)
+                        to2 = aiohttp.ClientTimeout(total=timeout_s - 0.8)
+                        async with session.post(url, json=payload, timeout=to2) as r2:
+                            if r2.status == 200:
+                                data = await r2.json()
+                                text = ""
+                                try:
+                                    text = data["candidates"][0]["content"]["parts"][0]["text"]
+                                except Exception:
+                                    text = json.dumps(data)[:500]
+                                lucky, score, reason, flags = _parse_json(text)
+                                return lucky, score, "ok", reason, flags
+                    except Exception:
+                        pass
                 return False, 0.0, "http", f"status={resp.status}", []
             data = await resp.json()
             # extract text
@@ -333,7 +350,7 @@ async def _do_sequential_deadline(session, model, keys, image_bytes, per_timeout
     neg_words = _negative_phrases()
     start_t = time.monotonic()
     k1 = keys[0]
-    t1 = max(0.8, per_timeout - (margin_ms/1000.0))
+    t1 = max(1.6, per_timeout - min((margin_ms/1000.0), max(0.6, per_timeout*0.20)))
     lucky, score, st, reason, flags = await _call_one(session, model, k1, image_bytes, t1)
     if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
         lucky = False; score = min(score, 0.50); reason = f"{reason}|neg_cue"

@@ -2,7 +2,10 @@ from __future__ import annotations
 import json, pathlib, logging
 
 log = logging.getLogger(__name__)
-PERSONA_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "personas" / "yandere.json"
+import os
+PERSONA_PATH = pathlib.Path(os.getenv("PERSONA_PROFILE_PATH", ""))
+if not PERSONA_PATH or not str(PERSONA_PATH):
+    PERSONA_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "yandere.json"
 
 def persona_version() -> str:
     try:

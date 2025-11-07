@@ -113,7 +113,7 @@ class PersonaRuntimeEnvOverlay(commands.Cog):
     """Persona picker honoring runtime_env with weighted tones."""
     def __init__(self, bot):
         self.bot = bot
-        self.path = _read_env("PERSONA_FILE", "nixe/config/yandere.json")
+        self.path = _read_env("PERSONA_FILE", _read_env("PERSONA_PROFILE_PATH", "nixe/config/yandere.json"))
         self.mode = _read_env("PERSONA_MODE", "yandere")
         try:
             self.persona_js = _load_persona(self.path)

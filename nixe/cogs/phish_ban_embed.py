@@ -8,8 +8,8 @@ from nixe.helpers import banlog
 log = logging.getLogger("nixe.cogs.phish_ban_embed")
 
 EMBED_COLOR = int(os.getenv("PHISH_EMBED_COLOR", "16007990"))  # default orange 0xF4511E
-DELETE_AFTER_SECONDS = int(os.getenv("PHISH_EMBED_TTL", "3600"))
-AUTO_BAN = (os.getenv("PHISH_AUTO_BAN","0") == "1")
+DELETE_AFTER_SECONDS = int(os.getenv("PHISH_EMBED_TTL", os.getenv("BAN_EMBED_TTL_SEC", "3600")))
+AUTO_BAN = (os.getenv("PHISH_AUTO_BAN","0") == "1" or os.getenv("PHISH_AUTOBAN","0") == "1")
 DELETE_MESSAGE = (os.getenv("PHISH_DELETE_MESSAGE","1") == "1")
 
 class PhishBanEmbed(commands.Cog):
@@ -54,30 +54,23 @@ class PhishBanEmbed(commands.Cog):
             except Exception:
                 target = None
             if not target:
-                # try explicit thread/channel ids from env (thread preferred)
-                try:
-                    tgt_id = int(os.getenv("PHISH_LOG_THREAD_ID") or os.getenv("NIXE_PHISH_LOG_THREAD_ID") or os.getenv("GROQ_THREAD_ID") or "0")
-                except Exception:
-                    tgt_id = 0
-                if tgt_id:
-                    try:
-                        tmp = self.bot.get_channel(tgt_id) or await self.bot.fetch_channel(tgt_id)
-                        if tmp: target = tmp
-                    except Exception:
-                        target = None
-            if not target:
                 target = channel
 
             if target:
                 await target.send(embed=em, delete_after=DELETE_AFTER_SECONDS)
 
             # Auto delete offending message (best-effort, optional)
+            # Resolve safe data thread (never delete here)
             SAFE_DATA_THREAD = 0
             try:
-                SAFE_DATA_THREAD = int(os.getenv("PHISH_DATA_THREAD_ID") or os.getenv("NIXE_PHISH_DATA_THREAD_ID") or "0")
+                SAFE_DATA_THREAD = int(
+                    os.getenv("PHISH_DATA_THREAD_ID") or
+                    os.getenv("NIXE_PHISH_DATA_THREAD_ID") or
+                    os.getenv("PHASH_IMAGEPHISH_THREAD_ID") or "0"
+                )
             except Exception:
                 SAFE_DATA_THREAD = 0
-            if DELETE_MESSAGE and channel and mid and (not SAFE_DATA_THREAD or int(channel.id) != SAFE_DATA_THREAD):
+            if DELETE_MESSAGE and channel and mid:
                 try:
                     msg = await channel.fetch_message(int(mid))
                     await msg.delete()

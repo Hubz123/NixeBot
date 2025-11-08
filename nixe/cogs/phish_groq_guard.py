@@ -10,7 +10,10 @@ from nixe.helpers.ban_utils import emit_phish_detected
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES","8192"))
 GUARD_IDS = set(int(x) for x in (os.getenv("LPG_GUARD_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
 try:
-    _safe_tid = int(os.getenv("PHISH_DATA_THREAD_ID") or os.getenv("NIXE_PHISH_DATA_THREAD_ID") or "0")
+    _safe_tid = int(
+        os.getenv("PHISH_DATA_THREAD_ID") or
+        os.getenv("NIXE_PHISH_DATA_THREAD_ID") or
+        os.getenv("PHASH_IMAGEPHISH_THREAD_ID") or "0")
     if _safe_tid:
         GUARD_IDS.add(_safe_tid)
 except Exception:

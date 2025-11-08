@@ -85,6 +85,22 @@ class LPGPrefilterHandoff(commands.Cog):
                 return
 
             # Find first attachment (image-like or any that pretends to be image.*)
+            # --- Fallback untuk thread/reply ketika attachments=0 ---
+            if not message.attachments:
+                # 1) kalau reply: pakai attachment dari pesan yang direply
+                ref = getattr(message, "reference", None)
+                if ref and hasattr(ref, "resolved"):
+                    ref_msg = ref.resolved
+                    if getattr(ref_msg, "attachments", None):
+                        message.attachments = ref_msg.attachments
+            
+            # 2) kalau masih kosong dan ini Thread: ambil dari starter message
+            if (not message.attachments) and hasattr(ch, "history") and getattr(ch, "type", None) and str(ch.type).endswith("thread"):
+                async for m in ch.history(limit=5, oldest_first=True):
+                    if m.attachments:
+                        message.attachments = m.attachments
+                        break
+            # --- /fallback ---
             att = None
             for a in message.attachments or []:
                 name = getattr(a,"filename","") or ""

@@ -143,7 +143,8 @@ class LPGThreadBridgeGuard(commands.Cog):
         # Persona
         text = None; persona_ok = False
         try:
-            if self.persona_enable and should_run_persona(self.persona_context):
+            ok_run, _pm = should_run_persona({ 'ok': ok, 'score': score, 'kind': self.persona_context, 'provider': provider, 'reason': reason })
+            if self.persona_enable and ok_run:
                 if self.persona_only_for and self.persona_context not in self.persona_only_for:
                     raise RuntimeError("persona_context_not_allowed")
                 if self.persona_allowed_providers and (provider_hint or "").lower() not in self.persona_allowed_providers:

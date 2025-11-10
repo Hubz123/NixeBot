@@ -3,7 +3,7 @@ services:
   - type: web
     name: nixe-phishbot
     env: python
-    plan: free
+plan: free
     buildCommand: pip install -r requirements.txt && python scripts/smoke_all.py
     startCommand: python main.py
     autoDeploy: false

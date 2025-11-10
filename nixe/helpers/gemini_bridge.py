@@ -3,6 +3,39 @@ from __future__ import annotations
 import os, json, base64, asyncio, logging, typing as T
 import aiohttp
 
+
+
+# --- Runtime config loader (non-secrets) ---
+def _load_runtime_env() -> dict:
+    import json, os
+    paths = [
+        os.path.join(os.getcwd(), "nixe", "config", "runtime_env.json"),
+        os.path.join(os.path.dirname(__file__), "..", "config", "runtime_env.json"),
+    ]
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue
+    return {}
+
+_RUNTIME = _load_runtime_env()
+
+def _cfg(name: str, default: str) -> str:
+    # ENV for secrets only; but we allow ENV to override if present
+    if name in ("GEMINI_API_KEY", "GEMINI_API_KEY_B", "DISCORD_TOKEN"):
+        envv = os.getenv(name)
+        return envv if envv is not None else default
+    val = _RUNTIME.get(name)
+    if val is None:
+        val = os.getenv(name, default)
+    if isinstance(val, (int, float)):
+        return str(val)
+    return str(val)
+
 log = logging.getLogger(__name__)
 __all__ = ["classify_lucky_pull_bytes"]
 
@@ -20,14 +53,14 @@ except Exception:
         _burst = None
 
 # config from env (hybrid loader should have applied runtime_env.json already)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = _cfg("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_KEY_A = os.getenv("GEMINI_API_KEY")
 GEMINI_KEY_B = os.getenv("GEMINI_API_KEY_B")
-FORCE_BURST = os.getenv("LPG_BRIDGE_FORCE_BURST", "1") == "1"
-ALLOW_QUICK = os.getenv("LPG_BRIDGE_ALLOW_QUICK_FALLBACK", "0") == "1"
-PARALLEL = os.getenv("LPG_PROVIDER_PARALLEL", "1") == "1"
-SOFT_TIMEOUT_MS = int(os.getenv("LPG_CLASSIFY_SOFT_TIMEOUT_MS", "6000"))
-THR = float(os.getenv("GEMINI_LUCKY_THRESHOLD", "0.85"))
+FORCE_BURST = _cfg("LPG_BRIDGE_FORCE_BURST", "1") == "1"
+ALLOW_QUICK = _cfg("LPG_BRIDGE_ALLOW_QUICK_FALLBACK", "0") == "1"
+PARALLEL = _cfg("LPG_PROVIDER_PARALLEL", "1") == "1"
+SOFT_TIMEOUT_MS = int(_cfg("LPG_CLASSIFY_SOFT_TIMEOUT_MS", "6000"))
+THR = float(_cfg("GEMINI_LUCKY_THRESHOLD", "0.85"))
 
 def _norm_prob(x: T.Any) -> float:
     try:

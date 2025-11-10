@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os, logging, asyncio
+from typing import Optional, List, Tuple, Any
 import discord
 from discord.ext import commands
 from nixe.helpers.persona_loader import load_persona, pick_line
@@ -10,6 +11,80 @@ except Exception:
     classify_lucky_pull_bytes = None
 
 log = logging.getLogger("nixe.cogs.a00_lpg_thread_bridge_guard")
+
+
+# -- simple pHash + helpers (minimal) --
+from io import BytesIO
+import json
+from pathlib import Path
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+def _dct2(a):
+    return np.real(np.fft.fft2(a)) if np is not None else None
+
+def _phash64_bytes(img_bytes: bytes) -> Optional[int]:
+    if Image is None or np is None:
+        return None
+    try:
+        im = Image.open(BytesIO(img_bytes)).convert("L").resize((32,32))
+        arr = np.asarray(im, dtype=np.float32)
+        d = _dct2(arr)[:8,:8]
+        med = float(np.median(d[1:,1:]))
+        bits = (d[1:,1:] > med).astype(np.uint8).flatten()
+        val = 0
+        for b in bits:
+            val = (val << 1) | int(b)
+        return int(val)
+    except Exception:
+        return None
+
+async def _post_status_embed(bot, *, title: str, fields: List[Tuple[str,str,bool]], color: int = 0x2B6CB0):
+    tid = None
+    for k in ("LPG_STATUS_THREAD_ID","NIXE_STATUS_THREAD_ID"):
+        v = os.getenv(k, "")
+        if v.isdigit():
+            tid = int(v); break
+    if tid is None:
+        tid = 1435924665615908965
+    try:
+        ch = bot.get_channel(tid) or await bot.fetch_channel(tid)
+        if ch:
+            import discord
+            emb = discord.Embed(title=title, color=color)
+            for name, value, inline in fields:
+                emb.add_field(name=name, value=value, inline=inline)
+            await ch.send(embed=emb)
+    except Exception:
+        pass
+
+def _cache_path(thread_id: int) -> Path:
+    base = Path(os.getenv("LPG_CACHE_DIR","data/phash_cache"))
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{thread_id}.json"
+
+def _load_cache(thread_id: int) -> dict:
+    p = _cache_path(thread_id)
+    if p.exists():
+        try:
+            return json.loads(p.read_text("utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _save_cache(thread_id: int, data: dict) -> None:
+    p = _cache_path(thread_id)
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
 
 def _parse_ids(val: str) -> list[int]:
     if not val: return []
@@ -125,7 +200,7 @@ class LPGThreadBridgeGuard(commands.Cog):
             log.warning("[lpg-thread-bridge] classify error: %r", e)
             return (False, 0.0, "error", "classify_exception")
 
-    async def _delete_redirect_persona(self, message: discord.Message, provider_hint: str | None = None):
+    async def _delete_redirect_persona(self, message: discord.Message, lucky: bool, score: float, provider: str, reason: str, provider_hint: Optional[str] = None):
         # Delete
         try:
             await message.delete()
@@ -177,12 +252,46 @@ class LPGThreadBridgeGuard(commands.Cog):
         if not self._in_guard(ch): return
         # Must have image
         if not any(self._is_image(a) for a in (message.attachments or [])): return
-        # Require classification by default
+        
+
+        # Prepare raw bytes & pHash for logging/caching
+        raw_bytes = None
+        try:
+            for a in (message.attachments or []):
+                ct = (getattr(a,"content_type",None) or "").lower()
+                fn = (getattr(a,"filename","") or "").lower()
+                if (ct.startswith("image/") if ct else False) or fn.endswith((".png",".jpg",".jpeg",".webp",".bmp",".gif")):
+                    raw_bytes = await a.read()
+                    break
+        except Exception:
+            raw_bytes = None
+        message.__dict__["_nixe_imgbytes"] = raw_bytes
+        message.__dict__["_nixe_phash"] = _phash64_bytes(raw_bytes) if raw_bytes else None
+
+
+# Require classification by default
         provider_hint = None
         if self.require_classify:
             lucky, score, provider, reason = await self._classify(message)
             log.info("[lpg-thread-bridge] classify: lucky=%s score=%.3f via=%s reason=%s", lucky, score, provider, reason)
             provider_hint = (provider or "").lower()
+        # Post classification result to status thread (always)
+        try:
+            ph = message.__dict__.get("_nixe_phash")
+            ph_str = (hex(int(ph))[2:].upper() if isinstance(ph, int) else "-")
+            fields = [
+                ("Result", "✅ LUCKY" if lucky else "❌ NOT LUCKY", True),
+                ("Score", f"{score:.3f}", True),
+                ("Provider", provider or "-", True),
+                ("Reason", reason or "-", False),
+                ("Message ID", str(message.id), True),
+                ("Channel", f"<#{getattr(message.channel,'id',0)}>", True),
+                ("pHash", ph_str, True),
+            ]
+            await _post_status_embed(self.bot, title="Lucky Pull Classification", fields=fields, color=(0x22C55E if lucky else 0xEF4444))
+        except Exception:
+            pass
+
             # Assume-lucky on fallback timeouts if explicitly enabled
             if not lucky:
                 try:
@@ -195,7 +304,7 @@ class LPGThreadBridgeGuard(commands.Cog):
                 except Exception:
                     return
         log.info("[lpg-thread-bridge] STRICT_ON_GUARD delete | ch=%s parent=%s type=%s", cid, pid, type(ch).__name__ if ch else None)
-        await self._delete_redirect_persona(message, provider_hint=provider_hint)
+        await self._delete_redirect_persona(message, lucky, score, provider, reason, provider_hint=provider_hint)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LPGThreadBridgeGuard(bot))

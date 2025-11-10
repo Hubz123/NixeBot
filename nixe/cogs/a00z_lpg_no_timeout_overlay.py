@@ -1,4 +1,4 @@
-# a00z_lpg_no_timeout_overlay: applies no-timeout + policy patches at load time.
+# a00z_lpg_no_timeout_overlay: apply robust no-timeout + LP policy patches
 import logging
 from nixe.helpers.overlay_utils.no_timeout_patch import apply_all_patches as _apply_no_timeout
 from nixe.helpers.overlay_utils.lp_policy_patch import apply_policy_patch as _apply_policy

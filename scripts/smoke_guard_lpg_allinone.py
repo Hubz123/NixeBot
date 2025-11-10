@@ -1,3 +1,51 @@
+
+# --- E2E ONLINE HELPERS (integrated) ---
+DISCORD_API = "https://discord.com/api/v10"
+def _discord_headers():
+    import os
+    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
+        raise SystemExit("Missing DISCORD_TOKEN (or DISCORD_BOT_TOKEN) for --e2e-online")
+    return {"Authorization": f"Bot {token}", "User-Agent": "nixe-smoke/online-e2e"}
+
+def _post_image_message(target_id: str, image_path: str, content: str = "(smoke:e2e)"):
+    url = f"{DISCORD_API}/channels/{target_id}/messages"
+    import json, mimetypes, requests, os
+    mime, _ = mimetypes.guess_type(image_path)
+    if not mime:
+        mime = "application/octet-stream"
+    with open(image_path, "rb") as f:
+        files = [("files[0]", (os.path.basename(image_path), f, mime))]
+        payload = {"content": content}
+        data = {"payload_json": json.dumps(payload)}
+        r = requests.post(url, headers=_discord_headers(), data=data, files=files, timeout=30)
+    r.raise_for_status()
+    return r.json()["id"]
+
+def _get_message(channel_id: str, message_id: str):
+    import requests
+    url = f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
+    r = requests.get(url, headers=_discord_headers(), timeout=15)
+    return r.status_code == 200, (r.json() if r.status_code == 200 else {"status": r.status_code, "text": r.text})
+
+def _list_messages(channel_id: str, limit: int = 50):
+    import requests
+    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}"
+    r = requests.get(url, headers=_discord_headers(), timeout=15)
+    return r.json() if r.status_code == 200 else []
+
+def _find_embed_with_mid(messages, title: str, mid: str):
+    for m in messages or []:
+        for emb in (m.get("embeds") or []):
+            if (emb.get("title") or "").strip().lower() == title.strip().lower():
+                for f in (emb.get("fields") or []):
+                    if (f.get("name") or "").lower() == "message id" and (f.get("value") or "").strip() == str(mid):
+                        return emb
+    return None
+
+import mimetypes
+import time
+import requests
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -495,6 +543,31 @@ def main():
     ap.add_argument("--burst", action="store_true", help="Run realtime Gemini BURST probe (API1/API2) with timing")
     args = ap.parse_args()
 
+    # --- E2E ONLINE mode ---
+    if getattr(args, "e2e_online", False):
+        if not args.e2e_img or not args.e2e_target_id:
+            raise SystemExit("--e2e-online requires --e2e-img and --e2e-target-id")
+        mid = _post_image_message(args.e2e_target_id, args.e2e_img)
+        print(f"[e2e] posted message id={mid}")
+        end = time.time() + int(args.e2e_ttl)
+        seen = None; deleted = False
+        while time.time() < end:
+            msgs = _list_messages(args.e2e_status_thread_id, limit=50)
+            emb = _find_embed_with_mid(msgs, title="Lucky Pull Classification", mid=mid)
+            if emb and not seen:
+                seen = emb
+                print("[e2e] embed detected on status thread")
+            ok, _ = _get_message(args.e2e_target_id, mid)
+            deleted = not ok
+            if seen and deleted:
+                break
+            time.sleep(2)
+        if not seen:
+            raise SystemExit("E2E FAIL: classification embed not found")
+        if not deleted:
+            print("[e2e] WARN: message not deleted within TTL")
+        print("[e2e] OK")
+        raise SystemExit(0)
     info = _read_env_hybrid()
     _print_env(info); _print_guard_wiring(); _print_thread_check(args.as_thread, args.parent); _print_policy(); _print_persona()
     _print_classify(args.img, use_real=args.real)

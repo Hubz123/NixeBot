@@ -1,5 +1,11 @@
-import os, asyncio, logging, base64, io, inspect
+import os, asyncio, logging, base64, io, inspect, hashlib, time
 logger = logging.getLogger(__name__)
+
+# Global concurrency + cache (friendly for free plan)
+_GEM_RATE = int(os.getenv("LPG_GEM_MAX_CONCURRENCY", "1"))  # serialize by default
+_GEM_SEM = asyncio.Semaphore(max(1, _GEM_RATE))
+_CACHE_TTL = int(os.getenv("LPG_CLASSIFY_CACHE_TTL_SEC", "30"))
+_cache = {}  # key sha256 -> (ts, (ok, score, via, reason))
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return (os.getenv(name, default) or default) == "1"
@@ -9,7 +15,7 @@ def set_default_envs():
         "LPG_SHIELD_ENABLE": "0",
         "LPG_BRIDGE_ALLOW_QUICK_FALLBACK": "0",
         "LPG_DEFER_ON_TIMEOUT": "1",
-        "LPG_GUARD_LASTCHANCE_MS": "1200",
+        "LPG_GUARD_LASTCHANCE_MS": "1800",
         "LPG_PROVIDER_PARALLEL": "0",
         "LPG_BURST_MODE": "stagger",
         "LPG_GEM_MAX_CONCURRENCY": "1",
@@ -18,11 +24,13 @@ def set_default_envs():
         "LPG_TIMEOUT_SEC": "12",
         "LPG_IMG_MAX_DIM": "1024",
         "LPG_IMG_JPEG_Q": "85",
-        "LPG_HTTP_TRIES": "2",
+        "LPG_HTTP_TRIES": "3",
         "LPG_HTTP_PER_TRY_MS": "3000",
         "LPG_REQUIRE_CLASSIFY": "1",
         "LPG_ASSUME_LUCKY_ON_FALLBACK": "0",
         "LPG_FREE_PLAN": "1",
+        "LPG_CLASSIFY_CACHE_TTL_SEC": "30",
+        "LPG_BURST_TIMEOUT_MS": "1500",
     }
     for k, v in defaults.items():
         os.environ.setdefault(k, v)
@@ -73,6 +81,9 @@ def _prep_image(image_bytes: bytes):
     except Exception:
         return image_bytes, "image/png"
 
+def _sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
 def _wrap_gemini_call_in_module(mod):
     candidates = ["call_gemini", "gemini_call", "call_gemini_generate_content"]
     for name in candidates:
@@ -83,15 +94,26 @@ def _wrap_gemini_call_in_module(mod):
                 b64 = base64.b64encode(ib).decode("ascii")
                 kwargs.setdefault("inline_mime", mime)
                 kwargs.setdefault("inline_b64", b64)
-                tries = max(1, int(os.getenv("LPG_HTTP_TRIES", "2")))
-                per_try_ms = max(1000, int(os.getenv("LPG_HTTP_PER_TRY_MS", "3000")))
+
+                key = _sha256(ib)
+                now = time.time()
+                if _CACHE_TTL > 0:
+                    hit = _cache.get(key)
+                    if hit and now - hit[0] <= _CACHE_TTL:
+                        return hit[1]
+
+                tries = max(1, int(os.getenv("LPG_HTTP_TRIES", "3")))
                 last_err = None
-                for _ in range(tries):
-                    try:
-                        return await fn(image_bytes, *args, **kwargs)
-                    except Exception as e:
-                        last_err = f"{type(e).__name__}:{str(e)[:200]}"
-                        continue
+                async with _GEM_SEM:  # serialize for free plan
+                    for _ in range(tries):
+                        try:
+                            res = await fn(image_bytes, *args, **kwargs)
+                            if _CACHE_TTL > 0:
+                                _cache[key] = (time.time(), res)
+                            return res
+                        except Exception as e:
+                            last_err = f"{type(e).__name__}:{str(e)[:200]}"
+                            continue
                 return (False, 0.0, "none", "no_result:" + (last_err or "err"))
             setattr(mod, name, wrapped)
             logger.info("[nixe-patch] wrapped gemini call: %s.%s", mod.__name__, name)
@@ -131,11 +153,11 @@ def patch_guard_defer():
                     try:
                         return await _orig(self, image_bytes)
                     except asyncio.TimeoutError:
-                        last_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1200"))
+                        last_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1800"))
                         if last_ms > 0:
                             try:
                                 from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes_burst as _burst
-                                os.environ.setdefault("LPG_BURST_TIMEOUT_MS", str(last_ms))
+                                os.environ.setdefault("LPG_BURST_TIMEOUT_MS", os.getenv("LPG_BURST_TIMEOUT_MS", "1500"))
                                 ok, score, via, reason = await _burst(image_bytes)
                                 return (bool(ok), float(score), f"{via or 'gemini:lastchance'}", f"lastchance({reason})")
                             except Exception:

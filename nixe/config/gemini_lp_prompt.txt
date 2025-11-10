@@ -3,7 +3,7 @@ Return ONLY JSON with these keys:
 {
   "is_lucky": true|false,
   "score": float,
-  "category": "result|inventory|guide|upgrade|other",
+  "category": "result|inventory/guide/upgrade/other",
   "reasons": [string, ...],
   "features": {
     "has_10_pull_grid": true|false,

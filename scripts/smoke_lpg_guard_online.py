@@ -12,6 +12,65 @@ except Exception:
 DISCORD_API = "https://discord.com/api/v10"
 GEMINI_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
+
+def _load_lp_prompt() -> str:
+    # Try env path first, then bundled file, else minimal fallback
+    cands = [
+        os.getenv("GEMINI_LP_PROMPT_PATH"),
+        "nixe/config/gemini_lp_prompt.txt",
+        os.path.join(os.path.dirname(__file__), "gemini_lp_prompt.txt"),
+    ]
+    for p in cands:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                return open(p, "r", encoding="utf-8").read()
+        except Exception:
+            pass
+    # Fallback compact prompt (same schema)
+    return (
+        "You are an image auditor that decides if a screenshot is a 'lucky pull result'. "
+        "Return ONLY JSON: {is_lucky, score, category, reasons[], features{"
+        "has_10_pull_grid, has_result_text, rarity_gold_5star_present, "
+        "is_inventory_or_loadout_ui, is_shop_or_guide_card, single_item_or_upgrade_ui, "
+        "dominant_purple_but_no_other_signals}}. "
+        "is_lucky=true ONLY IF at least two of the first three are true AND none of the veto flags are true. "
+        "If uncertain, is_lucky=false with score<=0.5."
+    )
+
+# === Lucky Pull strict policy (2-of-3 signals + veto) ===
+def _apply_lucky_policy(payload: Dict[str, Any], thr: float) -> Tuple[bool, float, str]:
+    """
+    Returns (ok_exec, score, reason)
+    ok_exec True only if:
+      - score >= thr
+      - at least TWO of (has_10_pull_grid, has_result_text, rarity_gold_5star_present) are True
+      - none of veto flags are True
+    """
+    try:
+        score = float(payload.get("score", 0.0))
+        f = payload.get("features", {}) or {}
+    except Exception:
+        return (False, 0.0, "parse_error")
+
+    signals = int(bool(f.get("has_10_pull_grid"))) + int(bool(f.get("has_result_text"))) + int(bool(f.get("rarity_gold_5star_present")))
+    veto = any([
+        f.get("is_inventory_or_loadout_ui"),
+        f.get("is_shop_or_guide_card"),
+        f.get("single_item_or_upgrade_ui"),
+        f.get("dominant_purple_but_no_other_signals"),
+    ])
+
+    if score < thr:
+        return (False, score, "below_threshold")
+    if signals < 2:
+        return (False, score, "insufficient_signals")
+    if veto:
+        return (False, score, "veto_context")
+    if bool(payload.get("is_lucky")):
+        return (True, score, "gemini_confirmed")
+    return (False, score, "gemini_said_no")
 DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 DEFAULT_THR = float(os.getenv("LPG_THRESHOLD", "0.85"))
 
@@ -108,11 +167,7 @@ def classify_with_gemini(image_path: str,
     mime, _ = mimetypes.guess_type(image_path)
     if not mime:
         mime = "image/png"
-    prompt = (
-        "You are a strict detector for gacha 'lucky pull' screenshots from games (e.g., HSR, Genshin, PGR, WuWa, etc.).\n"
-        "Return a single JSON object with fields: lucky (true/false), score (0..1), reason (string).\n"
-        "Be conservative: only lucky=true if it's clearly a results screen."
-    )
+    prompt = _load_lp_prompt()
     payload = {"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":mime,"data":b64}}]}],
                "generationConfig":{"temperature":0.0,"maxOutputTokens":256}}
 
@@ -131,11 +186,9 @@ def classify_with_gemini(image_path: str,
         try:
             obj = json.loads(body)
         except Exception:
-            obj = {"lucky": False, "score": 0.0, "reason": "parse_failed"}
-        return {"ok": True, "lucky": bool(obj.get("lucky", False)),
-                "score": float(obj.get("score", 0.0)),
-                "provider": f"gemini:{model}",
-                "reason": str(obj.get("reason", "")) or "n/a"}
+            obj = {"is_lucky": False, "score": 0.0, "features": {}}
+        return {"ok": True, "payload": obj,
+                "provider": f"gemini:{model}"}
 
     if key_primary:
         res = _try(key_primary)
@@ -178,12 +231,11 @@ def main():
     keyB = os.getenv("GEMINI_API_KEY_B")
     res = classify_with_gemini(args.img, model, keyA, keyB)
 
-    lucky = bool(res.get("lucky"))
-    score = float(res.get("score", 0.0))
     provider = res.get("provider", "gemini")
-    reason = res.get("reason", "")
+    payload = res.get("payload") or {"is_lucky": False, "score": 0.0, "features": {}}
+    ok_exec, score, policy_reason = _apply_lucky_policy(payload, DEFAULT_THR)
 
-    if lucky and score >= DEFAULT_THR:
+    if ok_exec:
         time.sleep(max(0, int(args.ttl)))
         delete_message(target_id, msg_id)
 
@@ -196,7 +248,7 @@ def main():
         if perr and args.log_chan_id:
             post_text(args.log_chan_id, f"[smoke] persona load note: {perr}")
     else:
-        post_text(target_id, f"[smoke] not lucky (score={score:.3f} via {provider}; reason={reason})")
+        post_text(target_id, f"[smoke] not lucky (score={score:.3f} via {provider}; reason={policy_reason})")
 
 if __name__ == "__main__":
     main()

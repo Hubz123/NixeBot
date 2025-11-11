@@ -1,326 +1,330 @@
+#!/usr/bin/env python3
+import os, sys, io, json, time, argparse, base64, hashlib, math, mimetypes, requests, ast
+from pathlib import Path
 
-# --- E2E ONLINE HELPERS ---
+# ---------- util: env hybrid ----------
+def _is_secret_key(name: str) -> bool:
+    name = (name or '').upper().strip()
+    # allow *_API_KEY, *_API_KEY_* (e.g., _API_KEY_B), *_BACKUP_API_KEY, *_TOKEN, *_SECRET
+    return (
+        name.endswith('_API_KEY') or
+        name or
+        name or
+        name.endswith('_BACKUP_API_KEY') or
+        ('_API_KEY_' in name)  # e.g. GEMINI_API_KEY_B
+    )
+
+def _read_env_hybrid(dotenv_path: str, runtime_json_path: str) -> dict:
+    info = {
+        "runtime_env_json_path": str(runtime_json_path),
+        "env_file_path": str(dotenv_path),
+        "runtime_env_json_keys": 0,
+        "env_file_keys": 0,
+        "runtime_env_exported_total": 0,
+        "env_exported_tokens": 0,
+        "GEMINI_API_KEY": False,
+        "GEMINI_API_KEY_B": False,
+        "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
+        "error": None,
+    }
+    # .env (only secrets)
+    try:
+        if dotenv_path and Path(dotenv_path).exists():
+            txt = Path(dotenv_path).read_text(encoding="utf-8", errors="ignore")
+            for line in txt.splitlines():
+                s = line.strip()
+                if not s or s.startswith("#") or "=" not in s: continue
+                k, v = s.split("=", 1)
+                k = k.strip(); v = v.strip()
+                if len(v) >= 2 and ((v[0] == v[-1]) and v[0] in ("'", '"')):
+                    v = v[1:-1]
+                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                    os.environ.setdefault(k, v)
+            info["env_file_keys"] = len([ln for ln in txt.splitlines() if "=" in ln and not ln.strip().startswith("#")])
+    except Exception as e:
+        info["error"] = f".env read error: {e}"
+
+    # runtime json (configs)
+    try:
+        data = json.loads(Path(runtime_json_path).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            info["runtime_env_json_keys"] = len(data.keys())
+            # non-secret hints (read-only); keep format intact
+            for k,v in data.items():
+                if isinstance(v, (str,int,bool)) and k in (
+                    "LPG_GUARD_CHANNELS","LUCKYPULL_GUARD_CHANNELS","LPG_STATUS_THREAD_ID",
+                    "LPG_PERSONA_FILE","PERSONA_FILE","PERSONA_PATH",
+                    "LPG_NEGATIVE_TEXT","GEMINI_LUCKY_THRESHOLD","GEMINI_MODEL"
+                ):
+                    os.environ.setdefault(k, str(v))
+    except Exception as e:
+        info["error"] = f"runtime json read error: {e}"
+
+    info["GEMINI_API_KEY"] = bool(os.getenv("GEMINI_API_KEY"))
+    info["GEMINI_API_KEY_B"] = bool(os.getenv("GEMINI_API_KEY_B") or os.getenv("GEMINI_BACKUP_API_KEY"))
+    info["DISCORD_TOKEN"] = bool(os.getenv("DISCORD_TOKEN"))
+    return info
+
+# ---------- parse helpers ----------
+def _parse_negative_words() -> list:
+    raw = os.getenv("LPG_NEGATIVE_TEXT", "").strip()
+    words = []
+    if not raw:
+        return words
+    try:
+        # allow python-list-like or json list
+        val = ast.literal_eval(raw)
+        if isinstance(val, (list, tuple)):
+            words = [str(x).strip().lower() for x in val if str(x).strip()]
+        else:
+            words = [w.strip().lower() for w in str(val).split(",") if w.strip()]
+    except Exception:
+        words = [w.strip().lower() for w in raw.split(",") if w.strip()]
+    # dedup while preserving order
+    seen = set(); uniq = []
+    for w in words:
+        if w not in seen:
+            seen.add(w); uniq.append(w)
+    return uniq
+
+def _get_threshold(default_val: float = 0.95) -> float:
+    envv = os.getenv("GEMINI_LUCKY_THRESHOLD", "").strip()
+    try:
+        if envv:
+            return float(envv)
+    except Exception:
+        pass
+    return default_val
+
+# ---------- util: phash (simple aHash 64-bit) ----------
+def _ahash64_bytes(b: bytes) -> int | None:
+    try:
+        from PIL import Image
+        import numpy as np
+        from io import BytesIO
+        im = Image.open(BytesIO(b)).convert("L").resize((8,8))
+        arr = np.asarray(im, dtype=np.float32)
+        avg = arr.mean()
+        bits = (arr > avg).astype("uint8")
+        v = 0
+        for i in range(64):
+            v = (v << 1) | int(bits.flat[i])
+        return int(v)
+    except Exception:
+        return None
+
+# ---------- util: golden-color heuristic (only if result screen) ----------
+def _golden_ratio_bytes(b: bytes) -> float:
+    try:
+        from PIL import Image
+        import numpy as np
+        from io import BytesIO
+        im = Image.open(BytesIO(b)).convert("RGB")
+        arr = np.asarray(im, dtype=np.uint8)
+        r = arr[:,:,0].astype("int32"); g = arr[:,:,1].astype("int32"); bl = arr[:,:,2].astype("int32")
+        mask = ((r > 200) & (g > 140) & (bl < 120) & ((r - bl) > 80) & ((r - g) < 120))
+        ratio = float(mask.sum()) / float(arr.shape[0]*arr.shape[1])
+        return ratio
+    except Exception:
+        return 0.0
+
+def _heuristic_score_from_ratio(ratio: float) -> float:
+    if ratio <= 0: return 0.0
+    return min(0.98, ratio / 0.08)
+
+# ---------- gemini call ----------
+GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta"
+
+def _build_prompt(neg_words: list) -> str:
+    neg_txt = ", ".join(sorted(set(neg_words))) if neg_words else ""
+    lines = [
+        "Task: Decide if an image is a **gacha PULL RESULT screen** and if it is **lucky**.",
+        "- 'Pull result screen' examples: a 10/11-pull grid with cards/tiles, 'NEW' badges, rarity stars near each card.",
+        "- NOT result screens: loadout/deck/build/inventory/save-data, equipment lists, shop, mail, settings.",
+    ]
+    if neg_txt:
+        lines.append("- Treat any image containing these UI phrases as NOT a result screen: " + neg_txt + ".")
+    lines.extend([
+        "- If NOT a result screen -> ok=false, score=0.0, reason='not_result_screen'.",
+        "- If a result screen: lucky=true only if at least one top-tier/new reward (gold/orange banner, SSR/UR/Legendary, rainbow effect).",
+        "Return ONLY compact JSON: {"is_result_screen": <true|false>, "ok": <true|false>, "score": <0..1>, "reason": "..."}. No prose.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def _gemini_request(model: str, api_key: str, image_bytes: bytes, prompt: str, timeout_s: float = 10.0) -> dict:
+    url = f"{GEMINI_HOST}/models/{model}:generateContent?key={api_key}"
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.1, "topP": 0.1, "topK": 16}
+    }
+    r = requests.post(url, json=body, timeout=timeout_s)
+    r.raise_for_status()
+    return r.json()
+
+def _gemini_parse(json_obj: dict):
+    txt = ""
+    try:
+        cands = (json_obj.get("candidates") or [])
+        for c in cands:
+            parts = (((c.get("content") or {}).get("parts")) or [])
+            for p in parts:
+                if "text" in p:
+                    txt += p["text"]
+    except Exception:
+        pass
+    txt = (txt or "").strip()
+    raw_text = txt
+    is_result = False; ok = False; score = 0.0; reason = "empty"
+    if txt:
+        try:
+            if txt.startswith("```"):
+                idx = txt.find("{")
+                if idx >= 0: txt = txt[idx:]
+                txt = txt.strip("`")
+            obj = json.loads(txt)
+            is_result = bool(obj.get("is_result_screen"))
+            ok = bool(obj.get("ok"))
+            score = float(obj.get("score") or 0.0)
+            reason = str(obj.get("reason") or "ok")
+        except Exception:
+            low = txt.lower()
+            if any(w in low for w in ["save data","card count","obtained equipment","loadout","deck","inventory","profile"]):
+                is_result = False; ok = False; score = 0.0; reason = "not_result_screen(text)"
+            elif any(w in low for w in ["results","rescue","recruit","confirm","new badge","new badges"]) and any(w in low for w in ["gold","ssr","ur","legend","rainbow"]):
+                is_result = True; ok = True; score = 0.7; reason = "result+rarity(text)"
+            else:
+                is_result = False; ok = False; score = 0.0; reason = "unparsed"
+    return is_result, ok, max(0.0, min(1.0, score)), reason, raw_text
+
+def classify_lucky(image_bytes: bytes, threshold: float = 0.95):
+    neg_words = _parse_negative_words()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    api_a = os.getenv("GEMINI_API_KEY") or ""
+    api_b = os.getenv("GEMINI_API_KEY_B") or os.getenv("GEMINI_BACKUP_API_KEY") or ""
+    prompt = _build_prompt(neg_words)
+    best = ("none", 0.0, "none", False, "")
+    last_err = None
+    for which, key in (("A", api_a), ("B", api_b)):
+        if not key: continue
+        try:
+            js = _gemini_request(model, key, image_bytes, prompt, timeout_s=10.0)
+            is_result, ok, sc, rs, raw = _gemini_parse(js)
+            # local negative gate using configured words against raw model text
+            low = (raw or "").lower()
+            if any(w in low for w in neg_words):
+                is_result = False; ok = False; sc = 0.0; rs = "neg_text_match"
+            if sc > best[1]: best = (which, sc, rs, is_result, raw)
+            if is_result and (sc >= threshold or ok):
+                return True, sc, f"gemini:{model}[{which}]", rs, True
+            if not is_result and which == "B":
+                return False, 0.0, f"gemini:{model}[{which}]", "not_result_screen", False
+        except requests.HTTPError as he:
+            if he.response is not None and he.response.status_code == 429:
+                last_err = f"429 on {which}"
+                continue
+            last_err = f"http error on {which}: {he}"
+        except Exception as e:
+            last_err = f"error on {which}: {e}"
+            continue
+
+    # Heuristic only if best guess suggests result screen
+    if best[3]:
+        ratio = _golden_ratio_bytes(image_bytes)
+        hsc = _heuristic_score_from_ratio(ratio)
+        if hsc >= threshold*0.85 and hsc >= 0.66:
+            return True, hsc, "heuristic:gold-ratio", f"golden_ratio={ratio:.4f}", True
+    prov = f"gemini:{model}[{best[0]}]" if best[0] != "none" else "none"
+    if best[3] is False:
+        return False, 0.0, prov, "not_result_screen", False
+    return False, best[1], prov, (best[2] or last_err or "below_threshold"), best[3]
+
+# ---------- discord post ----------
 DISCORD_API = "https://discord.com/api/v10"
-def _discord_headers():
-    import os
-    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
-    if not token:
-        raise SystemExit("Missing DISCORD_TOKEN (or DISCORD_BOT_TOKEN) for --e2e-online")
-    return {"Authorization": f"Bot {token}", "User-Agent": "nixe-smoke/online-e2e"}
+def _headers():
+    tok = os.getenv("DISCORD_TOKEN")
+    if not tok: raise SystemExit("Missing DISCORD_TOKEN")
+    return {"Authorization": f"Bot {tok}", "User-Agent": "nixe-smoke/online"}
 
-def _post_image_message(target_id: str, image_path: str, content: str = "(smoke:e2e)"):
-    url = f"{DISCORD_API}/channels/{target_id}/messages"
-    import json, mimetypes, requests, os
-    mime, _ = mimetypes.guess_type(image_path)
-    if not mime:
-        mime = "application/octet-stream"
-    with open(image_path, "rb") as f:
-        files = [("files[0]", (os.path.basename(image_path), f, mime))]
-        payload = {"content": content}
-        data = {"payload_json": json.dumps(payload)}
-        r = requests.post(url, headers=_discord_headers(), data=data, files=files, timeout=30)
+def post_image(channel_id: str, image_bytes: bytes, filename: str, content: str) -> str:
+    url = f"{DISCORD_API}/channels/{channel_id}/messages"
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    files = [("files[0]", (filename, io.BytesIO(image_bytes), mime))]
+    data = {"payload_json": json.dumps({"content": content})}
+    r = requests.post(url, headers=_headers(), data=data, files=files, timeout=30)
     r.raise_for_status()
     return r.json()["id"]
 
-def _get_message(channel_id: str, message_id: str):
-    import requests
-    url = f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
-    r = requests.get(url, headers=_discord_headers(), timeout=15)
-    return r.status_code == 200, (r.json() if r.status_code == 200 else {"status": r.status_code, "text": r.text})
-
-def _list_messages(channel_id: str, limit: int = 50):
-    import requests
-    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}"
-    r = requests.get(url, headers=_discord_headers(), timeout=15)
-    return r.json() if r.status_code == 200 else []
-
-def _find_embed_with_mid(messages, title: str, mid: str):
-    for m in messages or []:
-        for emb in (m.get("embeds") or []):
-            if (emb.get("title") or "").strip().lower() == title.strip().lower():
-                for f in (emb.get("fields") or []):
-                    if (f.get("name") or "").lower() == "message id" and (f.get("value") or "").strip() == str(mid):
-                        return emb
-    return None
-
-import mimetypes
-import time
-
-import argparse, base64, json, os, time, mimetypes, sys, re, random
-from typing import Dict, Any, Optional, Tuple, List
-import requests
-
-try:
-    from scripts.smoke_utils import load_env_hybrid, read_json_tolerant, flatten_group_lines  # type: ignore
-except Exception:
-    sys.path.append(os.path.dirname(__file__))
-    from smoke_utils import load_env_hybrid, read_json_tolerant, flatten_group_lines  # type: ignore
-
-DISCORD_API = "https://discord.com/api/v10"
-GEMINI_ENDPOINT_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-
-
-def _load_lp_prompt() -> str:
-    # Try env path first, then bundled file, else minimal fallback
-    cands = [
-        os.getenv("GEMINI_LP_PROMPT_PATH"),
-        "nixe/config/gemini_lp_prompt.txt",
-        os.path.join(os.path.dirname(__file__), "gemini_lp_prompt.txt"),
-    ]
-    for p in cands:
-        if not p:
-            continue
-        try:
-            if os.path.exists(p):
-                return open(p, "r", encoding="utf-8").read()
-        except Exception:
-            pass
-    # Fallback compact prompt (same schema)
-    return (
-        "You are an image auditor that decides if a screenshot is a 'lucky pull result'. "
-        "Return ONLY JSON: {is_lucky, score, category, reasons[], features{"
-        "has_10_pull_grid, has_result_text, rarity_gold_5star_present, "
-        "is_inventory_or_loadout_ui, is_shop_or_guide_card, single_item_or_upgrade_ui, "
-        "dominant_purple_but_no_other_signals}}. "
-        "is_lucky=true ONLY IF at least two of the first three are true AND none of the veto flags are true. "
-        "If uncertain, is_lucky=false with score<=0.5."
-    )
-
-# === Lucky Pull strict policy (2-of-3 signals + veto) ===
-def _apply_lucky_policy(payload: Dict[str, Any], thr: float) -> Tuple[bool, float, str]:
-    """
-    Returns (ok_exec, score, reason)
-    ok_exec True only if:
-      - score >= thr
-      - at least TWO of (has_10_pull_grid, has_result_text, rarity_gold_5star_present) are True
-      - none of veto flags are True
-    """
-    try:
-        score = float(payload.get("score", 0.0))
-        f = payload.get("features", {}) or {}
-    except Exception:
-        return (False, 0.0, "parse_error")
-
-    signals = int(bool(f.get("has_10_pull_grid"))) + int(bool(f.get("has_result_text"))) + int(bool(f.get("rarity_gold_5star_present")))
-    veto = any([
-        f.get("is_inventory_or_loadout_ui"),
-        f.get("is_shop_or_guide_card"),
-        f.get("single_item_or_upgrade_ui"),
-        f.get("dominant_purple_but_no_other_signals"),
-    ])
-
-    if score < thr:
-        return (False, score, "below_threshold")
-    if signals < 2:
-        return (False, score, "insufficient_signals")
-    if veto:
-        return (False, score, "veto_context")
-    if bool(payload.get("is_lucky")):
-        return (True, score, "gemini_confirmed")
-    return (False, score, "gemini_said_no")
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-DEFAULT_THR = float(os.getenv("LPG_THRESHOLD", "0.85"))
-
-def _headers() -> Dict[str, str]:
-    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
-    if not token:
-        raise SystemExit("Missing DISCORD_TOKEN (or DISCORD_BOT_TOKEN) in .env")
-    return {"Authorization": f"Bot {token}", "User-Agent": "nixe-smoke/guard-online"}
-
-def post_image_message(channel_or_thread_id: str, image_path: str, content: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-    url = f"{DISCORD_API}/channels/{channel_or_thread_id}/messages"
-    mime, _ = mimetypes.guess_type(image_path)
-    if not mime:
-        mime = "application/octet-stream"
-    files = []
-    with open(image_path, "rb") as f:
-        files.append(("files[0]", (os.path.basename(image_path), f, mime)))
-        payload = {"content": content or ""}
-        data = {"payload_json": json.dumps(payload)}
-        r = requests.post(url, headers=_headers(), data=data, files=files)
-    if r.status_code in (200, 201):
-        return True, r.json()["id"]
-    return False, None
-
-def delete_message(channel_or_thread_id: str, message_id: str) -> bool:
-    url = f"{DISCORD_API}/channels/{channel_or_thread_id}/messages/{message_id}"
-    r = requests.delete(url, headers=_headers())
-    return r.status_code in (200, 202, 204)
-
-def post_text(channel_or_thread_id: str, content: str) -> Tuple[bool, Optional[str]]:
-    url = f"{DISCORD_API}/channels/{channel_or_thread_id}/messages"
-    r = requests.post(url, headers=_headers(), json={"content": content})
-    if r.status_code in (200, 201):
-        return True, r.json()["id"]
-    return False, None
-
-def _candidate_persona_paths(p: str) -> List[str]:
-    cands = []
-    if p:
-        cands += [p, p.replace('\\', '/'), p.replace('/', '\\')]
-    cands += ["nixe/config/yandere.json", "nixe\\config\\yandere.json",
-              "./nixe/config/yandere.json", "../nixe/config/yandere.json"]
-    here = os.path.dirname(__file__)
-    cands += [os.path.join(here, "yandere.json"),
-              os.path.join(here, "../nixe/config/yandere.json")]
-    seen, out = set(), []
-    for x in cands:
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
-
-def load_persona_line_groups(persona_path: str) -> Tuple[str, Optional[str]]:
-    """
-    Strict persona: only use lines from groups.* and render as-is.
-    Returns (line, debug_err)
-    """
-    try:
-        from nixe.helpers.persona_loader import load_persona, pick_line  # type: ignore
-        data = load_persona(persona_path)
-        line = pick_line(data, randomize=True)
-        return line, None
-    except Exception as e_first:
-        errors = []
-        for cand in _candidate_persona_paths(persona_path):
-            try:
-                if os.path.exists(cand):
-                    data = read_json_tolerant(cand)
-                    lines = flatten_group_lines(data)
-                    if lines:
-                        line = random.choice(lines)
-                        return line, None
-                    else:
-                        errors.append(f"{cand}: no group lines")
-                else:
-                    errors.append(f"{cand}: not found")
-            except Exception as e_json:
-                errors.append(f"{cand}: {e_json!r}")
-        return "(persona gagal dimuat)", "; ".join(errors) if errors else str(e_first)
-
-def render_placeholders(line: str, user_id: Optional[str], channel_id: Optional[str], reason_txt: str = "Tebaran Garam") -> str:
-    user_mention = f"<@{user_id}>" if user_id else "@user"
-    chan_mention = f"<#{channel_id}>" if channel_id else "#channel"
-    line = re.sub(r'\{user\}', user_mention, line, flags=re.I)
-    line = re.sub(r'\{channel\}', chan_mention, line, flags=re.I)
-    line = re.sub(r'\{reason\}', reason_txt, line, flags=re.I)
-    return line
-
-def classify_with_gemini(image_path: str,
-                         model: str,
-                         key_primary: Optional[str],
-                         key_backup: Optional[str]) -> Dict[str, Any]:
-    img_bytes = open(image_path, "rb").read()
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-    mime, _ = mimetypes.guess_type(image_path)
-    if not mime:
-        mime = "image/png"
-    prompt = _load_lp_prompt()
-    payload = {"contents":[{"parts":[{"text":prompt},{"inline_data":{"mime_type":mime,"data":b64}}]}],
-               "generationConfig":{"temperature":0.0,"maxOutputTokens":256}}
-
-    def _try(key: str) -> Dict[str, Any]:
-        url = GEMINI_ENDPOINT_TMPL.format(model=model)
-        r = requests.post(url, params={"key": key}, json=payload, timeout=25)
-        if r.status_code != 200:
-            return {"ok": False, "err": f"gemini_http_{r.status_code}", "text": r.text}
-        data = r.json()
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            return {"ok": False, "err": "gemini_parse", "text": str(data)}
-        i, j = text.find("{"), text.rfind("}")
-        body = text[i:j+1] if (i>=0 and j>i) else "{}"
-        try:
-            obj = json.loads(body)
-        except Exception:
-            obj = {"is_lucky": False, "score": 0.0, "features": {}}
-        return {"ok": True, "payload": obj,
-                "provider": f"gemini:{model}"}
-
-    if key_primary:
-        res = _try(key_primary)
-        if res.get("ok"):
-            return res
-    if key_backup:
-        res = _try(key_backup)
-        if res.get("ok"):
-            return res
-    return {"ok": False, "lucky": False, "score": 0.0, "provider": f"gemini:{model}", "reason": "no_success_key"}
-
+# ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Lucky Pull guard smoke (strict persona-only)")
+    ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--img", required=True, help="Path to image file")
-    ap.add_argument("--chan-id", help="Channel ID (parent)")
-    ap.add_argument("--thread-id", help="Thread ID (if provided, used as target channel)")
-    ap.add_argument("--user-id", help="User ID to mention (e.g., 228126085160763392)")
-    ap.add_argument("--redirect", required=True, help="Channel ID for Lucky Pull redirect")
-    ap.add_argument("--persona-file", default="nixe/config/yandere.json")
-    ap.add_argument("--ttl", type=int, default=5)
-    ap.add_argument("--dotenv", dest="dotenv_path")
-    ap.add_argument("--runtime-json", dest="runtime_json", default="nixe\\config\\runtime_env.json")
-    ap.add_argument("--log-chan-id", help="Optional: channel for debug logs")
+    ap.add_argument("--chan-id", required=True, help="Channel ID to post to")
+    ap.add_argument("--thread-id", required=True, help="Thread ID to post to (for logging cache)")
+    ap.add_argument("--user-id", required=True, help="User ID to mention or attribute")
+    ap.add_argument("--redirect", required=True, help="Redirect channel on success")
+    ap.add_argument("--persona-file", required=False, help="Persona JSON path (not modified)")
+    ap.add_argument("--ttl", type=int, default=15)
+    ap.add_argument("--dotenv", default=".env")
+    ap.add_argument("--runtime-json", default="nixe/config/runtime_env.json")
+    ap.add_argument("--threshold", type=float, default=0.95, help="Lucky score threshold (default 0.95)")
     args = ap.parse_args()
 
-    # --- E2E ONLINE mode ---
-    if getattr(args, "e2e_online", False):
-        if not args.e2e_img or not args.e2e_target_id:
-            raise SystemExit("--e2e-online requires --e2e-img and --e2e-target-id")
-        mid = _post_image_message(args.e2e_target_id, args.e2e_img)
-        print(f"[e2e] posted message id={mid}")
-        end = time.time() + int(args.e2e_ttl)
-        seen = None; deleted = False
-        while time.time() < end:
-            msgs = _list_messages(args.e2e_status_thread_id, limit=50)
-            emb = _find_embed_with_mid(msgs, title="Lucky Pull Classification", mid=mid)
-            if emb and not seen:
-                seen = emb
-                print("[e2e] embed detected on status thread")
-            ok, _ = _get_message(args.e2e_target_id, mid)
-            deleted = not ok
-            if seen and deleted:
-                break
-            time.sleep(2)
-        if not seen:
-            raise SystemExit("E2E FAIL: classification embed not found")
-        if not deleted:
-            print("[e2e] WARN: message not deleted within TTL")
-        print("[e2e] OK")
-        return
-    _ = load_env_hybrid(args.dotenv_path, args.runtime_json)
+    info = _read_env_hybrid(args.dotenv, args.runtime_json)
+    # override threshold from runtime if set
+    th = _get_threshold(args.threshold)
+    print("=== ENV HYBRID CHECK ===")
+    print(json.dumps({k:v for k,v in info.items() if k != "error"}, indent=2))
+    if info.get("error"):
+        print("[WARN]", info["error"], file=sys.stderr)
 
-    target_id = args.thread_id or args.chan_id
-    if not target_id:
-        raise SystemExit("Provide --chan-id or --thread-id")
-    if not os.path.exists(args.img):
-        raise SystemExit(f"Image not found: {args.img}")
+    with open(args.img, "rb") as f:
+        b = f.read()
 
-    ok, msg_id = post_image_message(target_id, args.img, content="(smoke: lucky-pull test)")
-    if not ok or not msg_id:
-        raise SystemExit("Failed to post test image")
+    print("\n=== GEMINI CLASSIFY ===")
+    t0 = time.time()
+    ok, score, provider, reason, is_result = classify_lucky(b, threshold=th)
+    ok = bool(is_result and (score >= th))  # enforce runtime threshold
+    dur = (time.time() - t0)*1000.0
+    print(f"[RESULT] ok={ok} score={score:.3f} provider={provider} reason={reason} is_result={is_result} dur_ms={dur:.1f}")
 
-    model = os.getenv("GEMINI_MODEL", "") or "gemini-2.5-flash-lite"
-    keyA = os.getenv("GEMINI_API_KEY")
-    keyB = os.getenv("GEMINI_API_KEY_B")
-    res = classify_with_gemini(args.img, model, keyA, keyB)
+    # pHash + cache (per thread)
+    ph = _ahash64_bytes(b)
+    cache_dir = Path("nixe/cache"); cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / f"lucky_phash_thread_{args.thread_id}.json"
+    rec = {"ts": int(time.time()), "phash": (hex(int(ph))[2:].upper() if isinstance(ph,int) else None),
+           "ok": ok, "score": float(score), "provider": provider, "reason": reason, "is_result": bool(is_result)}
+    try:
+        arr = []
+        if cache_file.exists():
+            arr = json.loads(cache_file.read_text("utf-8"))
+            if not isinstance(arr, list): arr = []
+        arr.append(rec)
+        cache_file.write_text(json.dumps(arr, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[CACHE] wrote {cache_file}")
+    except Exception as e:
+        print(f"[CACHE] skip ({e})")
 
-    provider = res.get("provider", "gemini")
-    payload = res.get("payload") or {"is_lucky": False, "score": 0.0, "features": {}}
-    ok_exec, score, policy_reason = _apply_lucky_policy(payload, DEFAULT_THR)
+    # Post marker message to channel (so guard can act); keep existing content format
+    try:
+        content = f"(smoke: lucky-pull test) [score={score:.3f} via {provider}; reason={reason}; is_result={is_result}]"
+        mid = post_image(args.chan_id if args.chan_id else args.thread_id, b, Path(args.img).name, content=content)
+        print(f"[POST] message id={mid}")
+    except Exception as e:
+        print(f"[POST] failed: {e}", file=sys.stderr)
 
-    if ok_exec:
-        time.sleep(max(0, int(args.ttl)))
-        delete_message(target_id, msg_id)
-
-        # persona ONLY
-        raw_line, perr = load_persona_line_groups(args.persona_file)
-        rendered = render_placeholders(raw_line, args.user_id, args.redirect, reason_txt="Tebaran Garam")
-        content = rendered  # no extra lines appended
-        post_text(target_id, content)
-
-        if perr and args.log_chan_id:
-            post_text(args.log_chan_id, f"[smoke] persona load note: {perr}")
+    if ok and is_result:
+        print(f"[smoke] lucky (score={score:.3f} via {provider}; reason={reason})")
+        sys.exit(0)
     else:
-        post_text(target_id, f"[smoke] not lucky (score={score:.3f} via {provider}; reason={policy_reason})")
+        print(f"[smoke] not lucky (score={score:.3f} via {provider}; reason={reason})")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()

@@ -22,8 +22,10 @@ Existing env:
 
 from __future__ import annotations
 import os
+import atexit
 import io
 import asyncio
+
 import base64
 import json
 import logging
@@ -61,6 +63,7 @@ def _keys() -> List[str]:
         _env("GEMINI_API_KEYB",""),
         _env("GEMINI_API_KEY_2",""),
         _env("GEMINI_API_KEY2",""),
+        _env("GEMINI_BACKUP_API_KEY",""),
     ]:
         if k:
             candidates.append(k)
@@ -88,6 +91,25 @@ _INFLIGHT: dict[str, asyncio.Future] = {}
 # -------- http session helpers --------
 _SESSION = None
 
+
+def _close_session_sync():
+    global _SESSION
+    try:
+        s = _SESSION
+        _SESSION = None
+        if s is not None and not getattr(s, 'closed', True):
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(s.close())
+                else:
+                    loop.run_until_complete(s.close())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+atexit.register(_close_session_sync)
 def _make_connector():
     try:
         import socket, aiohttp
@@ -119,7 +141,52 @@ async def _warmup(session, key: str):
 
 
 # -------- request build/parse --------
+
+def _maybe_transcode(image_bytes: bytes) -> tuple[bytes, str]:
+    """
+    Try to downscale/transcode to JPEG to shrink payload.
+    Controlled by env:
+      - LPG_IMG_TRANSCODE (default '1')
+      - LPG_IMG_MAX_DIM (default '1024')  # longest side
+      - LPG_IMG_JPEG_QUALITY (default '85')
+      - LPG_IMG_MAX_JPEG_KB (default '256')  # soft cap
+    Returns: (bytes, mime_type)
+    """
+    try:
+        if _env("LPG_IMG_TRANSCODE","1") != "1":
+            return image_bytes, "image/png"
+        try:
+            from PIL import Image
+            import io
+        except Exception:
+            return image_bytes, "image/png"
+        # Load image
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        max_dim = int(_env("LPG_IMG_MAX_DIM", _env("LPG_IMG_MAX_SIDE","1024")))
+        w, h = im.size
+        if max(w,h) > max_dim and max_dim > 0:
+            scale = max_dim / float(max(w,h))
+            im = im.resize((max(1,int(w*scale)), max(1,int(h*scale))), Image.LANCZOS)
+        # Encode JPEG
+        buf = io.BytesIO()
+        quality = int(_env("LPG_IMG_JPEG_Q", _env("LPG_IMG_JPEG_QUALITY","85")))
+        im.save(buf, format="JPEG", quality=quality, optimize=True)
+        data = buf.getvalue()
+        cap_kb = int(_env("LPG_IMG_TARGET_KB", _env("LPG_IMG_MAX_JPEG_KB","256")))
+        # If still too large, re-encode at lower quality 70 then 60
+        if len(data) > cap_kb*1024:
+            for q in (70, 60, 50):
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=q, optimize=True)
+                data = buf.getvalue()
+                if len(data) <= cap_kb*1024:
+                    break
+        return data, "image/jpeg"
+    except Exception:
+        return image_bytes, "image/png"
+
 def _build_payload(image_bytes: bytes) -> dict:
+    image_bytes, mime = _maybe_transcode(image_bytes)
     b64 = base64.b64encode(image_bytes).decode("ascii")
     sys_prompt = (
         "Classify STRICTLY whether this image is a gacha 'lucky pull' RESULT screen. "
@@ -132,7 +199,7 @@ def _build_payload(image_bytes: bytes) -> dict:
         "contents": [
             {"role": "user", "parts": [
                 {"text": sys_prompt},
-                {"inline_data": {"mime_type": "image/png", "data": b64}}
+                {"inline_data": {"mime_type": mime, "data": b64}}
             ]}
         ],
         "generationConfig": {"temperature": 0.0, "topP": 0.1}
@@ -296,7 +363,7 @@ async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
         return False, 0.0, tag, "no_keys"
 
     model = _env("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    per_timeout = _env_f("LPG_BURST_TIMEOUT_MS", 1400) / 1000.0
+    per_timeout = _env_f("LPG_BURST_TIMEOUT_MS", float(os.getenv("GEMINI_PER_TIMEOUT_MS","6000"))) / 1000.0
     early_score = _env_f("LPG_BURST_EARLY_EXIT_SCORE", 0.90)
     mode = _env("LPG_BURST_MODE", "stagger").lower()
     stagger_ms = _env_f("LPG_BURST_STAGGER_MS", 300)
@@ -325,6 +392,7 @@ async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
             except Exception:
                 pass
         import asyncio
+
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         _INFLIGHT[key] = fut

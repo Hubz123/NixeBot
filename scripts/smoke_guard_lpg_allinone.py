@@ -1,51 +1,3 @@
-
-# --- E2E ONLINE HELPERS (integrated) ---
-DISCORD_API = "https://discord.com/api/v10"
-def _discord_headers():
-    import os
-    token = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
-    if not token:
-        raise SystemExit("Missing DISCORD_TOKEN (or DISCORD_BOT_TOKEN) for --e2e-online")
-    return {"Authorization": f"Bot {token}", "User-Agent": "nixe-smoke/online-e2e"}
-
-def _post_image_message(target_id: str, image_path: str, content: str = "(smoke:e2e)"):
-    url = f"{DISCORD_API}/channels/{target_id}/messages"
-    import json, mimetypes, requests, os
-    mime, _ = mimetypes.guess_type(image_path)
-    if not mime:
-        mime = "application/octet-stream"
-    with open(image_path, "rb") as f:
-        files = [("files[0]", (os.path.basename(image_path), f, mime))]
-        payload = {"content": content}
-        data = {"payload_json": json.dumps(payload)}
-        r = requests.post(url, headers=_discord_headers(), data=data, files=files, timeout=30)
-    r.raise_for_status()
-    return r.json()["id"]
-
-def _get_message(channel_id: str, message_id: str):
-    import requests
-    url = f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
-    r = requests.get(url, headers=_discord_headers(), timeout=15)
-    return r.status_code == 200, (r.json() if r.status_code == 200 else {"status": r.status_code, "text": r.text})
-
-def _list_messages(channel_id: str, limit: int = 50):
-    import requests
-    url = f"{DISCORD_API}/channels/{channel_id}/messages?limit={limit}"
-    r = requests.get(url, headers=_discord_headers(), timeout=15)
-    return r.json() if r.status_code == 200 else []
-
-def _find_embed_with_mid(messages, title: str, mid: str):
-    for m in messages or []:
-        for emb in (m.get("embeds") or []):
-            if (emb.get("title") or "").strip().lower() == title.strip().lower():
-                for f in (emb.get("fields") or []):
-                    if (f.get("name") or "").lower() == "message id" and (f.get("value") or "").strip() == str(mid):
-                        return emb
-    return None
-
-import mimetypes
-import time
-import requests
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -57,9 +9,90 @@ smoke_guard_lpg_allinone.py (v4-realtime-burst)
 - Read-only against runtime_env.json (.env only for tokens)
 """
 from __future__ import annotations
-import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re, random, time
+import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re, random, time, base64, base64
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
+try:
+    from nixe.helpers.gemini_lpg_burst import _maybe_transcode as _maybe_transcode_img  # type: ignore
+except Exception:
+    def _maybe_transcode_img(image_bytes: bytes):
+        return image_bytes, 'image/png'
+
+
+# --- E2E helpers (Discord REST) ---
+DISCORD_API = "https://discord.com/api/v10"
+def _e2e_headers():
+    tok = os.getenv("DISCORD_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+    if not tok:
+        raise SystemExit("Missing DISCORD_TOKEN (or DISCORD_BOT_TOKEN)")
+    return {"Authorization": f"Bot {tok}", "User-Agent": "nixe-smoke/e2e"}
+
+def _e2e_post_image(target_id: str, image_path: str, content="(smoke:e2e)") -> str:
+    import mimetypes, json, requests
+    url = f"{DISCORD_API}/channels/{target_id}/messages"
+    mime, _ = mimetypes.guess_type(image_path)
+    if not mime: mime = "application/octet-stream"
+    with open(image_path, "rb") as f:
+        files = [("files[0]", (os.path.basename(image_path), f, mime))]
+        payload = {"content": content}
+        data = {"payload_json": json.dumps(payload)}
+        r = requests.post(url, headers=_e2e_headers(), data=data, files=files, timeout=45)
+    r.raise_for_status()
+    return r.json()["id"]
+
+def _e2e_get_message(chan_id: str, message_id: str):
+    import requests
+    url = f"{DISCORD_API}/channels/{chan_id}/messages/{message_id}"
+    try:
+        r = requests.get(url, headers=_e2e_headers(), timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def _e2e_list_messages(chan_id: str, limit: int = 50):
+    import requests, time
+    url = f"{DISCORD_API}/channels/{chan_id}/messages?limit={limit}"
+    try:
+        r = requests.get(url, headers=_e2e_headers(), timeout=5)
+        if r.status_code == 429:
+            try:
+                ra = float(r.headers.get("Retry-After", "1"))
+            except Exception:
+                ra = 1.0
+            time.sleep(min(max(ra, 1.0), 5.0))
+            return []
+        return r.json() if r.status_code == 200 else []
+    except Exception:
+        return []
+
+def _e2e_find_embed_with_mid(messages, title: str, mid: str):
+    for m in messages or []:
+        for emb in (m.get("embeds") or []):
+            if (emb.get("title") or "").strip().lower() == title.strip().lower():
+                for f in (emb.get("fields") or []):
+                    if (f.get("name") or "").lower() == "message id" and (f.get("value") or "").strip() == str(mid):
+                        return emb
+    return None
+
+def _normalize_image_path(p: str) -> str:
+    if not p: return p
+    # Windows Git Bash -> Windows path
+    if os.name == "nt":
+        import re as _re
+        s = p.replace("\\", "/")
+        m = _re.match(r"^/mnt/([a-zA-Z])/(.*)$", s) or _re.match(r"^/([a-zA-Z])/(.*)$", s)
+        if m:
+            drv, rest = m.group(1).upper(), m.group(2)
+            win_rest = rest.replace("/", "\\")
+            return f"{drv}:\\" + win_rest
+        return p
+    # POSIX running, convert C:\ to /mnt/c/
+    if ":" in p and "\\" in p:
+        drv = p[0].lower()
+        rest = p[3:].replace("\\","/")
+        return f"/mnt/{drv}/{rest}"
+    return p
+
 
 # -------------------------
 # Util
@@ -103,7 +136,7 @@ def _read_env_hybrid():
             data = json.load(open(rpath, "r", encoding="utf-8"))
             info["runtime_env_json_keys"] = len(data)
             for k,v in data.items():
-                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                if (k.endswith(("_API_KEY","_TOKEN","_SECRET")) or k.endswith("_BACKUP_API_KEY") or ("_API_KEY_" in k)):
                     info["runtime_env_tokens_skipped"] += 1
                     continue
                 os.environ.setdefault(str(k), str(v))
@@ -118,7 +151,7 @@ def _read_env_hybrid():
             for ln in lines:
                 k, _, v = ln.partition("=")
                 k=k.strip(); v=v.strip()
-                if k.endswith(("_API_KEY","_TOKEN","_SECRET")):
+                if (k.endswith(("_API_KEY","_TOKEN","_SECRET")) or k.endswith("_BACKUP_API_KEY") or ("_API_KEY_" in k)):
                     os.environ.setdefault(k, v)
                     info["env_exported_tokens"] += 1
     except Exception as e:
@@ -146,9 +179,12 @@ def _print_thread_check(as_thread: int, parent: int):
     lpg = set(_parse_ids(os.getenv("LPG_GUARD_CHANNELS","")))
     luck = set(_parse_ids(os.getenv("LUCKYPULL_GUARD_CHANNELS","")))
     guards = lpg or luck
-    in_guard = (as_thread in guards) or (parent in guards)
+    tid = int(as_thread) if as_thread else 0
+    pid = int(parent) if parent else 0
+    in_guard = (tid in guards) or (pid in guards)
     print("=== THREAD CHECK ===")
-    print(f"thread_id={as_thread} parent_id={parent} in_guard={bool(in_guard)}"); print()
+    print(f"thread_id={as_thread} parent_id={parent} in_guard={in_guard}")
+
 
 def _print_policy():
     strict = (os.getenv("LPG_STRICT_ON_GUARD") or os.getenv("STRICT_ON_GUARD") or "1") == "1"
@@ -317,7 +353,7 @@ def _get_gemini_keys() -> List[str]:
         keys = [p.strip() for p in raw.replace(";",",").split(",") if p.strip()]
     else:
         k1 = os.getenv("GEMINI_API_KEY","")
-        k2 = os.getenv("GEMINI_API_KEY_B", os.getenv("GEMINI_API_KEYB",""))
+        k2 = os.getenv("GEMINI_API_KEY_B", os.getenv("GEMINI_API_KEYB", os.getenv("GEMINI_BACKUP_API_KEY","")))
         keys = [k for k in (k1, k2) if k]
     # dedup while keeping order
     seen, out = set(), []
@@ -327,183 +363,91 @@ def _get_gemini_keys() -> List[str]:
     return out
 
 def _build_payload(image_bytes: bytes) -> dict:
-    import base64
-    b64 = base64.b64encode(image_bytes).decode("ascii")
+    # Downscale/recompress large Discord images; choose correct MIME
+    try:
+        image_bytes, mime = _maybe_transcode_img(image_bytes)
+    except Exception:
+        mime = 'image/png'
+    b64 = base64.b64encode(image_bytes).decode('ascii')
     sys_prompt = (
-        "Classify STRICTLY whether this image is a gacha 'lucky pull' RESULT screen. "
-        "Respond ONLY JSON: {\"lucky\": <bool>, \"score\": <0..1>, \"reason\": <short>, \"flags\": <string[]>}. "
-        "Bias toward FALSE if it's inventory/loadout/profile/status. "
-        "Positive cues: 10-pull grid, NEW!!, rainbow beam, multiple result slots. "
-        "Negative cues: 'Save data', 'Card Count', 'Obtained Equipment', 'Manifest Ego', partners, memory fragments."
+        'Classify STRICTLY whether this image is a gacha "lucky pull" RESULT screen. '
+        'Return ONLY JSON: {"lucky": <true|false>, "score": <0..1>, "reason": "..."}. '
+        'Bias toward FALSE if inventory/profile/save-data UI.'
     )
     return {
-        "contents": [
-            {"role": "user", "parts": [
-                {"text": sys_prompt},
-                {"inline_data": {"mime_type": "image/png", "data": b64}}
-            ]}
-        ],
-        "generationConfig": {"temperature": 0.0, "topP": 0.1}
+        'contents': [{
+            'role': 'user',
+            'parts': [
+                {'text': sys_prompt},
+                {'inline_data': {'mime_type': mime, 'data': b64}}
+            ]
+        }],
+        'generationConfig': {'temperature': 0.0, 'topP': 0.1}
     }
 
-async def _burst_realtime(img_bytes: bytes, thr: float) -> Tuple[str, float, dict]:
-    try:
-        import aiohttp
-    except Exception:
-        return ("error:aiohttp_missing", 0.0, {})
-
-    model = os.getenv("GEMINI_MODEL","gemini-2.5-flash-lite")
+# FIXTAG:BRRT-OK
+async def _burst_realtime(image_bytes: bytes, threshold: float):
+    import sys, os, importlib.util, pathlib
+    # Ensure project root on sys.path so 'nixe.helpers' can be imported
+    _repo_root = pathlib.Path(__file__).resolve().parents[1]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    """Burst realtime via helper; returns (verdict, score, timeline)."""
+    import time as _t
+    t0 = _t.monotonic()
+    mode = os.getenv('LPG_BURST_MODE', 'stagger')
+    model = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash-lite')
+    per_timeout_ms = float(os.getenv('GEMINI_PER_TIMEOUT_MS', os.getenv('LPG_BURST_TIMEOUT_MS', '3500')))
+    stagger_ms = float(os.getenv('LPG_BURST_STAGGER_MS', '300'))
     keys = _get_gemini_keys()
-    per_timeout_ms = float(os.getenv("LPG_BURST_TIMEOUT_MS","1400"))
-    stagger_ms = float(os.getenv("LPG_BURST_STAGGER_MS","300"))
-    early_score = float(os.getenv("LPG_BURST_EARLY_EXIT_SCORE","0.90"))
-    mode = os.getenv("LPG_BURST_MODE","stagger").lower()
-    fallback_margin_ms = float(os.getenv("LPG_FALLBACK_MARGIN_MS","1200"))
-
-    payload = _build_payload(img_bytes)
-    url_tpl = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    t0 = time.monotonic()
-    timeline = {
-        "mode": mode, "model": model,
-        "keys": [_mask_key(k) for k in keys],
-        "stagger_ms": stagger_ms, "per_timeout_ms": per_timeout_ms,
-        "t_start": t0, "events": []  # (name, t, extra)
-    }
-
-    async def call_one(session, key, name):
-        url = url_tpl.format(model=model, key=key)
-        t_start = time.monotonic()
-        timeline["events"].append((f"{name}:start", t_start, {}))
+    events = [('api:start', _t.monotonic(), None)]
+    try:
         try:
-            async with session.post(url, json=payload, timeout=per_timeout_ms/1000.0) as resp:
-                st = resp.status
-                try:
-                    data = await resp.json()
-                except Exception:
-                    data = {"_raw": await resp.text()}
-                t_end = time.monotonic()
-                txt = ""
-                try:
-                    txt = data["candidates"][0]["content"]["parts"][0]["text"]
-                except Exception:
-                    txt = json.dumps(data)[:500]
-                # parse json-ish
-                lucky, score, reason = False, 0.0, "unparseable"
-                try:
-                    obj = None
-                    try:
-                        obj = json.loads(txt)
-                    except Exception:
-                        m = re.search(r"\{.*\}", txt, re.S)
-                        if m: obj = json.loads(m.group(0))
-                    if isinstance(obj, dict):
-                        lucky = bool(obj.get("lucky", False))
-                        score = float(obj.get("score", 0.0))
-                        reason = str(obj.get("reason",""))
-                except Exception:
-                    pass
-                timeline["events"].append((f"{name}:end", t_end, {"status": st, "lucky": lucky, "score": score, "reason": reason[:120]}))
-                return lucky, score, st, reason
-        except asyncio.TimeoutError:
-            t_end = time.monotonic()
-            timeline["events"].append((f"{name}:timeout", t_end, {}))
-            return False, 0.0, "timeout", "request_timeout"
-        except Exception as e:
-            t_end = time.monotonic()
-            timeline["events"].append((f"{name}:error", t_end, {"err": type(e).__name__}))
-            return False, 0.0, "error", type(e).__name__
-    async def _run_sequential(session, keys, per_timeout_ms, early_score):
-        # Fire key#1 first (reduced timeout to leave margin), fallback to key#2 only if needed.
-        t1 = max(800.0, per_timeout_ms - fallback_margin_ms)
-        k1 = keys[0]
-        lucky1, score1, st1, reason1 = await call_one(session, k1, "api1")
-        if lucky1 and score1 >= early_score:
-            return True, score1, "api1-early", reason1
-        need_fb = (st1 in ("timeout","error")) or ("429" in str(reason1)) or (not lucky1)
-        if len(keys) >= 2 and need_fb:
-            k2 = keys[1]
-            lucky2, score2, st2, reason2 = await call_one(session, k2, "api2")
-            if (lucky2 and score2 >= score1) or not lucky1:
-                return lucky2, score2, "api2", reason2
-        return lucky1, score1, "api1", reason1
+            from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes_burst as _burst_call  # type: ignore
+        except Exception:
+            # fallback to bridge; if package import fails, try importing by file path
+            try:
+                from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes as _burst_call  # type: ignore
+            except Exception:
+                _bridge_path = _repo_root / 'nixe' / 'helpers' / 'gemini_bridge.py'
+                spec = importlib.util.spec_from_file_location('gemini_bridge', str(_bridge_path))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+                _burst_call = mod.classify_lucky_pull_bytes
+        lucky, score, tag, reason = await _burst_call(image_bytes)
+        events.append(('api:done', _t.monotonic(), {'tag': tag, 'reason': reason}))
+        verdict = 'LP' if (lucky and float(score) >= float(threshold)) else 'OTHER'
+        tl = {
+            'mode': mode,
+            'model': model,
+            'keys': keys,
+            'stagger_ms': stagger_ms,
+            'per_timeout_ms': per_timeout_ms,
+            'events': events,
+            't_start': t0,
+            'ms_total': int((_t.monotonic() - t0) * 1000.0),
+            'ok': bool(lucky and float(score) >= float(threshold)),
+            'score': float(score),
+            'source': 'helper'
+        }
+        return verdict, float(score), tl
+    except Exception as e:
+        events.append(('api:error', _t.monotonic(), {'error': type(e).__name__}))
+        tl = {
+            'mode': mode,
+            'model': model,
+            'keys': keys,
+            'stagger_ms': stagger_ms,
+            'per_timeout_ms': per_timeout_ms,
+            'events': events,
+            't_start': t0,
+            'ms_total': int((_t.monotonic() - t0) * 1000.0),
+            'ok': False,
+            'score': 0.0,
+            'source': 'exception'
+        }
+        return 'OTHER', 0.0, tl
 
-
-    async with aiohttp.ClientSession() as session:
-            # Sequential mode (deadline fallback) for quota saving
-        if mode == "sequential" and len(keys) >= 1:
-            ok, score, source, _ = await _run_sequential(session, keys, per_timeout_ms, early_score)
-        else:
-            res1 = res2 = None
-            task1 = task2 = None
-            # fire key1
-            if len(keys) >= 1:
-                task1 = asyncio.create_task(call_one(session, keys[0], "api1"))
-            # optionally fire key2
-            if mode == "parallel" and len(keys) >= 2:
-                task2 = asyncio.create_task(call_one(session, keys[1], "api2"))
-            elif mode == "stagger" and len(keys) >= 2:
-                # schedule after stagger, unless task1 finishes early and hits early_score positive
-                async def delayed():
-                    await asyncio.sleep(stagger_ms/1000.0)
-                    return await call_one(session, keys[1], "api2")
-                task2 = asyncio.create_task(delayed())
-        
-            # collect
-            ok, score, source = False, 0.0, "none"
-            while True:
-                pending = [t for t in (task1, task2) if t and not t.done()]
-                if not pending:
-                    break
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED, timeout=per_timeout_ms/1000.0 + 0.2)
-                for d in done:
-                    if d is task1:
-                        res1 = d.result()
-                        l, s, st, _ = res1
-                        if l and s >= early_score:
-                            ok, score, source = True, s, "api1-early"
-                            if task2 and not task2.done():
-                                task2.cancel()
-                            pending = []
-                            break
-                    elif d is task2:
-                        res2 = d.result()
-                        l, s, st, _ = res2
-                        if l and s >= early_score:
-                            ok, score, source = True, s, "api2-early"
-                            if task1 and not task1.done():
-                                task1.cancel()
-                            pending = []
-                            break
-                if not pending:
-                    break
-        
-            # ensure gather results
-            if task1 and not task1.done():
-                try: res1 = await task1
-                except: pass
-            if task2 and not task2.done():
-                try: res2 = await task2
-                except: pass
-        
-            # choose best
-            cand = []
-            if res1: cand.append(("api1", res1))
-            if res2: cand.append(("api2", res2))
-            for name, (l, s, st, r) in cand:
-                if l and s > score:
-                    ok, score, source = True, s, name
-            if not cand:
-                ok, score, source = False, 0.0, "no-response"
-
-    total = (time.monotonic() - t0) * 1000.0
-    verdict = "LP" if ok and score >= thr else "OTHER"
-    timeline["t_end"] = time.monotonic()
-    timeline["ms_total"] = round(total, 1)
-    timeline["verdict"] = verdict
-    timeline["ok"] = ok
-    timeline["score"] = round(float(score), 3)
-    timeline["source"] = source
-    return verdict, score, timeline
 
 def _print_burst(img_path: str):
     try:
@@ -535,39 +479,75 @@ def _print_burst(img_path: str):
 # -------------------------
 def main():
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--img", required=True)
-    ap.add_argument("--as-thread", type=int, required=True)
-    ap.add_argument("--parent", type=int, required=True)
+    ap.add_argument("--img", required=False)
+    ap.add_argument("--as-thread", required=False)
+    ap.add_argument("--parent", required=False)
     ap.add_argument("--print-logs", action="store_true")
     ap.add_argument("--real", action="store_true", help="Use REAL bridge classify instead of SIM")
     ap.add_argument("--burst", action="store_true", help="Run realtime Gemini BURST probe (API1/API2) with timing")
+    ap.add_argument("--dotenv", default=".env")
+    ap.add_argument("--runtime-json", default="nixe/config/runtime_env.json")
+    ap.add_argument("--e2e-online", action="store_true", help="E2E: post image, wait for embed, verify delete")
+    ap.add_argument("--e2e-img", help="Image path for E2E (fallback to --img)")
+    ap.add_argument("--e2e-target-id", help="Target channel/thread ID (auto from ENV/runtime)")
+    ap.add_argument("--e2e-status-thread-id", help="Status thread ID (auto from ENV/runtime or default)")
+    ap.add_argument("--e2e-ttl", type=int, default=45, help="Seconds to wait for embed & delete")
     args = ap.parse_args()
 
-    # --- E2E ONLINE mode ---
-    if getattr(args, "e2e_online", False):
-        if not args.e2e_img or not args.e2e_target_id:
-            raise SystemExit("--e2e-online requires --e2e-img and --e2e-target-id")
-        mid = _post_image_message(args.e2e_target_id, args.e2e_img)
-        print(f"[e2e] posted message id={mid}")
-        end = time.time() + int(args.e2e_ttl)
-        seen = None; deleted = False
+    # --- E2E ONLINE (non-destructive) ---
+    if getattr(args, 'e2e_online', False):
+        info = _read_env_hybrid()
+        img = args.e2e_img or args.img
+        if not img:
+            raise SystemExit('--e2e-online requires --e2e-img or --img')
+        img = _normalize_image_path(img)
+        # Resolve target: CLI > ENV E2E_TARGET_ID > runtime guard lists
+        tgt = (args.e2e_target_id or os.getenv('E2E_TARGET_ID') or None)
+        if not tgt:
+            gids = []
+            try:
+                gids = _parse_ids(os.getenv('LPG_GUARD_CHANNELS') or os.getenv('LUCKYPULL_GUARD_CHANNELS') or '')
+            except Exception:
+                pass
+            tgt = str(gids[0]) if gids else None
+        if not tgt:
+            raise SystemExit('Cannot resolve target id; pass --e2e-target-id or set in runtime_env.json')
+        # Resolve status thread: CLI > ENV > default
+        stid = (args.e2e_status_thread_id or os.getenv('LPG_STATUS_THREAD_ID') or '1435924665615908965')
+        mid = _e2e_post_image(str(tgt), img)
+        print(f'[e2e] posted message id={mid}')
+        end = time.time() + int(args.e2e_ttl or 45)
+        seen = False; deleted = False
+        start_ts = time.time()
         while time.time() < end:
-            msgs = _list_messages(args.e2e_status_thread_id, limit=50)
-            emb = _find_embed_with_mid(msgs, title="Lucky Pull Classification", mid=mid)
-            if emb and not seen:
-                seen = emb
-                print("[e2e] embed detected on status thread")
-            ok, _ = _get_message(args.e2e_target_id, mid)
-            deleted = not ok
+            msgs = _e2e_list_messages(str(stid), limit=50)
+            if _e2e_find_embed_with_mid(msgs, 'Lucky Pull Classification', mid):
+                if not seen:
+                    print('[e2e] embed detected on status thread')
+                seen = True
+            deleted = not _e2e_get_message(str(tgt), mid)
+            elapsed = int(time.time() - start_ts)
+            print(f'[e2e] poll t={elapsed}s seen={seen} deleted={deleted}')
             if seen and deleted:
                 break
-            time.sleep(2)
+            time.sleep(2.0)
         if not seen:
-            raise SystemExit("E2E FAIL: classification embed not found")
+            raise SystemExit('E2E FAIL: classification embed not found')
         if not deleted:
-            print("[e2e] WARN: message not deleted within TTL")
-        print("[e2e] OK")
-        raise SystemExit(0)
+            print('[e2e] WARN: message not deleted within TTL', file=sys.stderr)
+        print('[e2e] OK')
+        return
+
+
+    # Legacy-mode validation: require classic args only if not running --e2e-online
+    if not getattr(args, "e2e_online", False):
+        missing = []
+        if not getattr(args, "img", None): missing.append("--img")
+        if not getattr(args, "as_thread", None): missing.append("--as-thread")
+        if not getattr(args, "parent", None): missing.append("--parent")
+        if missing:
+            raise SystemExit("Missing required arguments for legacy mode: " + ", ".join(missing))
+
     info = _read_env_hybrid()
     _print_env(info); _print_guard_wiring(); _print_thread_check(args.as_thread, args.parent); _print_policy(); _print_persona()
     _print_classify(args.img, use_real=args.real)

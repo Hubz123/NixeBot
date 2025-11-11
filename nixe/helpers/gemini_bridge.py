@@ -55,7 +55,7 @@ except Exception:
 # config from env (hybrid loader should have applied runtime_env.json already)
 GEMINI_MODEL = _cfg("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_KEY_A = os.getenv("GEMINI_API_KEY")
-GEMINI_KEY_B = os.getenv("GEMINI_API_KEY_B")
+GEMINI_KEY_B = os.getenv("GEMINI_API_KEY_B") or os.getenv("GEMINI_BACKUP_API_KEY")
 FORCE_BURST = _cfg("LPG_BRIDGE_FORCE_BURST", "1") == "1"
 ALLOW_QUICK = _cfg("LPG_BRIDGE_ALLOW_QUICK_FALLBACK", "0") == "1"
 PARALLEL = _cfg("LPG_PROVIDER_PARALLEL", "1") == "1"
@@ -76,6 +76,33 @@ async def _call_gemini_key(image_bytes: bytes, key: str) -> T.Tuple[dict|None, s
         return None, "no_key"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={key}"
     b64 = base64.b64encode(image_bytes).decode("ascii")
+    # Build instruction dynamically from runtime NEG tokens
+    neg_words = _RUNTIME.get("LPG_NEGATIVE_TEXT", [])
+    try:
+        neg_line = ", ".join([str(x).lower() for x in neg_words if isinstance(x, (str,int,float))])
+    except Exception:
+        neg_line = ""
+    instr = (
+        "You are a strict detector for gacha 'lucky pull' screenshots. "
+        "Return a single JSON object with fields: lucky (true/false), score (0..1), reason (string). "
+        "Be conservative: only lucky=true when the results screen is clear. "
+        + ("Treat any image containing these UI phrases as NOT a result screen: " + neg_line + ". " if neg_line else "")
+        + "If NOT a result screen set lucky=false, score=0.0, reason='not_result_screen'."
+    )
+
+    neg_words = _RUNTIME.get("LPG_NEGATIVE_TEXT", [])
+    try:
+        neg_line = ", ".join([str(x).lower() for x in neg_words])
+    except Exception:
+        neg_line = ""
+    instr = (
+        "You are a strict detector for gacha 'lucky pull' screenshots. "
+        "Return a single JSON object with fields: lucky (true/false), score (0..1), reason (string). "
+        "Be conservative: only lucky=true when the results screen is clear. "
+        + ("Treat any image containing these UI phrases as NOT a result screen: " + neg_line + ". " if neg_line else "")
+        + "If NOT a result screen set lucky=false, score=0.0, reason='not_result_screen'."
+    )
+
     payload = {
         "contents": [{
             "parts": [
@@ -108,6 +135,12 @@ async def _call_gemini_key(image_bytes: bytes, key: str) -> T.Tuple[dict|None, s
                     obj = json.loads(body)
                 except Exception:
                     return None, "parse_failed"
+                neg = [str(x).lower() for x in _RUNTIME.get("LPG_NEGATIVE_TEXT", []) if isinstance(x, str)]
+                t = (txt or "").lower()
+                if any((w and (w in t)) for w in neg):
+                    obj['lucky'] = False
+                    obj['score'] = 0.0
+                    obj['reason'] = 'neg_gate'
                 return {"lucky": bool(obj.get("lucky", False)),
                         "score": float(obj.get("score", 0.0)),
                         "reason": str(obj.get("reason", "") or "n/a"),
@@ -178,7 +211,7 @@ async def classify_lucky_pull_bytes(image_bytes: bytes) -> T.Tuple[bool, float, 
     provider_res, provider_err = await _try_parallel_provider(image_bytes)
     if provider_res is not None:
         score = _norm_prob(provider_res.get("score", 0.0))
-        ok = bool(score >= THR)
+        ok = bool(provider_res.get('lucky', False) and (score >= THR))
         tag = provider_res.get("provider_tag", "primary")
         via = f"gemini:{tag}"
         return ok, score, via, provider_res.get("reason", "n/a")
@@ -190,7 +223,7 @@ async def classify_lucky_pull_bytes(image_bytes: bytes) -> T.Tuple[bool, float, 
             res, err = await _call_gemini_key(image_bytes, key)
             if res:
                 score = _norm_prob(res.get("score", 0.0))
-                ok = bool(score >= THR)
+                ok = bool(provider_res.get('lucky', False) and (score >= THR))
                 tag = "primary" if key == GEMINI_KEY_A else "backup"
                 via = f"gemini:{tag}"
                 return ok, score, via, res.get("reason", "n/a")

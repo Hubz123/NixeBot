@@ -265,8 +265,10 @@ class LPGThreadBridgeGuard(commands.Cog):
                     break
         except Exception:
             raw_bytes = None
-        message.__dict__["_nixe_imgbytes"] = raw_bytes
-        message.__dict__["_nixe_phash"] = _phash64_bytes(raw_bytes) if raw_bytes else None
+        d = getattr(message, "__dict__", None)
+        if isinstance(d, dict):
+            d["_nixe_imgbytes"] = raw_bytes
+            d["_nixe_phash"] = _phash64_bytes(raw_bytes) if raw_bytes else None
 
 
 # Require classification by default
@@ -277,7 +279,8 @@ class LPGThreadBridgeGuard(commands.Cog):
             provider_hint = (provider or "").lower()
         # Post classification result to status thread (always)
         try:
-            ph = message.__dict__.get("_nixe_phash")
+            ph = getattr(message, "__dict__", {}) if isinstance(getattr(message, "__dict__", None), dict) else {}
+            ph = ph.get("_nixe_phash") if isinstance(ph, dict) else None
             ph_str = (hex(int(ph))[2:].upper() if isinstance(ph, int) else "-")
             fields = [
                 ("Result", "✅ LUCKY" if lucky else "❌ NOT LUCKY", True),

@@ -3,17 +3,6 @@ import os, sys, io, json, time, argparse, base64, hashlib, math, mimetypes, requ
 from pathlib import Path
 
 # ---------- util: env hybrid ----------
-def _is_secret_key(name: str) -> bool:
-    name = (name or '').upper().strip()
-    # allow *_API_KEY, *_API_KEY_* (e.g., _API_KEY_B), *_BACKUP_API_KEY, *_TOKEN, *_SECRET
-    return (
-        name.endswith('_API_KEY') or
-        name or
-        name or
-        name.endswith('_BACKUP_API_KEY') or
-        ('_API_KEY_' in name)  # e.g. GEMINI_API_KEY_B
-    )
-
 def _read_env_hybrid(dotenv_path: str, runtime_json_path: str) -> dict:
     info = {
         "runtime_env_json_path": str(runtime_json_path),
@@ -137,19 +126,19 @@ GEMINI_HOST = "https://generativelanguage.googleapis.com/v1beta"
 
 def _build_prompt(neg_words: list) -> str:
     neg_txt = ", ".join(sorted(set(neg_words))) if neg_words else ""
-    lines = [
-        "Task: Decide if an image is a **gacha PULL RESULT screen** and if it is **lucky**.",
-        "- 'Pull result screen' examples: a 10/11-pull grid with cards/tiles, 'NEW' badges, rarity stars near each card.",
-        "- NOT result screens: loadout/deck/build/inventory/save-data, equipment lists, shop, mail, settings.",
-    ]
+    p = (
+        "Task: Decide if an image is a gacha PULL RESULT screen and if it is lucky.\n"
+        "- Result screen examples: 10- or 11-pull grid of cards or characters, results/recruit/rescue banners, NEW badges, rarity stars near each card.\n"
+        "- NOT result screens: loadout/deck/build/inventory/save-data, equipment lists, shop, mail, settings, profile, status screen, stat page.\n"
+    )
     if neg_txt:
-        lines.append("- Treat any image containing these UI phrases as NOT a result screen: " + neg_txt + ".")
-    lines.extend([
-        "- If NOT a result screen -> ok=false, score=0.0, reason='not_result_screen'.",
-        "- If a result screen: lucky=true only if at least one top-tier/new reward (gold/orange banner, SSR/UR/Legendary, rainbow effect).",
-        "Return ONLY compact JSON: {"is_result_screen": <true|false>, "ok": <true|false>, "score": <0..1>, "reason": "..."}. No prose.",
-    ])
-    return "\n".join(lines) + "\n"
+        p += f"- Treat any image containing these UI phrases as NOT a result screen: {neg_txt}.\n"
+    p += (
+        "Output strictly in JSON. Do not add prose or formatting.\n"
+        "Return exactly one JSON object with keys: is_result_screen (bool), ok (bool), score (float between 0 and 1), reason (short string).\n"
+        'Example: {"is_result_screen": true, "ok": true, "score": 0.92, "reason": "10-pull with rainbow card"}\n'
+    )
+    return p
 
 
 def _gemini_request(model: str, api_key: str, image_bytes: bytes, prompt: str, timeout_s: float = 10.0) -> dict:
@@ -290,7 +279,6 @@ def main():
     print("\n=== GEMINI CLASSIFY ===")
     t0 = time.time()
     ok, score, provider, reason, is_result = classify_lucky(b, threshold=th)
-    ok = bool(is_result and (score >= th))  # enforce runtime threshold
     dur = (time.time() - t0)*1000.0
     print(f"[RESULT] ok={ok} score={score:.3f} provider={provider} reason={reason} is_result={is_result} dur_ms={dur:.1f}")
 

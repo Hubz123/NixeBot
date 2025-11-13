@@ -9,6 +9,8 @@ smoke_guard_lpg_allinone.py (v4-realtime-burst)
 - Read-only against runtime_env.json (.env only for tokens)
 """
 from __future__ import annotations
+import json
+import os
 import os, sys, json, argparse, hashlib, asyncio, textwrap, types, importlib.util, re, random, time, base64, base64
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -112,6 +114,61 @@ def _parse_ids(val: str) -> list[int]:
 
 def _fmt_ids(nums):
     return "[" + ",".join(str(n) for n in nums) + "]"
+
+
+def _parse_ids_any(val: str) -> list[int]:
+    """Parse CSV / JSON-array / bracketed strings into a list of ints."""
+    out: list[int] = []
+    s = (val or "").strip()
+    if not s:
+        return out
+    if s.startswith("[") and s.endswith("]"):
+        try:
+            arr = json.loads(s)
+            for x in arr:
+                try:
+                    out.append(int(str(x).strip()))
+                except Exception:
+                    pass
+            return out
+        except Exception:
+            pass
+    for tok in re.findall(r"\d+", s):
+        try:
+            out.append(int(tok))
+        except Exception:
+            pass
+    return out
+
+
+
+
+def _get_guard_ids(key: str) -> list[int]:
+    """Resolve guard IDs: ENV first; then nixe/config/runtime_env.json. Accepts list/CSV/brackets."""
+    val = os.getenv(key, "")
+    ids = _parse_ids_any(val)
+    if ids:
+        return ids
+    try:
+        rpath = os.path.join(os.getcwd(), "nixe", "config", "runtime_env.json")
+        if os.path.exists(rpath):
+            data = json.load(open(rpath, "r", encoding="utf-8"))
+            raw = data.get(key)
+            if isinstance(raw, list):
+                out = []
+                for x in raw:
+                    try:
+                        out.append(int(str(x).strip()))
+                    except Exception:
+                        pass
+                return out
+            if raw is not None:
+                return _parse_ids_any(str(raw))
+    except Exception:
+        pass
+    return []
+
+
 
 def _read_env_hybrid():
     base = os.getcwd()
@@ -550,10 +607,37 @@ def main():
 
     info = _read_env_hybrid()
     _print_env(info); _print_guard_wiring(); _print_thread_check(args.as_thread, args.parent); _print_policy(); _print_persona()
-    _print_classify(args.img, use_real=args.real)
+    _print_classify(args.img, use_real=(args.real or args.burst or (os.getenv('LPG_BURST','0')=='1')))
     if args.burst:
         _print_burst(args.img)
     print("=== SUMMARY ==="); print("result=OK (wiring looks good)")
 
 if __name__ == "__main__":
     main()
+
+def _read_runtime_json_cached():
+    import os, json
+    if hasattr(_read_runtime_json_cached, '_cache'):
+        return getattr(_read_runtime_json_cached, '_cache')
+    path = os.getenv('NIXE_RUNTIME_ENV_PATH') or os.path.join(os.getcwd(), 'nixe','config','runtime_env.json')
+    data = {}
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+    except Exception:
+        data = {}
+    setattr(_read_runtime_json_cached, '_cache', data)
+    return data
+
+def _coerce_list(val):
+    import re
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        s = val.strip().strip('[]')
+        parts = [t.strip().strip('"\'') for t in s.split(',') if t.strip()]
+        if not parts:
+            parts = re.findall(r"[\w\-\+ ]+", s)
+        return [p for p in parts if p]
+    return []

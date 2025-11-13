@@ -76,10 +76,65 @@ def _keys() -> List[str]:
 
 
 def _negative_phrases() -> List[str]:
-    return [
-        "save data", "save-data", "card count", "obtained equipment",
-        "manifest ego", "partners", "memory fragments", "potential"
+    """
+    Resolve negative (non-result) cues for Lucky Pull classification.
+
+    Priority:
+      1) LPG_NEGATIVE_TEXT from environment (populated via runtime_env.json).
+         - Accepts Python-list-like, JSON list, or comma-separated string.
+      2) Built-in defaults as safety net.
+
+    All values are normalized to lower case and de-duplicated.
+    """
+    raw = os.getenv("LPG_NEGATIVE_TEXT", "").strip()
+    words: List[str] = []
+    if raw:
+        try:
+            import ast as _ast
+            val = _ast.literal_eval(raw)
+            if isinstance(val, (list, tuple)):
+                words = [str(x).strip().lower() for x in val if str(x).strip()]
+            else:
+                words = [w.strip().lower() for w in str(val).split(",") if w.strip()]
+        except Exception:
+            words = [w.strip().lower() for w in raw.split(",") if w.strip()]
+
+    defaults = [
+        # Save/load & meta UI
+        "save data", "save date", "card count", "save slot", "save record",
+        "obtained equipment",
+        # Loadout / deck / inventory / presets
+        "loadout", "edit loadout", "loadout edit",
+        "deck", "card deck", "skill deck", "main discs", "disc skills",
+        "inventory", "equipment", "equipment list", "gear",
+        "artifact", "relic", "emblem", "emblem info", "reforge",
+        "build", "build guide", "preset", "ui preset",
+        # Navigation / stage / quest UI
+        "stage select", "quest", "mission",
+        # Character / status / profile / detail
+        "profile", "stats", "status screen", "stat page",
+        "card skills", "details", "detail",
+        # Special game systems
+        "potentials", "potential", "memory fragments", "manifest ego",
+        "epiphany",
+        # Generic popup / info panels
+        "emblem info", "select to close", "equip", "equipment info",
+        # Web / planner / sheet style (external build charts)
+        "spreadsheet", "sheet", "planner", "build table",
     ]
+    # append defaults after config to preserve user priority but ensure we always have a floor
+    for d in defaults:
+        words.append(d)
+
+    seen = set()
+    uniq: List[str] = []
+    for w in words:
+        w = str(w).strip().lower()
+        if not w or w in seen:
+            continue
+        seen.add(w)
+        uniq.append(w)
+    return uniq
 
 def _sha1(b: bytes) -> str:
     return hashlib.sha1(b).hexdigest()
@@ -186,23 +241,75 @@ def _maybe_transcode(image_bytes: bytes) -> tuple[bytes, str]:
         return image_bytes, "image/png"
 
 def _build_payload(image_bytes: bytes) -> dict:
+    """
+    Build Gemini prompt + payload for Lucky Pull detection.
+
+    We ask the model for a richer schema (screen_type, slot_count, etc.)
+    so that the client can enforce strict multi-result semantics and avoid
+    deleting non-gacha UI like loadouts, Epiphany, save data, or build sheets.
+    """
     image_bytes, mime = _maybe_transcode(image_bytes)
     b64 = base64.b64encode(image_bytes).decode("ascii")
+    neg_words = _negative_phrases()
+    if neg_words:
+        # keep prompt readable; use a compact subset
+        max_words = 18
+        sample = neg_words[:max_words]
+        neg_txt = ", ".join(sample)
+    else:
+        neg_txt = "save data, card deck, inventory, loadout, profile, status screen"
+
     sys_prompt = (
-        "Classify STRICTLY whether this image is a gacha 'lucky pull' RESULT screen. "
-        "Respond ONLY JSON: {\"lucky\": <bool>, \"score\": <0..1>, \"reason\": <short>, \"flags\": <string[]>}. "
-        "Bias toward FALSE if it's inventory/loadout/profile/status. "
-        "Positive cues: 10-pull grid, NEW!!, rainbow beam, multiple result slots. "
-        "Negative cues: 'Save data', 'Card Count', 'Obtained Equipment', 'Manifest Ego', partners, memory fragments."
+        "You are a game UI analyst.\n"
+        "Classify STRICTLY whether this screenshot is a gacha PULL RESULT screen.\n\n"
+        "You must output a single compact JSON object with these keys: "
+        "{"
+        "\"lucky\": <bool>, "
+        "\"score\": <0..1>, "
+        "\"reason\": <short string>, "
+        "\"flags\": <string[]>, "
+        "\"screen_type\": <string>, "
+        "\"slot_count\": <int>, "
+        "\"is_multi_result_screen\": <bool>"
+        "}."
+        "\n\n"
+        "Definitions:\n"
+        "- result_multi_pull: a gacha result screen showing many results at once "
+        "(typically 8-12, often 10 or 11). Cards or characters are laid out as vertical "
+        "banners or a grid, usually with rarity colors, NEW tags, etc.\n"
+        "- single_pull: a result screen showing only one result.\n"
+        "- save_data, loadout, deck, inventory, potentials, disc skills, card_detail, "
+        "upgrade, epiphany, emblem info, build sheets, or web planners are NOT result screens.\n"
+        "Any screen showing only 1-4 cards in the middle (such as Epiphany/card choice/upgrade) "
+        "is NOT a pull result.\n"
+        "Any screen showing Save data, Card Count, Manifest Ego, Memory Fragments, equipment or "
+        "artifact grids, character details, stat pages, emblem info, or reforging UI is NOT a pull result.\n"
+        "Any external website, spreadsheet, or build table (for example skill charts or planners) "
+        "is NOT a pull result.\n\n"
+        "Rules:\n"
+        "- If the image is not a multi-result gacha pull result screen (10-pull style or similar), "
+        "set lucky=false, is_multi_result_screen=false, slot_count to the estimated number of cards, "
+        "and screen_type to an appropriate non-result label (e.g. 'epiphany', 'save_data', 'deck', "
+        "'upgrade', 'potentials', 'disc_skills', 'build_sheet').\n"
+        "- Only if the image clearly shows a multi-result gacha result (>=8 result slots at once) may you set "
+        "lucky=true. In that case you MUST set screen_type='result_multi_pull', "
+        "is_multi_result_screen=true, and slot_count>=8.\n"
+        "- If you are unsure, treat it as NOT a result screen (lucky=false).\n"
+        f"- Negative UI phrases that strongly indicate NOT a result screen: {neg_txt}.\n"
+        "Return ONLY the JSON object. No prose, no markdown."
     )
+
     return {
         "contents": [
-            {"role": "user", "parts": [
-                {"text": sys_prompt},
-                {"inline_data": {"mime_type": mime, "data": b64}}
-            ]}
+            {
+                "role": "user",
+                "parts": [
+                    {"text": sys_prompt},
+                    {"inline_data": {"mime_type": mime, "data": b64}},
+                ],
+            }
         ],
-        "generationConfig": {"temperature": 0.0, "topP": 0.1}
+        "generationConfig": {"temperature": 0.0, "topP": 0.1},
     }
 
 def _parse_json(text: str):
@@ -227,6 +334,59 @@ def _parse_json(text: str):
     if not isinstance(flags, list):
         flags = []
     flags = [str(x).lower() for x in flags]
+
+    # Optional richer schema from the model to allow stricter gating.
+    screen_type = str(j.get("screen_type", "") or "").strip().lower()
+    slot_count_raw = j.get("slot_count", None)
+    try:
+        slot_count = int(slot_count_raw)
+    except Exception:
+        slot_count = None
+    multi_raw = j.get("is_multi_result_screen", None)
+    is_multi = None
+    if isinstance(multi_raw, bool):
+        is_multi = multi_raw
+    elif isinstance(multi_raw, (int, float)):
+        is_multi = bool(multi_raw)
+    elif isinstance(multi_raw, str):
+        v = multi_raw.strip().lower()
+        if v in ("true", "yes", "y", "1"):
+            is_multi = True
+        elif v in ("false", "no", "n", "0"):
+            is_multi = False
+
+    # Heuristic gating: if the model says the UI is clearly non-result, or that
+    # there are only a few cards, force lucky=False regardless of the raw flag.
+    non_result_keys = (
+        "save", "save_data", "loadout", "deck", "inventory", "profile",
+        "status", "stat", "detail", "card_detail", "epiphany", "upgrade",
+        "manifest", "memory", "equipment", "artifact", "relic",
+        "potential", "potentials", "disc", "disc_skill",
+        "emblem", "reforge", "build", "sheet", "planner",
+        "guide", "record",
+    )
+    if screen_type:
+        st = screen_type
+        if any(k in st for k in non_result_keys):
+            lucky = False
+            score = min(score, 0.5)
+
+    # Require a reasonably large multi-result screen for lucky=True.
+    if slot_count is not None and slot_count < 7:
+        lucky = False
+        score = min(score, 0.5)
+    if is_multi is False:
+        lucky = False
+        score = min(score, 0.5)
+    if lucky:
+        if screen_type and screen_type not in (
+            "result_multi_pull",
+            "multi_result",
+            "gacha_result_multi",
+        ):
+            lucky = False
+            score = min(score, 0.5)
+
     return lucky, max(0.0, min(1.0, score)), reason, flags
 
 async def _call_one(session, model: str, key: str, image_bytes: bytes, timeout_s: float):
@@ -433,4 +593,3 @@ async def _do_sequential_deadline(session, model, keys, image_bytes, per_timeout
         if (lucky2 and score2 >= score) or not lucky:
             return lucky2, score2, tag, f"fallback({st2})"
     return lucky, score, st, reason
-

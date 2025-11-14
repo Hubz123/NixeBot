@@ -295,17 +295,17 @@ class LPGThreadBridgeGuard(commands.Cog):
         except Exception:
             pass
 
-            # Assume-lucky on fallback timeouts if explicitly enabled
-            if not lucky:
-                try:
-                    assume = (os.getenv("LPG_ASSUME_LUCKY_ON_FALLBACK","0") == "1")
-                    if assume and isinstance(reason, str) and ("lastchance(" in reason or "shield_fallback(" in reason):
-                        log.warning("[lpg-thread-bridge] assume_lucky_fallback active → forcing redirect (reason=%s)", reason)
-                        lucky = True
-                    else:
-                        return
-                except Exception:
+        # Assume-lucky on fallback timeouts if explicitly enabled
+        if not lucky:
+            try:
+                assume = (os.getenv("LPG_ASSUME_LUCKY_ON_FALLBACK","0") == "1")
+                if assume and isinstance(reason, str) and ("lastchance(" in reason or "shield_fallback(" in reason):
+                    log.warning("[lpg-thread-bridge] assume_lucky_fallback active → forcing redirect (reason=%s)", reason)
+                    lucky = True
+                else:
                     return
+            except Exception:
+                return
         log.info("[lpg-thread-bridge] STRICT_ON_GUARD delete | ch=%s parent=%s type=%s", cid, pid, type(ch).__name__ if ch else None)
         await self._delete_redirect_persona(message, lucky, score, provider, reason, provider_hint=provider_hint)
 

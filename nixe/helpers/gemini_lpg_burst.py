@@ -490,7 +490,7 @@ async def _do_parallel(session, model, keys, image_bytes, per_timeout, early_sco
     try:
         for coro in asyncio.as_completed(tasks, timeout=per_timeout + 0.1):
             lucky, score, st, reason, flags = await coro
-            if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
+            if st == "ok" and any(w in " ".join(flags + [reason]).lower() for w in neg_words):
                 lucky = False
                 score = min(score, 0.50)
                 reason = f"{reason}|neg_cue"
@@ -521,7 +521,7 @@ async def _do_stagger(session, model, keys, image_bytes, per_timeout, early_scor
     async def _evaluate(res):
         nonlocal best
         lucky, score, st, reason, flags = res
-        if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
+        if st == "ok" and any(w in " ".join(flags + [reason]).lower() for w in neg_words):
             lucky = False
             score = min(score, 0.50)
             reason = f"{reason}|neg_cue"
@@ -599,7 +599,7 @@ async def _do_sequential(session, model, keys, image_bytes, per_timeout, early_s
 
     # first key
     lucky, score, st, reason, flags = await _call_one(session, model, keys[0], image_bytes, per_timeout1)
-    if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
+    if st == "ok" and any(w in " ".join(flags + [reason]).lower() for w in neg_words):
         lucky = False
         score = min(score, 0.50)
         reason = f"{reason}|neg_cue"
@@ -610,7 +610,7 @@ async def _do_sequential(session, model, keys, image_bytes, per_timeout, early_s
     need_fallback = (st in ("soft_timeout", "error")) or ("status=429" in reason)
     if len(keys) >= 2 and need_fallback:
         lucky2, score2, st2, reason2, flags2 = await _call_one(session, model, keys[1], image_bytes, per_timeout)
-        if any(w in " ".join(flags2 + [reason2]).lower() for w in neg_words):
+        if st2 == "ok" and any(w in " ".join(flags2 + [reason2]).lower() for w in neg_words):
             lucky2 = False
             score2 = min(score2, 0.50)
             reason2 = f"{reason2}|neg_cue"

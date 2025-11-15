@@ -1,107 +1,143 @@
-
 # -*- coding: utf-8 -*-
 """
-nixe.helpers.gemini_lpg_burst  (v2: stagger + inflight dedup)
-----------------------------------------------------------------
+nixe.helpers.gemini_lpg_burst  (v3: burst + stagger + sequential)
+-----------------------------------------------------------------
 Dual-Gemini classifier for Lucky Pull with strict time budget and
-rate-limit friendly features.
+rate-limit friendly features, plus optional inflight de-duplication
+and simple image transcoding.
 
 Returns: (ok: bool, score: float, via: str, reason: str)
 
-New env (optional):
-- LPG_BURST_MODE: "stagger" | "parallel"   (default: "stagger")
-- LPG_BURST_STAGGER_MS: delay before firing 2nd key (default: 300)\n- LPG_FALLBACK_MARGIN_MS: sequential fallback margin (default: 1200)\n- LPG_BURST_MODE: 'sequential' | 'stagger' | 'parallel' (default: 'sequential' for Render Free)
-- LPG_BURST_DEDUP: "1" to de-dup concurrent identical images (default: "1")
-Existing env:
-- GEMINI_MODEL (default: "gemini-2.5-flash-lite")
-- GEMINI_API_KEYS or GEMINI_API_KEY + GEMINI_API_KEY_2
-- LPG_BURST_TIMEOUT_MS (per-key, default: 1400)
-- LPG_BURST_EARLY_EXIT_SCORE (default: 0.90)
-- LPG_BURST_TAG (default: "gemini:burst-2keys")
+Env (supported):
+- GEMINI_MODEL              : vision model name (default: "gemini-2.5-flash-lite")
+- GEMINI_API_KEYS           : CSV of API keys (preferred)
+- GEMINI_API_KEY            : primary key (legacy)
+- GEMINI_API_KEY_B / ...    : backup keys (legacy)
+- GEMINI_PER_TIMEOUT_MS     : default per-request timeout if LPG_BURST_TIMEOUT_MS unset
+
+- LPG_BURST_MODE            : "stagger" | "parallel" | "sequential" (default: "stagger")
+- LPG_BURST_STAGGER_MS      : delay before firing 2nd key in stagger mode (default: 300)
+- LPG_BURST_TIMEOUT_MS      : per-provider timeout in ms (default: GEMINI_PER_TIMEOUT_MS or 6000)
+- LPG_BURST_EARLY_EXIT_SCORE: score threshold for early exit (default: 0.90)
+- LPG_BURST_DEDUP           : "1" to enable inflight de-dup (default: "1")
+- LPG_BURST_TAG             : custom tag for "via" result (default: "gemini:{model}")
+- LPG_FALLBACK_MARGIN_MS    : margin for sequential mode (soft; default: 1200)
+
+- LPG_NEGATIVE_TEXT         : optional list/CSV of negative phrases that indicate non-result screens
+- LPG_FORCE_IPV4            : "1" to prefer IPv4 TCP connector for aiohttp (default: "1")
+- LPG_IMG_TRANSCODE         : "1" to enable JPEG transcode/downscale (default: "1")
+- LPG_IMG_MAX_SIDE          : max image side when transcoding (default: 1600)
+- LPG_IMG_JPEG_QUALITY      : JPEG quality when transcoding (default: 88)
 """
 
 from __future__ import annotations
+
 import os
 import atexit
 import io
 import asyncio
-
 import base64
 import json
 import logging
 import hashlib
-from typing import Tuple, Optional, List
+import socket
+from typing import List, Tuple, Optional
 
 try:
-    import aiohttp
-except Exception:
+    import aiohttp  # type: ignore
+except Exception:  # pragma: no cover
     aiohttp = None
 
-log = logging.getLogger(__name__)
+try:
+    from PIL import Image  # type: ignore
+    import numpy as np  # type: ignore
+except Exception:  # pragma: no cover
+    Image = None
+    np = None
 
-# -------- util/env --------
-def _env(k: str, d: str = "") -> str:
-    v = os.getenv(k)
-    return str(v) if v is not None else d
+log = logging.getLogger("nixe.helpers.gemini_lpg_burst")
 
-def _env_f(k: str, d: float) -> float:
+
+# ---------------------------------------------------------------------------
+# env helpers
+# ---------------------------------------------------------------------------
+
+def _env(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    return str(v) if v is not None else default
+
+
+def _env_f(key: str, default: float) -> float:
     try:
-        return float(_env(k, str(d)))
+        return float(_env(key, str(default)))
     except Exception:
-        return d
+        return default
 
 
 def _keys() -> List[str]:
-    # Merge from CSV + individual envs (order-preserving de-dup)
-    raw = _env("GEMINI_API_KEYS", "")
-    candidates: List[str] = []
-    if raw.strip():
-        candidates.extend([p.strip() for p in raw.replace(";", ",").split(",") if p.strip()])
-    for k in [
-        _env("GEMINI_API_KEY",""),
-        _env("GEMINI_API_KEY_B",""),
-        _env("GEMINI_API_KEYB",""),
-        _env("GEMINI_API_KEY_2",""),
-        _env("GEMINI_API_KEY2",""),
-        _env("GEMINI_BACKUP_API_KEY",""),
+    """Collect Gemini keys from various envs; order-preserving de-dup."""
+    keys: List[str] = []
+    raw = _env("GEMINI_API_KEYS", "").strip()
+    if raw:
+        for part in raw.replace(";", ",").split(","):
+            k = part.strip()
+            if k and k not in keys:
+                keys.append(k)
+    for name in [
+        "GEMINI_API_KEY",
+        "GEMINI_API_KEY_B",
+        "GEMINI_API_KEYB",
+        "GEMINI_API_KEY_2",
+        "GEMINI_API_KEY2",
+        "GEMINI_BACKUP_API_KEY",
     ]:
-        if k:
-            candidates.append(k)
-    seen, out = set(), []
-    for k in candidates:
-        if k not in seen:
-            seen.add(k); out.append(k)
-    return out
+        v = _env(name, "").strip()
+        if v and v not in keys:
+            keys.append(v)
+    return keys
 
 
+# ---------------------------------------------------------------------------
+# negative phrases / gating
+# ---------------------------------------------------------------------------
 
 def _negative_phrases() -> List[str]:
     """
     Resolve negative (non-result) cues for Lucky Pull classification.
 
     Priority:
-      1) LPG_NEGATIVE_TEXT from environment (populated via runtime_env.json).
-         - Accepts Python-list-like, JSON list, or comma-separated string.
+      1) LPG_NEGATIVE_TEXT from environment (runtime_env.json).
+         Accepts Python literal list, JSON array, or CSV.
       2) Built-in defaults as safety net.
 
     All values are normalized to lower case and de-duplicated.
     """
-    raw = os.getenv("LPG_NEGATIVE_TEXT", "").strip()
+    raw = os.getenv("LPG_NEGATIVE_TEXT", "") or ""
+    raw = raw.strip()
     words: List[str] = []
     if raw:
         try:
-            import ast as _ast
-            val = _ast.literal_eval(raw)
+            import ast
+            val = ast.literal_eval(raw)
             if isinstance(val, (list, tuple)):
-                words = [str(x).strip().lower() for x in val if str(x).strip()]
+                for x in val:
+                    s = str(x).strip().lower()
+                    if s:
+                        words.append(s)
             else:
-                words = [w.strip().lower() for w in str(val).split(",") if w.strip()]
+                for part in str(val).split(","):
+                    s = part.strip().lower()
+                    if s:
+                        words.append(s)
         except Exception:
-            words = [w.strip().lower() for w in raw.split(",") if w.strip()]
+            for part in raw.split(","):
+                s = part.strip().lower()
+                if s:
+                    words.append(s)
 
     defaults = [
         # Save/load & meta UI
-        "save data", "save date", "card count", "save slot", "save record",
+        "save data", "save_date", "card count", "save slot", "save record",
         "obtained equipment",
         # Loadout / deck / inventory / presets
         "loadout", "edit loadout", "loadout edit",
@@ -118,16 +154,15 @@ def _negative_phrases() -> List[str]:
         "potentials", "potential", "memory fragments", "manifest ego",
         "epiphany",
         # Generic popup / info panels
-        "emblem info", "select to close", "equip", "equipment info",
+        "select to close", "equip", "equipment info",
         # Web / planner / sheet style (external build charts)
         "spreadsheet", "sheet", "planner", "build table",
     ]
-    # append defaults after config to preserve user priority but ensure we always have a floor
     for d in defaults:
         words.append(d)
 
-    seen = set()
     uniq: List[str] = []
+    seen = set()
     for w in words:
         w = str(w).strip().lower()
         if not w or w in seen:
@@ -136,118 +171,68 @@ def _negative_phrases() -> List[str]:
         uniq.append(w)
     return uniq
 
-def _sha1(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()
 
-# inflight dedup for identical bytes (optional)
-_INFLIGHT: dict[str, asyncio.Future] = {}
+# ---------------------------------------------------------------------------
+# image helpers
+# ---------------------------------------------------------------------------
+
+def _detect_mime(image_bytes: bytes) -> str:
+    if image_bytes.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG"):
+        return "image/png"
+    return "image/png"
 
 
-# -------- http session helpers --------
-_SESSION = None
-
-
-def _close_session_sync():
-    global _SESSION
+def _phash64(image_bytes: bytes) -> Optional[int]:
+    """Simple pHash for inflight de-dup; returns 64-bit int or None."""
+    if Image is None or np is None:
+        return None
     try:
-        s = _SESSION
-        _SESSION = None
-        if s is not None and not getattr(s, 'closed', True):
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.create_task(s.close())
-                else:
-                    loop.run_until_complete(s.close())
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-atexit.register(_close_session_sync)
-def _make_connector():
-    try:
-        import socket, aiohttp
-        force_ipv4 = _env("LPG_FORCE_IPV4","1") == "1"
-        args = dict(limit=8, ttl_dns_cache=300)
-        if force_ipv4:
-            args["family"] = getattr(socket, "AF_INET", 2)
-        return aiohttp.TCPConnector(**args)
+        im = Image.open(io.BytesIO(image_bytes)).convert("L").resize((32, 32))
+        arr = np.asarray(im, dtype="float32")
+        d = np.fft.fft2(arr).real[:8, :8]
+        med = float(np.median(d[1:, 1:]))
+        bits = (d[1:, 1:] > med).astype("uint8").flatten()
+        val = 0
+        for b in bits:
+            val = (val << 1) | int(b)
+        return int(val)
     except Exception:
         return None
 
-async def _get_session():
-    global _SESSION
-    if _SESSION is None or getattr(_SESSION, "closed", True):
-        _SESSION = aiohttp.ClientSession(connector=_make_connector())
-    return _SESSION
 
-async def _warmup(session, key: str):
-    if _env("LPG_BURST_WARMUP","1") != "1":
-        return
-    try:
-        import aiohttp
-        url = f"https://generativelanguage.googleapis.com/v1/models?key={key}"
-        t = aiohttp.ClientTimeout(total=1.0)
-        async with session.get(url, timeout=t) as r:
-            await r.release()
-    except Exception:
-        pass
-
-
-# -------- request build/parse --------
-
-def _maybe_transcode(image_bytes: bytes) -> tuple[bytes, str]:
+def _maybe_transcode(image_bytes: bytes) -> Tuple[bytes, str]:
     """
-    Try to downscale/transcode to JPEG to shrink payload.
-    Controlled by env:
-      - LPG_IMG_TRANSCODE (default '1')
-      - LPG_IMG_MAX_DIM (default '1024')  # longest side
-      - LPG_IMG_JPEG_QUALITY (default '85')
-      - LPG_IMG_MAX_JPEG_KB (default '256')  # soft cap
-    Returns: (bytes, mime_type)
+    Optionally transcode / downscale large PNGs to JPEG for latency/rate-limit
+    friendliness. Controlled by LPG_IMG_TRANSCODE (default: on).
     """
+    if _env("LPG_IMG_TRANSCODE", "1") != "1":
+        return image_bytes, _detect_mime(image_bytes)
+    if Image is None:
+        return image_bytes, _detect_mime(image_bytes)
     try:
-        if _env("LPG_IMG_TRANSCODE","1") != "1":
-            return image_bytes, "image/png"
-        try:
-            from PIL import Image
-            import io
-        except Exception:
-            return image_bytes, "image/png"
-        # Load image
-        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        max_dim = int(_env("LPG_IMG_MAX_DIM", _env("LPG_IMG_MAX_SIDE","1024")))
-        w, h = im.size
-        if max(w,h) > max_dim and max_dim > 0:
-            scale = max_dim / float(max(w,h))
-            im = im.resize((max(1,int(w*scale)), max(1,int(h*scale))), Image.LANCZOS)
-        # Encode JPEG
-        buf = io.BytesIO()
-        quality = int(_env("LPG_IMG_JPEG_Q", _env("LPG_IMG_JPEG_QUALITY","85")))
-        im.save(buf, format="JPEG", quality=quality, optimize=True)
-        data = buf.getvalue()
-        cap_kb = int(_env("LPG_IMG_TARGET_KB", _env("LPG_IMG_MAX_JPEG_KB","256")))
-        # If still too large, re-encode at lower quality 70 then 60
-        if len(data) > cap_kb*1024:
-            for q in (70, 60, 50):
-                buf = io.BytesIO()
-                im.save(buf, format="JPEG", quality=q, optimize=True)
-                data = buf.getvalue()
-                if len(data) <= cap_kb*1024:
-                    break
-        return data, "image/jpeg"
+        im = Image.open(io.BytesIO(image_bytes))
+        max_side = int(_env("LPG_IMG_MAX_SIDE", "1600") or "1600")
+        if max_side <= 0:
+            max_side = 1600
+        im.thumbnail((max_side, max_side))
+        out = io.BytesIO()
+        im = im.convert("RGB")
+        q = int(_env("LPG_IMG_JPEG_QUALITY", "88") or "88")
+        im.save(out, format="JPEG", quality=q, optimize=True)
+        return out.getvalue(), "image/jpeg"
     except Exception:
-        return image_bytes, "image/png"
+        return image_bytes, _detect_mime(image_bytes)
+
+
+# ---------------------------------------------------------------------------
+# payload / prompt
+# ---------------------------------------------------------------------------
 
 def _build_payload(image_bytes: bytes) -> dict:
-    """
-    Build Gemini prompt + payload for Lucky Pull detection.
-
-    We ask the model for a richer schema (screen_type, slot_count, etc.)
-    so that the client can enforce strict multi-result semantics and avoid
-    deleting non-gacha UI like loadouts, Epiphany, save data, or build sheets.
-    """
+    # Build Gemini prompt + payload for Lucky Pull detection.
+    # Prompt supports both multi-pull (10-pull style) and single-pull result screens.
     image_bytes, mime = _maybe_transcode(image_bytes)
     b64 = base64.b64encode(image_bytes).decode("ascii")
     neg_words = _negative_phrases()
@@ -261,7 +246,8 @@ def _build_payload(image_bytes: bytes) -> dict:
 
     sys_prompt = (
         "You are a game UI analyst.\n"
-        "Classify STRICTLY whether this screenshot is a gacha PULL RESULT screen.\n\n"
+        "Classify STRICTLY whether this screenshot is a gacha PULL RESULT screen "
+        "(either a single result or a multi-result 10-pull style screen).\n\n"
         "You must output a single compact JSON object with these keys: "
         "{"
         "\"lucky\": <bool>, "
@@ -271,29 +257,30 @@ def _build_payload(image_bytes: bytes) -> dict:
         "\"screen_type\": <string>, "
         "\"slot_count\": <int>, "
         "\"is_multi_result_screen\": <bool>"
-        "}."
-        "\n\n"
+        "}.\n\n"
         "Definitions:\n"
         "- result_multi_pull: a gacha result screen showing many results at once "
         "(typically 8-12, often 10 or 11). Cards or characters are laid out as vertical "
         "banners or a grid, usually with rarity colors, NEW tags, etc.\n"
-        "- single_pull: a result screen showing only one result.\n"
+        "- result_single_pull: a result screen showing only one gacha result, usually with "
+        "a large character or card illustration and rarity stars.\n"
         "- save_data, loadout, deck, inventory, potentials, disc skills, card_detail, "
         "upgrade, epiphany, emblem info, build sheets, or web planners are NOT result screens.\n"
         "Any screen showing only 1-4 cards in the middle (such as Epiphany/card choice/upgrade) "
-        "is NOT a pull result.\n"
+        "is usually NOT a pull result unless the UI clearly matches a gacha result screen.\n"
         "Any screen showing Save data, Card Count, Manifest Ego, Memory Fragments, equipment or "
         "artifact grids, character details, stat pages, emblem info, or reforging UI is NOT a pull result.\n"
         "Any external website, spreadsheet, or build table (for example skill charts or planners) "
         "is NOT a pull result.\n\n"
         "Rules:\n"
-        "- If the image is not a multi-result gacha pull result screen (10-pull style or similar), "
-        "set lucky=false, is_multi_result_screen=false, slot_count to the estimated number of cards, "
-        "and screen_type to an appropriate non-result label (e.g. 'epiphany', 'save_data', 'deck', "
-        "'upgrade', 'potentials', 'disc_skills', 'build_sheet').\n"
-        "- Only if the image clearly shows a multi-result gacha result (>=8 result slots at once) may you set "
-        "lucky=true. In that case you MUST set screen_type='result_multi_pull', "
+        "- First decide if the screenshot is a gacha pull result at all. If it is clearly a "
+        "loadout / deck / save_data / epiphany / build_sheet / planner, set lucky=false.\n"
+        "- If the image clearly shows a multi-result gacha result (>=8 result slots at once) you may set "
+        "lucky=true, and you MUST set screen_type='result_multi_pull', "
         "is_multi_result_screen=true, and slot_count>=8.\n"
+        "- If the image clearly shows a single gacha result screen (one character or card with "
+        "rarity stars and result UI), you may set lucky=true, and you MUST set "
+        "screen_type='result_single_pull', is_multi_result_screen=false, and slot_count=1.\n"
         "- If you are unsure, treat it as NOT a result screen (lucky=false).\n"
         f"- Negative UI phrases that strongly indicate NOT a result screen: {neg_txt}.\n"
         "Return ONLY the JSON object. No prose, no markdown."
@@ -311,6 +298,7 @@ def _build_payload(image_bytes: bytes) -> dict:
         ],
         "generationConfig": {"temperature": 0.0, "topP": 0.1},
     }
+
 
 def _parse_json(text: str):
     try:
@@ -365,84 +353,153 @@ def _parse_json(text: str):
         "emblem", "reforge", "build", "sheet", "planner",
         "guide", "record",
     )
+    allowed_multi = (
+        "result_multi_pull",
+        "multi_result",
+        "gacha_result_multi",
+    )
+    allowed_single = (
+        "result_single_pull",
+        "single_result",
+        "gacha_result_single",
+        "result_character_single",
+    )
+
+    # Hard negatives: jika screen_type jelas non-result, paksa tidak lucky.
     if screen_type:
         st = screen_type
         if any(k in st for k in non_result_keys):
             lucky = False
             score = min(score, 0.5)
 
-    # Require a reasonably large multi-result screen for lucky=True.
-    if slot_count is not None and slot_count < 7:
-        lucky = False
-        score = min(score, 0.5)
-    if is_multi is False:
-        lucky = False
-        score = min(score, 0.5)
+    # Structural gating:
+    # - Multi result: butuh slot cukup banyak dan tag yang benar.
+    # - Single result: boleh jika ditandai jelas sebagai result_single_pull, dsb.
     if lucky:
-        if screen_type and screen_type not in (
-            "result_multi_pull",
-            "multi_result",
-            "gacha_result_multi",
-        ):
-            lucky = False
-            score = min(score, 0.5)
+        if screen_type in allowed_multi or (is_multi is True):
+            # Multi → wajib minimal 7 slot dan label yang benar
+            if slot_count is not None and slot_count < 7:
+                lucky = False
+                score = min(score, 0.5)
+            if screen_type and screen_type not in allowed_multi:
+                lucky = False
+                score = min(score, 0.5)
+        elif screen_type in allowed_single:
+            # Single result → terima selama sudah ditandai jelas dan skornya tidak terlalu kecil.
+            if score < 0.6:
+                score = 0.6
+        else:
+            # Model bilang lucky tapi type tidak jelas → kalau slot sedikit, main aman (anggap bukan result).
+            if slot_count is not None and slot_count <= 4:
+                lucky = False
+                score = min(score, 0.5)
 
     return lucky, max(0.0, min(1.0, score)), reason, flags
 
-async def _call_one(session, model: str, key: str, image_bytes: bytes, timeout_s: float):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    payload = _build_payload(image_bytes)
+
+# ---------------------------------------------------------------------------
+# HTTP layer
+# ---------------------------------------------------------------------------
+
+_SESSION: Optional["aiohttp.ClientSession"] = None  # type: ignore
+
+
+async def _get_session():
+    global _SESSION
+    if _SESSION is not None and not getattr(_SESSION, "closed", False):
+        return _SESSION
+    if aiohttp is None:
+        raise RuntimeError("aiohttp_not_available")
+    force_ipv4 = (_env("LPG_FORCE_IPV4", "1") == "1")
+    connector = None
+    if force_ipv4:
+        try:
+            connector = aiohttp.TCPConnector(family=socket.AF_INET)  # type: ignore[arg-type]
+        except Exception:
+            connector = None
+    _SESSION = aiohttp.ClientSession(connector=connector)
+    return _SESSION
+
+
+@atexit.register
+def _close_session_sync():
+    global _SESSION
     try:
-        async with session.post(url, json=payload, timeout=timeout_s) as resp:
-            if resp.status != 200:
-                # ## RETRY_ON_429: quick single retry if we still have headroom
-                if resp.status in (429, 503) and timeout_s >= 2.2:
-                    try:
-                        await asyncio.sleep(0.25)
-                        to2 = aiohttp.ClientTimeout(total=timeout_s - 0.8)
-                        async with session.post(url, json=payload, timeout=to2) as r2:
-                            if r2.status == 200:
-                                data = await r2.json()
-                                text = ""
-                                try:
-                                    text = data["candidates"][0]["content"]["parts"][0]["text"]
-                                except Exception:
-                                    text = json.dumps(data)[:500]
-                                lucky, score, reason, flags = _parse_json(text)
-                                return lucky, score, "ok", reason, flags
-                    except Exception:
-                        pass
-                return False, 0.0, "http", f"status={resp.status}", []
-            data = await resp.json()
-            # extract text
-            text = ""
+        s = _SESSION
+        _SESSION = None
+        if s is not None and not getattr(s, "closed", False):
             try:
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(s.close())
+                else:
+                    loop.run_until_complete(s.close())
             except Exception:
-                text = json.dumps(data)[:500]
-            lucky, score, reason, flags = _parse_json(text)
+                pass
+    except Exception:
+        pass
+
+
+async def _call_one(session, model: str, key: str, image_bytes: bytes, per_timeout: float):
+    """
+    Low-level call; returns (lucky, score, status, reason, flags).
+    status in {"ok","soft_timeout","error","http_error","none:no_result"}.
+    """
+    if aiohttp is None:
+        return False, 0.0, "no_http", "aiohttp_missing", []
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    payload = _build_payload(image_bytes)
+    params = {"key": key}
+    try:
+        async with session.post(url, headers=headers, params=params, json=payload, timeout=per_timeout) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                return False, 0.0, "http_error", f"status={resp.status}", [text[:200]]
+            try:
+                data = json.loads(text)
+            except Exception:
+                data = {}
+            out_text = ""
+            try:
+                cands = data.get("candidates") or []
+                if cands:
+                    parts = cands[0].get("content", {}).get("parts", [])
+                    if parts:
+                        out_text = parts[0].get("text", "") or ""
+            except Exception:
+                out_text = ""
+            if not out_text:
+                return False, 0.0, "none:no_result", ["empty_text", text[:200]]
+            lucky, score, reason, flags = _parse_json(out_text)
             return lucky, score, "ok", reason, flags
     except asyncio.TimeoutError:
         return False, 0.0, "soft_timeout", "request_timeout", []
     except Exception as e:
-        return False, 0.0, "error", f"{type(e).__name__}", []
+        return False, 0.0, "error", repr(e), []
 
-# -------- core: burst with modes --------
+
+# ---------------------------------------------------------------------------
+# burst / stagger / sequential helpers
+# ---------------------------------------------------------------------------
+
 async def _do_parallel(session, model, keys, image_bytes, per_timeout, early_score, tag):
     tasks = [asyncio.create_task(_call_one(session, model, k, image_bytes, per_timeout)) for k in keys]
     neg_words = _negative_phrases()
-    best = (False, 0.0, "none", "no_result", [])
+    best = None
     try:
-        for coro in asyncio.as_completed(tasks, timeout=per_timeout+0.1):
+        for coro in asyncio.as_completed(tasks, timeout=per_timeout + 0.1):
             lucky, score, st, reason, flags = await coro
             if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
-                lucky = False; score = min(score, 0.50); reason = f"{reason}|neg_cue"
+                lucky = False
+                score = min(score, 0.50)
+                reason = f"{reason}|neg_cue"
             if lucky and score >= early_score:
                 for t in tasks:
                     if not t.done():
                         t.cancel()
                 return True, score, tag, f"early({st})"
-            if score > best[1]:
+            if best is None or score > best[1]:
                 best = (lucky, score, st, reason, flags)
     except asyncio.TimeoutError:
         pass
@@ -450,29 +507,34 @@ async def _do_parallel(session, model, keys, image_bytes, per_timeout, early_sco
         for t in tasks:
             if not t.done():
                 t.cancel()
+    if best is None:
+        best = (False, 0.0, "none", "no_result", [])
     lucky, score, st, reason, _ = best
     return lucky, score, tag, f"{st}:{reason}"
 
-async def _do_stagger(session, model, keys, image_bytes, per_timeout, early_score, tag, stagger):
+
+async def _do_stagger(session, model, keys, image_bytes, per_timeout, early_score, tag, stagger_ms: float):
     # fire key[0], wait a bit, then key[1] if still uncertain/slow
     neg_words = _negative_phrases()
-    best = (False, 0.0, "none", "no_result", [])
+    best = None
 
     async def _evaluate(res):
         nonlocal best
         lucky, score, st, reason, flags = res
         if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
-            lucky = False; score = min(score, 0.50); reason = f"{reason}|neg_cue"
+            lucky = False
+            score = min(score, 0.50)
+            reason = f"{reason}|neg_cue"
         if lucky and score >= early_score:
             return True, score, tag, f"early({st})"
-        if score > best[1]:
+        if best is None or score > best[1]:
             best = (lucky, score, st, reason, flags)
         return None
 
     # launch first
     t1 = asyncio.create_task(_call_one(session, model, keys[0], image_bytes, per_timeout))
     try:
-        r1 = await asyncio.wait_for(t1, timeout=min(per_timeout, stagger/1000.0))
+        r1 = await asyncio.wait_for(t1, timeout=min(per_timeout, stagger_ms / 1000.0))
         verdict = await _evaluate(r1)
         if verdict:
             return verdict
@@ -487,7 +549,7 @@ async def _do_stagger(session, model, keys, image_bytes, per_timeout, early_scor
         t2 = None
 
     # now await whichever finishes first fully
-    pending = [t for t in [t1, t2] if t is not None and not t.done()]
+    pending = [t for t in (t1, t2) if t is not None and not t.done()]
     try:
         if pending:
             done, pending = await asyncio.wait(pending, timeout=per_timeout, return_when=asyncio.FIRST_COMPLETED)
@@ -505,91 +567,145 @@ async def _do_stagger(session, model, keys, image_bytes, per_timeout, early_scor
                     if verdict:
                         return verdict
     finally:
-        for p in [t1, t2] if t2 else [t1]:
+        for p in (t1, t2) if t2 else (t1,):
             if p and not p.done():
                 p.cancel()
+
+    if best is None:
+        best = (False, 0.0, "none", "no_result", [])
+    lucky, score, st, reason, _ = best
+    return lucky, score, tag, f"{st}:{reason}"
+
+
+async def _do_sequential(session, model, keys, image_bytes, per_timeout, early_score, tag, margin_ms: int):
+    """
+    Simple sequential mode: call key[0], then optionally key[1] if:
+      - status soft_timeout/error, or
+      - HTTP 429, or
+      - score too low.
+    margin_ms is accepted for compat but only used to slightly reduce timeout
+    for the first call.
+    """
+    neg_words = _negative_phrases()
+    best = None
+
+    # shorten t1 slightly so second key still has room if needed
+    per_timeout1 = per_timeout
+    try:
+        m = max(0.2, min(per_timeout * 0.5, margin_ms / 1000.0))
+        per_timeout1 = max(0.8, per_timeout - m)
+    except Exception:
+        pass
+
+    # first key
+    lucky, score, st, reason, flags = await _call_one(session, model, keys[0], image_bytes, per_timeout1)
+    if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
+        lucky = False
+        score = min(score, 0.50)
+        reason = f"{reason}|neg_cue"
+    best = (lucky, score, st, reason, flags)
+    if lucky and score >= early_score:
+        return True, score, tag, f"early({st})"
+
+    need_fallback = (st in ("soft_timeout", "error")) or ("status=429" in reason)
+    if len(keys) >= 2 and need_fallback:
+        lucky2, score2, st2, reason2, flags2 = await _call_one(session, model, keys[1], image_bytes, per_timeout)
+        if any(w in " ".join(flags2 + [reason2]).lower() for w in neg_words):
+            lucky2 = False
+            score2 = min(score2, 0.50)
+            reason2 = f"{reason2}|neg_cue"
+        if (lucky2 and score2 >= score) or not lucky:
+            return lucky2, score2, tag, f"fallback({st2})"
 
     lucky, score, st, reason, _ = best
     return lucky, score, tag, f"{st}:{reason}"
 
-# -------- public API --------
-async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
-    tag = _env("LPG_BURST_TAG", "gemini:burst-2keys")
-    if aiohttp is None:
-        return False, 0.0, tag, "aiohttp_missing"
 
+# ---------------------------------------------------------------------------
+# public API
+# ---------------------------------------------------------------------------
+
+_INFLIGHT: dict = {}
+
+
+async def classify_lucky_pull_bytes_burst(image_bytes: bytes):
+    """
+    Main entry point used by LPG thread bridge.
+    Returns (ok, score, via, reason).
+    """
     keys = _keys()
+    model = _env("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    tag = _env("LPG_BURST_TAG", f"gemini:{model}")
     if not keys:
         return False, 0.0, tag, "no_keys"
 
-    model = _env("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    per_timeout = _env_f("LPG_BURST_TIMEOUT_MS", float(os.getenv("GEMINI_PER_TIMEOUT_MS","6000"))) / 1000.0
+    timeout_ms_env = os.getenv("LPG_BURST_TIMEOUT_MS") or os.getenv("GEMINI_PER_TIMEOUT_MS")
+    try:
+        timeout_ms = float(timeout_ms_env) if timeout_ms_env else 6000.0
+    except Exception:
+        timeout_ms = 6000.0
+    per_timeout = max(0.5, timeout_ms / 1000.0)
     early_score = _env_f("LPG_BURST_EARLY_EXIT_SCORE", 0.90)
-    mode = _env("LPG_BURST_MODE", "stagger").lower()
-    stagger_ms = _env_f("LPG_BURST_STAGGER_MS", 300)
-    dedup = _env("LPG_BURST_DEDUP", "1") == "1"
+    mode = _env("LPG_BURST_MODE", "stagger").strip().lower() or "stagger"
+    stagger_ms = _env_f("LPG_BURST_STAGGER_MS", 300.0)
+    dedup = (_env("LPG_BURST_DEDUP", "1") == "1")
 
-    # Prepare payload
-    tag = f"gemini:{model}"
+    # Pre-process image (transcode/downscale) for all keys
+    processed, _mime = _maybe_transcode(image_bytes)
 
-    async def _parallel_or_stagger(session):
-        if mode == "parallel" or len(keys) < 2:
-            return await _do_parallel(session, model, keys, image_bytes, per_timeout, early_score, tag)
-        else:
-            if mode == "sequential":
-                return await _do_sequential_deadline(session, model, keys, image_bytes, per_timeout, early_score, tag, int(_env('LPG_FALLBACK_MARGIN_MS','1200')))
-            else:
-                return await _do_stagger(session, model, keys, image_bytes, per_timeout, early_score, tag, stagger_ms)
-
-    # simple inflight de-dup per image digest + mode
-    key = f"{hash(image_bytes)}|{mode}|{per_timeout}|{stagger_ms}"
-    if dedup:
-        fut = _INFLIGHT.get(key)
-        if fut and not fut.done():
-            try:
-                res = await fut
-                return res
-            except Exception:
-                pass
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-        _INFLIGHT[key] = fut
-        try:
-            session = await _get_session()
-            await _warmup(session, keys[0] if keys else _env('GEMINI_API_KEY',''))
-            res = await _parallel_or_stagger(session)
-            if not fut.done():
-                fut.set_result(res)
-            return res
-        finally:
-            _INFLIGHT.pop(key, None)
-    else:
+    async def _runner():
         session = await _get_session()
-        await _warmup(session, keys[0] if keys else _env('GEMINI_API_KEY',''))
-        return await _parallel_or_stagger(session)
+        if mode == "parallel" or len(keys) < 2:
+            return await _do_parallel(session, model, keys, processed, per_timeout, early_score, tag)
+        elif mode == "sequential":
+            try:
+                margin_ms = int(_env("LPG_FALLBACK_MARGIN_MS", "1200") or "1200")
+            except Exception:
+                margin_ms = 1200
+            return await _do_sequential(session, model, keys, processed, per_timeout, early_score, tag, margin_ms)
+        else:
+            return await _do_stagger(session, model, keys, processed, per_timeout, early_score, tag, stagger_ms)
+
+    if not dedup:
+        ok, score, via, reason = await _runner()
+        return ok, score, via, reason
+
+    # inflight de-dup keyed by phash+model+mode+len(keys)
+    ph = _phash64(processed)
+    if ph is None:
+        h = hashlib.sha256(processed).hexdigest()
+        ph = int(h[:16], 16)
+    inflight_key = (ph, model, mode, len(keys))
+
+    fut = _INFLIGHT.get(inflight_key)
+    if fut is not None and not fut.done():
+        try:
+            return await fut
+        except Exception:
+            _INFLIGHT.pop(inflight_key, None)
+
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+    _INFLIGHT[inflight_key] = fut
+    try:
+        res = await _runner()
+        if not fut.done():
+            fut.set_result(res)
+        return res
+    except Exception as e:  # pragma: no cover
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        try:
+            if fut.done():
+                _INFLIGHT.pop(inflight_key, None)
+        except Exception:
+            pass
 
 
-
-
-async def _do_sequential_deadline(session, model, keys, image_bytes, per_timeout, early_score, tag, margin_ms):
-    import time
-    neg_words = _negative_phrases()
-    start_t = time.monotonic()
-    k1 = keys[0]
-    t1 = max(1.6, per_timeout - min((margin_ms/1000.0), max(0.6, per_timeout*0.20)))
-    lucky, score, st, reason, flags = await _call_one(session, model, k1, image_bytes, t1)
-    if any(w in " ".join(flags + [reason]).lower() for w in neg_words):
-        lucky = False; score = min(score, 0.50); reason = f"{reason}|neg_cue"
-    if lucky and score >= early_score:
-        return True, score, tag, f"early({st})"
-    need_fallback = (st in ("soft_timeout","error")) or (st == "http" and "status=429" in reason) or (time.monotonic() - start_t) >= t1
-    if (len(keys) >= 2) and need_fallback:
-        k2 = keys[1]
-        lucky2, score2, st2, reason2, flags2 = await _call_one(session, model, k2, image_bytes, per_timeout)
-        if any(w in " ".join(flags2 + [reason2]).lower() for w in neg_words):
-            lucky2 = False; score2 = min(score2, 0.50); reason2 = f"{reason2}|neg_cue"
-        if (lucky2 and score2 >= score) or not lucky:
-            return lucky2, score2, tag, f"fallback({st2})"
-    return lucky, score, st, reason
+async def classify_lucky_pull_bytes(image_bytes: bytes):
+    """
+    Backwards-compatible alias; some callers still import classify_lucky_pull_bytes.
+    """
+    return await classify_lucky_pull_bytes_burst(image_bytes)

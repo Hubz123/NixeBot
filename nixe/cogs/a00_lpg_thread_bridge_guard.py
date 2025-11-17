@@ -413,14 +413,17 @@ class LPGThreadBridgeGuard(commands.Cog):
             if self.persona_enable and ok_run:
                 if self.persona_only_for and self.persona_context not in self.persona_only_for:
                     raise RuntimeError("persona_context_not_allowed")
-                if self.persona_allowed_providers and (
-                    provider_hint or ""
-                ).lower() not in self.persona_allowed_providers:
-                    raise RuntimeError("persona_provider_not_allowed")
-                data = load_persona()
+                if self.persona_allowed_providers:
+                    prov = (provider_hint or "").lower()
+                    if not any(prov.startswith(prefix) for prefix in self.persona_allowed_providers):
+                        raise RuntimeError("persona_provider_not_allowed")
+                pmode, pdata, ppath = load_persona()
+                if not pdata:
+                    raise RuntimeError("persona_data_empty")
+                use_mode = self.persona_mode or pmode or "yandere"
                 text = pick_line(
-                    data,
-                    mode=self.persona_mode,
+                    pdata,
+                    mode=use_mode,
                     tone=self.persona_tone,
                     user=getattr(message.author, "mention", "@user"),
                     channel=mention or "",

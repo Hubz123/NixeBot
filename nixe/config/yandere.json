@@ -13,10 +13,10 @@
   "groups": {
     "soft": [
       "eh {user}~ ❤️ ini salah kamar, ya. aku bereskan dulu supaya {channel} tetap rapi~ (alasan: {reason})",
-      "hai {user}… kiriman itu lebih cocok di channel khusus. aku hapus pelan-pelan ya~ (alasan: {reason})",
+      "hai {user}… kiriman itu lebih cocok di {channel}. aku hapus pelan-pelan ya~ (alasan: {reason})",
       "ssst {user}, {channel} butuh rapi. aku bersihkan dulu ya~ (alasan: {reason})",
       "demi ketertiban {channel}, postinganmu aku turunkan dengan lembut, oke? (alasan: {reason})",
-      "maaf ya {user}~ tolong pakai channel yang tepat lain kali. sekarang aku rapikan dulu. (alasan: {reason})",
+      "maaf ya {user}~ tolong pakai {channel} yang tepat lain kali. sekarang aku rapikan dulu. (alasan: {reason})",
       "eh {user} sayang… itu untuk {channel} ya. aku rapikan dulu~ (alasan: {reason})",
       "maaf ya {user}~ lain kali share-nya di {channel} supaya rapi. (alasan: {reason})",
       "{user}, biar enak dibaca semua, pindah ke {channel} ya~ (alasan: {reason})",
@@ -29,11 +29,11 @@
       "eh lucu banget, {user}. taruhnya di {channel} ya biar nggak tenggelam~ (alasan: {reason})"
     ],
     "agro": [
-      "hei {user}—aturan itu ada untuk ditaati. ini salah tempat, aku bersihkan. (alasan: {reason})",
+      "hei {user}—aturan itu ada untuk ditaati. ini salah tempat, gunakan {channel}. aku bersihkan. (alasan: {reason})",
       "{user}, {channel} bukan buat itu. kiriman di-take down sekarang. patuhi deskripsi channel. (alasan: {reason})",
-      "ups, salah kamar, {user}. sudah aku sapu. jangan diulang. (alasan: {reason})",
-      "ketertiban duluan, {user}. konten salah tempat = bersih. (alasan: {reason})",
-      "peringatan, {user}: gunakan channel yang sesuai. yang ini sudah kuhapus. (alasan: {reason})",
+      "ups, salah kamar, {user}. pindah ke {channel}, sudah aku sapu. jangan diulang. (alasan: {reason})",
+      "ketertiban duluan, {user}. konten salah tempat = bersih. {channel} tempat yang benar. (alasan: {reason})",
+      "peringatan, {user}: gunakan {channel} yang sesuai. yang ini sudah kuhapus. (alasan: {reason})",
       "{user}, pindah ke {channel}. sekarang. (alasan: {reason})",
       "oi {user}. pamer gacha di sini? salah channel. ke {channel} sana.",
       "jangan acak-acakan. {channel} untuk konten begitu, {user}. (alasan: {reason})",
@@ -46,11 +46,11 @@
       "ingat aturan, {user}: {channel}. (alasan: {reason})"
     ],
     "sharp": [
-      "moderasi: kiriman off-topic dihapus. {user}, pindahkan ke kanal yang benar. (alasan: {reason})",
+      "moderasi: kiriman off-topic dihapus. {user}, pindahkan ke {channel}. (alasan: {reason})",
       "aturan ditegakkan. kontenmu tidak sesuai {channel} → dihapus. (alasan: {reason})",
-      "hapus otomatis: {reason}. {user}, baca panduan channel.",
-      "notifikasi: pelanggaran tata letak. kiriman dibersihkan. (alasan: {reason})",
-      "{user}, kontenmu melenceng dari tema. sudah dihapus. gunakan kanal yang tepat. (alasan: {reason})",
+      "hapus otomatis: {reason}. {user}, baca panduan channel {channel}.",
+      "notifikasi: pelanggaran tata letak. kiriman dibersihkan. gunakan {channel}. (alasan: {reason})",
+      "{user}, kontenmu melenceng dari tema. sudah dihapus. gunakan {channel}. (alasan: {reason})",
       "hapus: {reason}. {user} → {channel}.",
       "moderasi: salah kanal. {user} ke {channel}. (alasan: {reason})",
       "dibersihkan. gunakan {channel}. (alasan: {reason})",

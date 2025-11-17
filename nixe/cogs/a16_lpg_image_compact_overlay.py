@@ -36,7 +36,6 @@ class LPGImageCompactOverlay(commands.Cog):
             return b
         try:
             from PIL import Image
-            import numpy as np  # not strictly required, Pillow alone is enough
         except Exception:
             # Pillow not available: keep original
             return b

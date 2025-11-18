@@ -32,6 +32,9 @@ def _dct2(a):
 
 
 def _phash64_bytes(img_bytes: bytes) -> Optional[int]:
+    """Compute 64-bit perceptual hash from raw image bytes.
+    Returns None on any failure but logs the reason for easier debugging.
+    """
     if Image is None or np is None:
         log.warning(
             "[lpg-thread-bridge] pHash disabled (Image=%r, np=%r)",
@@ -271,19 +274,6 @@ class LPGThreadBridgeGuard(commands.Cog):
             if len(data) > self.max_bytes:
                 data = data[: self.max_bytes]
 
-            # Stash bytes + pHash ke message untuk embed / cache
-            try:
-                d = getattr(message, "__dict__", None)
-                if isinstance(d, dict):
-                    d.setdefault("_nixe_imgbytes", data)
-                    if not isinstance(d.get("_nixe_phash"), int):
-                        d["_nixe_phash"] = _phash64_bytes(data)
-            except Exception as e:
-                log.debug(
-                    "[lpg-thread-bridge] failed to attach pHash on classify: %r",
-                    e,
-                )
-
             # primary path: gemini_bridge (may be monkeypatched by overlay)
             res = await asyncio.wait_for(
                 classify_lucky_pull_bytes(data), timeout=self.timeout
@@ -488,8 +478,9 @@ class LPGThreadBridgeGuard(commands.Cog):
         if not any(self._is_image(a) for a in (message.attachments or [])):
             return
 
-        # Prepare raw bytes & pHash for logging/caching
+        # Prepare raw bytes & pHash for logging/caching (local only, robust for discord.py slots)
         raw_bytes = None
+        ph_val: Optional[int] = None
         try:
             for a in (message.attachments or []):
                 ct = (getattr(a, "content_type", None) or "").lower()
@@ -499,12 +490,25 @@ class LPGThreadBridgeGuard(commands.Cog):
                 ):
                     raw_bytes = await a.read()
                     break
-        except Exception:
+        except Exception as e:
+            log.debug("[lpg-thread-bridge] failed to read bytes for pHash: %r", e)
             raw_bytes = None
+
+        if isinstance(raw_bytes, (bytes, bytearray)):
+            try:
+                ph_val = _phash64_bytes(raw_bytes)
+            except Exception as e:
+                log.warning(
+                    "[lpg-thread-bridge] _phash64_bytes failed in on_message: %r",
+                    e,
+                )
+                ph_val = None
+
+        # Best-effort stash into message for any consumers that support dynamic attrs
         d = getattr(message, "__dict__", None)
         if isinstance(d, dict):
             d["_nixe_imgbytes"] = raw_bytes
-            d["_nixe_phash"] = _phash64_bytes(raw_bytes) if raw_bytes else None
+            d["_nixe_phash"] = ph_val
 
         # Require classification by default
         lucky: bool = False
@@ -526,24 +530,20 @@ class LPGThreadBridgeGuard(commands.Cog):
 
         # Post classification result to status thread (always)
         try:
-            ph_container = (
-                getattr(message, "__dict__", {})
-                if isinstance(getattr(message, "__dict__", None), dict)
-                else {}
-            )
-            ph = None
-            if isinstance(ph_container, dict):
-                ph = ph_container.get("_nixe_phash")
-                if not isinstance(ph, int):
-                    raw = ph_container.get("_nixe_imgbytes")
-                    if isinstance(raw, (bytes, bytearray)):
-                        try:
-                            ph = _phash64_bytes(raw)
-                        except Exception:
-                            ph = None
-                        else:
-                            if isinstance(ph, int):
-                                ph_container["_nixe_phash"] = ph
+            # Compute pHash for logging/status embed.
+            # We prefer the local ph_val computed earlier in on_message to avoid
+            # relying on discord.py dynamic attributes (most models use __slots__).
+            ph = ph_val
+            if not isinstance(ph, int) and isinstance(raw_bytes, (bytes, bytearray)):
+                try:
+                    ph = _phash64_bytes(raw_bytes)
+                except Exception as e:
+                    log.warning(
+                        "[lpg-thread-bridge] _phash64_bytes failed in status embed: %r",
+                        e,
+                    )
+                    ph = None
+
             ph_str = f"{int(ph):016X}" if isinstance(ph, int) else "-"
             fields = [
                 ("Result", "✅ LUCKY" if lucky else "❌ NOT LUCKY", True),

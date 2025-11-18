@@ -33,6 +33,11 @@ def _dct2(a):
 
 def _phash64_bytes(img_bytes: bytes) -> Optional[int]:
     if Image is None or np is None:
+        log.warning(
+            "[lpg-thread-bridge] pHash disabled (Image=%r, np=%r)",
+            Image,
+            np,
+        )
         return None
     try:
         im = Image.open(BytesIO(img_bytes)).convert("L").resize((32, 32))
@@ -44,7 +49,8 @@ def _phash64_bytes(img_bytes: bytes) -> Optional[int]:
         for b in bits:
             val = (val << 1) | int(b)
         return int(val)
-    except Exception:
+    except Exception as e:
+        log.warning("[lpg-thread-bridge] _phash64_bytes failed: %r", e)
         return None
 
 
@@ -264,6 +270,19 @@ class LPGThreadBridgeGuard(commands.Cog):
                 return (False, 0.0, "none", "empty_bytes")
             if len(data) > self.max_bytes:
                 data = data[: self.max_bytes]
+
+            # Stash bytes + pHash ke message untuk embed / cache
+            try:
+                d = getattr(message, "__dict__", None)
+                if isinstance(d, dict):
+                    d.setdefault("_nixe_imgbytes", data)
+                    if not isinstance(d.get("_nixe_phash"), int):
+                        d["_nixe_phash"] = _phash64_bytes(data)
+            except Exception as e:
+                log.debug(
+                    "[lpg-thread-bridge] failed to attach pHash on classify: %r",
+                    e,
+                )
 
             # primary path: gemini_bridge (may be monkeypatched by overlay)
             res = await asyncio.wait_for(

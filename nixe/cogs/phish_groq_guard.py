@@ -91,18 +91,41 @@ class GroqPhishGuard(commands.Cog):
                 pass
             is_phish = ("\"phish\":true" in txt.lower()) or ("phish: true" in txt.lower())
             reason = txt[:180]
-            if LOG_CHAN_ID:
-                try:
-                    logch = self.bot.get_channel(LOG_CHAN_ID) or await self.bot.fetch_channel(LOG_CHAN_ID)
-                    if logch:
-                        await logch.send(f"[phish-groq] sus image from <@{message.author.id}> → phish={is_phish} reason={reason}")
-                except Exception:
-                    pass
+
             log.info("[phish-groq] result=%s reason=%s", is_phish, reason)
+
             try:
                 if is_phish:
-                    ev_urls = [getattr(att,'url',None)] if getattr(att,'url',None) else []
-                    emit_phish_detected(self.bot, message, {'score':1.0,'provider':'groq','reason':reason,'kind':'image'}, ev_urls)
+                    target_id = _safe_tid or LOG_CHAN_ID
+                    if target_id:
+                        logch = None
+                        try:
+                            logch = self.bot.get_channel(target_id) or await self.bot.fetch_channel(target_id)
+                        except Exception:
+                            logch = None
+                        if logch:
+                            msg_link = None
+                            try:
+                                gid = getattr(message.guild, "id", None)
+                                cid = getattr(message.channel, "id", None)
+                                mid = getattr(message, "id", None)
+                                if gid and cid and mid:
+                                    msg_link = f"https://discord.com/channels/{gid}/{cid}/{mid}"
+                            except Exception:
+                                msg_link = None
+                            text = f"[phish-groq] sus image from <@{message.author.id}> → phish=True reason={reason}"
+                            if msg_link:
+                                text += f"\n{msg_link}"
+                            await logch.send(text)
+
+                    ev_urls = [getattr(att, 'url', None)] if getattr(att, 'url', None) else []
+                    details = {
+                        'score': 1.0,
+                        'provider': 'groq',
+                        'reason': reason,
+                        'kind': 'image',
+                    }
+                    emit_phish_detected(self.bot, message, details, ev_urls)
             except Exception:
                 pass
         except Exception as e:

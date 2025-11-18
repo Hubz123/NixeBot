@@ -512,8 +512,20 @@ class LPGThreadBridgeGuard(commands.Cog):
                 if isinstance(getattr(message, "__dict__", None), dict)
                 else {}
             )
-            ph = ph_container.get("_nixe_phash") if isinstance(ph_container, dict) else None
-            ph_str = (hex(int(ph))[2:].upper() if isinstance(ph, int) else "-")
+            ph = None
+            if isinstance(ph_container, dict):
+                ph = ph_container.get("_nixe_phash")
+                if not isinstance(ph, int):
+                    raw = ph_container.get("_nixe_imgbytes")
+                    if isinstance(raw, (bytes, bytearray)):
+                        try:
+                            ph = _phash64_bytes(raw)
+                        except Exception:
+                            ph = None
+                        else:
+                            if isinstance(ph, int):
+                                ph_container["_nixe_phash"] = ph
+            ph_str = f"{int(ph):016X}" if isinstance(ph, int) else "-"
             fields = [
                 ("Result", "✅ LUCKY" if lucky else "❌ NOT LUCKY", True),
                 ("Score", f"{float(score or 0.0):.3f}", True),

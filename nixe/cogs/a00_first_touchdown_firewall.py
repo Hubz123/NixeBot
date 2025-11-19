@@ -31,11 +31,20 @@ class FirstTouchdownFirewall(commands.Cog):
         self.enabled = get("PHISH_FTF_ENABLE","1")=="1"
         self.guard = {int(x) for x in (get("PHISH_FTF_GUARD_CHANNELS","").replace(","," ").split()) if x.isdigit()}
         self.allow = {int(x) for x in (get("PHISH_FTF_ALLOW_CHANNELS","").replace(","," ").split()) if x.isdigit()}
+        # Global skip channels (mods/safe); shared with other phish guards
+        skip_raw = get("PHISH_SKIP_CHANNELS","").replace(","," ").split()
+        self.skip = {int(x) for x in skip_raw if x.isdigit()}
+        if not self.skip:
+            # Default: mod channels that must never be auto-banned by FTF
+            self.skip = {1400375184048787566, 936690788946030613}
         self.block = set(get("PHISH_BLOCK_DOMAINS","").lower().replace(","," ").split())
         self.hash_thr = int(get_int("PHISH_HASH_HAMMING_MAX",6))
         self.hash_ref = get_blacklist_hashes()
     def _in_scope(self, ch_id:int)->bool:
-        if self.allow and ch_id in self.allow: return False
+        if ch_id in self.skip: 
+            return False
+        if self.allow and ch_id in self.allow: 
+            return False
         return (not self.guard) or (ch_id in self.guard)
     async def _banish(self, m: discord.Message, reason_suffix: str):
         reason=f"{_ban_reason()} • {reason_suffix}"

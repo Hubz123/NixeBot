@@ -43,10 +43,15 @@ class LinkPhishGuard(commands.Cog):
         self.bot = bot
         self.enable = (os.getenv("PHISH_LINK_ENABLE","1") == "1")
         self.guard_ids = set(int(x) for x in (os.getenv("LPG_GUARD_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
+        skip_raw = (os.getenv("PHISH_SKIP_CHANNELS","") or "")
+        self.skip_ids = set(int(x) for x in skip_raw.replace(";",",").split(",") if x.strip().isdigit())
+        if not self.skip_ids:
+            # Default: mod channels excluded from link-phish guard
+            self.skip_ids = {1400375184048787566, 936690788946030613}
         hosts_env = os.getenv("PHISH_LINK_HOSTS","")
         self.hosts = DEFAULT_HOSTS | {h.strip().lower() for h in hosts_env.split(",") if h.strip()}
         self.min_links = int(os.getenv("PHISH_LINK_MIN_COUNT","2"))
-        log.info("[phish-link] enable=%s guards=%s hosts=%s", self.enable, sorted(self.guard_ids), sorted(self.hosts))
+        log.info("[phish-link] enable=%s guards=%s hosts=%s skip=%s", self.enable, sorted(self.guard_ids), sorted(self.hosts), sorted(self.skip_ids))
 
     @commands.Cog.listener("on_message")
     async def on_message(self, message: discord.Message):
@@ -57,7 +62,10 @@ class LinkPhishGuard(commands.Cog):
             if not ch: return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
-            if not ((cid in self.guard_ids) or (pid and pid in self.guard_ids)): return
+            if (cid in self.skip_ids) or (pid and pid in self.skip_ids):
+                return
+            if not ((cid in self.guard_ids) or (pid and pid in self.guard_ids)):
+                return
 
             text = (message.content or "") + " " + " ".join(a.url for a in getattr(message,"attachments",[]) or [])
             urls = URL_RE.findall(text)

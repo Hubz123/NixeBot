@@ -9,6 +9,10 @@ log = logging.getLogger("nixe.cogs.phish_groq_guard")
 from nixe.helpers.ban_utils import emit_phish_detected
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES","8192"))
 GUARD_IDS = set(int(x) for x in (os.getenv("LPG_GUARD_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
+SKIP_IDS = set(int(x) for x in (os.getenv("PHISH_SKIP_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
+if not SKIP_IDS:
+    # Default: mod channels to exclude from phishing guards
+    SKIP_IDS = {1400375184048787566, 936690788946030613}
 try:
     _safe_tid = int(
         os.getenv("PHISH_DATA_THREAD_ID") or
@@ -41,7 +45,7 @@ def _sus(att: discord.Attachment) -> bool:
 class GroqPhishGuard(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        log.info("[phish-groq] enable=%s model=%s guards=%s", ENABLE, MODEL_VISION, sorted(GUARD_IDS))
+        log.info("[phish-groq] enable=%s model=%s guards=%s skip=%s", ENABLE, MODEL_VISION, sorted(GUARD_IDS), sorted(SKIP_IDS))
 
     @commands.Cog.listener("on_message")
     async def on_message(self, message: discord.Message):
@@ -52,7 +56,10 @@ class GroqPhishGuard(commands.Cog):
             if not ch: return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
-            if not ((cid in GUARD_IDS) or (pid and pid in GUARD_IDS)): return
+            if cid in SKIP_IDS or (pid and pid in SKIP_IDS): 
+                return
+            if not ((cid in GUARD_IDS) or (pid and pid in GUARD_IDS)): 
+                return
 
             # find one image
             att = None

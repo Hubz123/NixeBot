@@ -1,0 +1,239 @@
+
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import os, logging, json, asyncio
+from typing import Set, List, Tuple, Optional
+
+import discord
+from discord.ext import commands
+
+from nixe.helpers.img_hashing import phash_list_from_bytes
+from nixe.helpers.phash_tools import hamming
+from nixe.state_runtime import get_phash_ids
+from nixe.helpers.ban_utils import emit_phish_detected
+
+log = logging.getLogger("nixe.cogs.phash_phish_guard")
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        v = os.getenv(name)
+        if v is None or v == "":
+            return default
+        return int(v)
+    except Exception:
+    # silently fall back to default
+        return default
+
+def _env_set(name: str) -> Set[int]:
+    out: Set[int] = set()
+    raw = os.getenv(name) or ""
+    for tok in raw.replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.add(int(tok))
+        except Exception:
+            continue
+    return out
+
+def _load_phash_list_from_content(content: str) -> Set[int]:
+    """Parse pinned message content into a set of 64-bit int hashes.
+
+    Expected formats:
+    - Pure JSON: {"phash":["809c7d...","82ca6d...", ...]}
+    - JSON wrapped in ```json ... ``` code block.
+    """
+    if not content:
+        return set()
+
+    text = content.strip()
+    data: Optional[object] = None
+
+    # Try raw JSON first
+    try:
+        data = json.loads(text)
+    except Exception:
+        # Maybe code block
+        if text.startswith("```") and text.endswith("```"):
+            inner = text.strip("`\n ")
+            # Drop leading language hint if any
+            lines = inner.splitlines()
+            if lines and not lines[0].lstrip().startswith("{"):
+                inner = "\n".join(lines[1:])
+            try:
+                data = json.loads(inner)
+            except Exception:
+                return set()
+        else:
+            return set()
+
+    seq = None
+    if isinstance(data, dict):
+        seq = data.get("phash") or data.get("hashes") or data.get("items") or []
+    elif isinstance(data, list):
+        seq = data
+    else:
+        return set()
+
+    result: Set[int] = set()
+    for v in seq:
+        s = str(v).strip().lower()
+        if not s:
+            continue
+        if s.startswith("0x"):
+            s = s[2:]
+        try:
+            result.add(int(s, 16))
+            continue
+        except Exception:
+            pass
+        try:
+            result.add(int(s))
+        except Exception:
+            continue
+    return result
+
+class PhashPhishGuard(commands.Cog):
+    """Lightweight pHash-based phishing guard.
+
+    - Loads pHash blacklist once from DB thread/message (runtime_env: PHASH_DB_THREAD_ID / PHASH_DB_MESSAGE_ID).
+    - Only checks image attachments (png/jpg/jpeg/webp/gif).
+    - On match (Hamming <= PHASH_MATCH_DELETE_MAX_BITS) it emits `nixe_phish_detected`,
+      so existing phish_ban_embed pipeline handles log + auto-ban.
+    - Never deletes anything inside the imagephish/db threads themselves.
+    """
+
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._hashes: Set[int] = set()
+        self.bits_max: int = _env_int("PHASH_MATCH_DELETE_MAX_BITS", 12)
+        self.guard_ids: Set[int] = _env_set("LPG_GUARD_CHANNELS")
+        self.safe_threads: Set[int] = {
+            _env_int("PHASH_IMAGEPHISH_THREAD_ID", 0),
+            _env_int("PHASH_DB_THREAD_ID", 0),
+            _env_int("PHASH_SOURCE_THREAD_ID", 0),
+            _env_int("PHASH_IMPORT_SOURCE_THREAD_ID", 0),
+        }
+        self.log_chan_id: int = _env_int("PHISH_LOG_CHAN_ID", _env_int("NIXE_PHISH_LOG_CHAN_ID", 0))
+        # lazy bootstrap
+        self._bootstrap_task = asyncio.create_task(self._bootstrap())
+        log.info("[phash-phish] init bits_max=%s guards=%s safe=%s", self.bits_max, sorted(self.guard_ids), sorted(self.safe_threads))
+
+    async def _bootstrap(self) -> None:
+        await self.bot.wait_until_ready()
+        try:
+            await self._refresh_hashes()
+        except Exception as e:
+            log.warning("[phash-phish] initial load failed: %r", e)
+
+    async def _fetch_db_message(self) -> Tuple[Optional[discord.abc.Messageable], Optional[discord.Message]]:
+        tid, mid = get_phash_ids()
+        tid = tid or _env_int("PHASH_DB_THREAD_ID", 0)
+        mid = mid or _env_int("PHASH_DB_MESSAGE_ID", 0)
+        if not mid:
+            return None, None
+        channel: Optional[discord.abc.Messageable] = None
+        msg: Optional[discord.Message] = None
+        try:
+            if tid:
+                channel = self.bot.get_channel(tid) or await self.bot.fetch_channel(tid)
+            if channel is None and self.log_chan_id:
+                channel = self.bot.get_channel(self.log_chan_id) or await self.bot.fetch_channel(self.log_chan_id)
+            if channel:
+                msg = await channel.fetch_message(mid)
+        except Exception as e:
+            log.warning("[phash-phish] fetch db failed: %r", e)
+        return channel, msg
+
+    async def _refresh_hashes(self) -> None:
+        _, msg = await self._fetch_db_message()
+        if not msg:
+            log.warning("[phash-phish] db message not found; skip")
+            return
+        hashes = _load_phash_list_from_content(msg.content or "")
+        if not hashes:
+            log.warning("[phash-phish] db parse yields 0 hashes; len=%s", len(msg.content or ""))
+            return
+        self._hashes = hashes
+        log.warning("[phash-phish] loaded %d hashes from db msg %s", len(hashes), getattr(msg, "id", "?"))
+
+    def _should_guard_channel(self, ch: discord.abc.GuildChannel | discord.Thread) -> bool:
+        cid = int(getattr(ch, "id", 0) or 0)
+        pid = int(getattr(ch, "parent_id", 0) or 0)
+        if not cid:
+            return False
+        if cid in self.safe_threads or (pid and pid in self.safe_threads):
+            return False
+        if not self.guard_ids:
+            # Guard all channels (except safe ones) by default.
+            return True
+        return cid in self.guard_ids or (pid and pid in self.guard_ids)
+
+    async def _scan_message(self, m: discord.Message) -> None:
+        if not self._hashes:
+            return
+        if m.author.bot:
+            return
+        ch = getattr(m, "channel", None)
+        if ch is None:
+            return
+        if not self._should_guard_channel(ch):
+            return
+
+        # Collect candidate image attachments (PNG/JPEG/WEBP/GIF).
+        images: List[bytes] = []
+        for a in getattr(m, "attachments", []) or []:
+            name = (getattr(a, "filename", "") or "").lower()
+            if not any(name.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                continue
+            try:
+                b = await a.read()
+                if b:
+                    images.append(b)
+            except Exception:
+                continue
+
+        if not images:
+            return
+
+        # Compare each local phash to blacklist.
+        for raw in images:
+            hashes = phash_list_from_bytes(raw, max_frames=4)
+            for s in hashes:
+                try:
+                    hv = int(str(s), 16)
+                except Exception:
+                    continue
+                for ref in self._hashes:
+                    if hamming(hv, ref) <= self.bits_max:
+                        reason = f"phash-match≤{self.bits_max} hv={hv:x}"
+                        ev_urls: List[str] = []
+                        for att in getattr(m, "attachments", []) or []:
+                            url = getattr(att, "url", None)
+                            if url:
+                                ev_urls.append(url)
+                        details = {
+                            "score": 1.0,
+                            "provider": "phash",
+                            "reason": reason,
+                            "kind": "image",
+                        }
+                        emit_phish_detected(self.bot, m, details, ev_urls)
+                        log.warning(
+                            "[phash-phish] HIT mid=%s user=%s ch=%s",
+                            getattr(m, "id", "?"),
+                            getattr(getattr(m, "author", None), "id", "?"),
+                            getattr(ch, "id", "?"),
+                        )
+                        return
+
+    @commands.Cog.listener("on_message")
+    async def on_message(self, m: discord.Message) -> None:
+        try:
+            await self._scan_message(m)
+        except Exception as e:
+            log.debug("[phash-phish] err: %r", e)
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(PhashPhishGuard(bot))

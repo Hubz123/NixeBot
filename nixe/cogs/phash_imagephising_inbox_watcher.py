@@ -9,12 +9,20 @@ from nixe.helpers.img_hashing import phash_list_from_bytes, dhash_list_from_byte
 log = logging.getLogger(__name__)
 
 MARKER = (os.getenv("PHASH_DB_MARKER") or "NIXE_PHASH_DB_V1").strip()
-SRC_THREAD_ID = int(os.getenv("NIXE_PHASH_SOURCE_THREAD_ID", "0") or 0)
+SRC_THREAD_ID = int(
+    os.getenv("PHASH_IMAGEPHISH_THREAD_ID")
+    or os.getenv("NIXE_PHASH_SOURCE_THREAD_ID", "0")
+    or 0
+)
 SRC_THREAD_NAME = (os.getenv("NIXE_PHASH_SOURCE_THREAD_NAME") or "imagephising").lower()
-DEST_THREAD_ID = int(os.getenv("NIXE_PHASH_DB_THREAD_ID", "0") or 0)
+DEST_THREAD_ID = int(
+    os.getenv("PHASH_DB_THREAD_ID")
+    or os.getenv("NIXE_PHASH_DB_THREAD_ID", "0")
+    or 0
+)
 DEST_MSG_ID = int(os.getenv("PHASH_DB_MESSAGE_ID", "0") or 0)
 LOG_CH_ID = int(os.getenv("LOG_CHANNEL_ID", "0") or 0)
-NO_FALLBACK = (os.getenv("NIXE_PHASH_DISABLE_LOG_FALLBACK","1")=="1")
+NO_FALLBACK = (os.getenv("NIXE_PHASH_DISABLE_LOG_FALLBACK", "1") == "1")
 
 class PhashImagephisingWatcher(commands.Cog):
     def __init__(self, bot: commands.Bot):

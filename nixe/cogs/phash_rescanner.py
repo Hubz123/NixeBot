@@ -12,14 +12,26 @@ from nixe.helpers.phash_board import get_pinned_db_message, edit_pinned_db
 
 log = logging.getLogger(__name__)
 
-SRC_THREAD_ID = int(os.getenv("NIXE_PHASH_SOURCE_THREAD_ID", "0") or 0)
+SRC_THREAD_ID = int(
+    os.getenv("PHASH_IMAGEPHISH_THREAD_ID")
+    or os.getenv("NIXE_PHASH_SOURCE_THREAD_ID", "0")
+    or 0
+)
 SRC_THREAD_NAME = (os.getenv("NIXE_PHASH_SOURCE_THREAD_NAME") or "imagephising").lower()
-DB_THREAD_ID = int(os.getenv("NIXE_PHASH_DB_THREAD_ID", "0") or 0)
+DB_THREAD_ID = int(
+    os.getenv("PHASH_DB_THREAD_ID")
+    or os.getenv("NIXE_PHASH_DB_THREAD_ID", "0")
+    or 0
+)
 DB_MSG_ID = int(os.getenv("PHASH_DB_MESSAGE_ID", "0") or 0)
 MAX_FRAMES = int(os.getenv("PHASH_MAX_FRAMES", "6"))
-AUTO_BACKFILL = (os.getenv("NIXE_PHASH_AUTOBACKFILL","0") == "1")
-BACKFILL_LIMIT = int(os.getenv("NIXE_PHASH_BACKFILL_LIMIT","0") or 0)
-REQ_PERM = (os.getenv("PHASH_RESCAN_REQUIRE_PERM","1") == "1")
+AUTO_BACKFILL = (
+    os.getenv("PHASH_RESYNC_ON_BOOT")
+    or os.getenv("PHASH_RESCANNER_ENABLE")
+    or os.getenv("NIXE_PHASH_AUTOBACKFILL", "0")
+) == "1"
+BACKFILL_LIMIT = int(os.getenv("NIXE_PHASH_BACKFILL_LIMIT", "0") or 0)
+REQ_PERM = (os.getenv("PHASH_RESCAN_REQUIRE_PERM", "1") == "1")
 
 IMAGE_EXTS = (".png",".jpg",".jpeg",".webp",".gif",".bmp",".tif",".tiff",".heic",".heif")
 

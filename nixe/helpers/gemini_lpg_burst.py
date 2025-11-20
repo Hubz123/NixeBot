@@ -55,6 +55,13 @@ except Exception:  # pragma: no cover
     Image = None
     np = None
 
+
+try:
+    # Optional safety filter to harden Gemini JSON outputs against deck/collection false positives.
+    from nixe.helpers.gemini_result_filters import apply_deck_hardening as _apply_deck_hardening
+except Exception:  # pragma: no cover
+    _apply_deck_hardening = None
+
 log = logging.getLogger("nixe.helpers.gemini_lpg_burst")
 
 
@@ -281,6 +288,7 @@ def _build_payload(image_bytes: bytes) -> dict:
         "- If the image clearly shows a single gacha result screen (one character or card with "
         "rarity stars and result UI), you may set lucky=true, and you MUST set "
         "screen_type='result_single_pull', is_multi_result_screen=false, and slot_count=1.\n"
+        "- If the screen shows 14 or more cards or items at once in a dense grid (like a deck or collection view), treat it as NOT a result screen: set lucky=false, use a screen_type containing 'deck' or 'collection', and set is_multi_result_screen=false even if it visually resembles a gacha UI.\n"
         "- If you are unsure, treat it as NOT a result screen (lucky=false).\n"
         f"- Negative UI phrases that strongly indicate NOT a result screen: {neg_txt}.\n"
         "Return ONLY the JSON object. No prose, no markdown."
@@ -312,6 +320,13 @@ def _parse_json(text: str):
             j = json.loads(m.group(0))
         except Exception:
             return False, 0.0, "bad_json", []
+    # Harden payload against deck/collection false positives if helper is available.
+    if _apply_deck_hardening is not None:
+        try:
+            j = _apply_deck_hardening(j)
+        except Exception:
+            # Safety: never let filter failures break classification.
+            pass
     lucky = bool(j.get("lucky", False))
     try:
         score = float(j.get("score", 0.0))

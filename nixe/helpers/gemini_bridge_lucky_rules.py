@@ -6,6 +6,27 @@ Strict Gemini classifier for Lucky Pull (image bytes only).
 """
 import os
 
+def _load_neg_text() -> list[str]:
+    """Load LPG_NEGATIVE_TEXT from env/runtime_env (JSON list or CSV).
+    Returns a cleaned list of phrases; safe if unset or malformed.
+    """
+    import json as _json
+    raw = (os.getenv("LPG_NEGATIVE_TEXT") or "").strip()
+    if not raw:
+        return []
+    # Try JSON list first
+    try:
+        obj = _json.loads(raw)
+        if isinstance(obj, (list, tuple)):
+            out = [str(x).strip() for x in obj if str(x).strip()]
+            if out:
+                return out
+    except Exception:
+        pass
+    # Fallback: comma-separated string
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
 # Lazy import to avoid hard dependency if library missing at import time
 def _lazy_client():
     try:
@@ -46,6 +67,16 @@ def classify_lucky_pull_bytes(img_bytes: bytes):
             "- Be conservative: if mixed or unsure, prefer not_lucky (confidence <= 0.4).\n"
             "- If it clearly shows 10-pull grid with stars/New badges -> lucky with high confidence (>=0.9)."
         )
+        neg = _load_neg_text()
+        if neg:
+            extra = (
+                "\n\nAdditional NOT_LUCKY UI contexts from config:"
+                "\n- Screens that mention or visually correspond to any of: "
+                + ", ".join(f'"{p}"' for p in neg)
+                + ". Treat these as inventory/loadout/deck/status screens, NOT gacha results."
+            )
+            system = system + extra
+
         prompt = "Classify the uploaded image strictly per the rubric. Output JSON only."
 
         # Construct Gemini call
@@ -68,7 +99,7 @@ def classify_lucky_pull_bytes(img_bytes: bytes):
         except Exception:
             # Fallback heuristic from plain text
             low = txt.lower()
-            if "not_lucky" in low or "not lucky" in low or "inventory" in low or "loadout" in low:
+            if ("not_lucky" in low or "not lucky" in low or "inventory" in low or "loadout" in low or "deck" in low or "card list" in low or "collection" in low or "save data" in low or "status screen" in low):
                 label, conf = "not_lucky", 0.3
             elif "lucky" in low or "gacha" in low:
                 label, conf = "lucky", 0.9

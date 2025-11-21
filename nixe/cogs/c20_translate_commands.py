@@ -30,6 +30,7 @@ from discord import app_commands
 from discord.ext import commands
 
 log = logging.getLogger(__name__)
+
 def _env(k: str, default: str = "") -> str:
     v = os.getenv(k)
     return v if v is not None and v != "" else default
@@ -52,31 +53,32 @@ def _as_bool(k: str, default: bool=False) -> bool:
 def _translate_ephemeral() -> bool:
     """Whether to send translate responses ephemeral; default False (public)."""
     return _as_bool('TRANSLATE_EPHEMERAL', False)
-def _parse_guild_ids(raw: str) -> list[int]:
-    gids: list[int] = []
-    for tok in re.split(r"[,\s]+", (raw or "").strip()):
-        if not tok:
-            continue
-        try:
-            gid = int(tok)
-        except Exception:
-            continue
-        if gid not in gids:
-            gids.append(gid)
-    return gids
 
 
 def _translate_guild_ids() -> list[int]:
-    """Parse guild IDs for guild-only Translate commands.
+    """Parse guild IDs for per-guild registration.
 
-    Supports legacy TRANSLATE_GUILD_ID and preferred TRANSLATE_GUILD_IDS.
-    If neither is set, returns [] to indicate auto-attach to all guilds
-    the bot is currently in.
+    Supports:
+    - TRANSLATE_GUILD_ID (legacy, comma/space separated)
+    - TRANSLATE_GUILD_IDS (preferred, comma/space separated)
+
+    If empty, setup() will fall back to all guilds the bot is currently in.
     """
-    raw_legacy = _env("TRANSLATE_GUILD_ID", "").strip()
-    raw_multi = _env("TRANSLATE_GUILD_IDS", "").strip()
-    raw = raw_legacy or raw_multi
-    return _parse_guild_ids(raw)
+    raw = (_env("TRANSLATE_GUILD_IDS", "").strip() or _env("TRANSLATE_GUILD_ID", "").strip())
+    if not raw:
+        return []
+    parts = re.split(r"[ ,;]+", raw)
+    gids: list[int] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            gids.append(int(p))
+        except Exception:
+            continue
+    return gids
+
 def _pretty_provider(tag: str) -> str:
     """Render provider tag like 'gemini' or 'groq' into a nice label."""
     t = (tag or '').lower()
@@ -85,33 +87,6 @@ def _pretty_provider(tag: str) -> str:
     if 'groq' in t:
         return 'Groq'
     return tag or 'unknown'
-def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
-    """Extract readable text from embeds (title, description, fields, footer)."""
-    parts: List[str] = []
-    for e in embeds or []:
-        if getattr(e, "title", None):
-            parts.append(str(e.title))
-        if getattr(e, "description", None):
-            parts.append(str(e.description))
-        for f in getattr(e, "fields", []) or []:
-            if getattr(f, "name", None):
-                parts.append(str(f.name))
-            if getattr(f, "value", None):
-                parts.append(str(f.value))
-        try:
-            if e.footer and e.footer.text:
-                parts.append(str(e.footer.text))
-        except Exception:
-            pass
-        try:
-            if e.author and e.author.name:
-                parts.append(str(e.author.name))
-        except Exception:
-            pass
-
-    text = "\n".join([p.strip() for p in parts if p and p.strip()])
-    return text.strip()
-
 
 
 def _split_chunks(text: str, max_chars: int) -> List[str]:
@@ -161,6 +136,29 @@ IMAGE_TRANSLATE_SYS_MSG = (
     + json.dumps(IMAGE_TRANSLATE_SCHEMA, ensure_ascii=False) + ". "
     "No markdown, no prose outside JSON."
 )
+
+def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
+    """Extract readable text from Discord embeds (title/description/fields)."""
+    parts: List[str] = []
+    for e in embeds or []:
+        try:
+            if e.title:
+                parts.append(str(e.title))
+            if e.description:
+                parts.append(str(e.description))
+            for f in getattr(e, "fields", []) or []:
+                if getattr(f, "name", None):
+                    parts.append(str(f.name))
+                if getattr(f, "value", None):
+                    parts.append(str(f.value))
+            if getattr(getattr(e, "footer", None), "text", None):
+                parts.append(str(e.footer.text))
+            if getattr(getattr(e, "author", None), "name", None):
+                parts.append(str(e.author.name))
+        except Exception:
+            continue
+    text = "\n".join([p.strip() for p in parts if p and p.strip()])
+    return text.strip()
 
 def _as_float(k: str, default: float) -> float:
     try:
@@ -317,102 +315,13 @@ async def _translate_groq(text: str, target_lang: str) -> Tuple[bool, str]:
         return True, out or "(empty)"
     except Exception as e:
         return False, f"Groq request failed: {e!r}"
+
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._last_call: Dict[int, float] = {}  # user_id -> monotonic seconds
-        self._registered_guilds: set[int] = set()
-        self._ready_once = False
-        self._fixed_guild_ids: set[int] = set()
-        self._autoguild = False  # set True when no guild IDs configured
+        self._last_call = {}  # user_id -> monotonic seconds
 
-    def set_target_guilds(self, gids: List[int]):
-        self._fixed_guild_ids = set(gids or [])
-        self._autoguild = not bool(self._fixed_guild_ids)
-
-    async def _add_commands_for_guild(self, gid: int) -> bool:
-        if not gid or gid in self._registered_guilds:
-            return False
-        gobj = discord.Object(id=gid)
-
-        # Remove any existing translate commands in this bot's tree before adding.
-        try:
-            for cmd in list(self.bot.tree.get_commands(type=discord.AppCommandType.message)):
-                if (cmd.name or '').lower().startswith('translate'):
-                    try:
-                        self.bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message, guild=gobj)
-                    except TypeError:
-                        self.bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
-        except Exception:
-            pass
-        try:
-            for cmd in list(self.bot.tree.get_commands(type=discord.AppCommandType.chat_input)):
-                if (cmd.name or '').lower().startswith('translate'):
-                    try:
-                        self.bot.tree.remove_command(cmd.name, type=discord.AppCommandType.chat_input, guild=gobj)
-                    except TypeError:
-                        self.bot.tree.remove_command(cmd.name, type=discord.AppCommandType.chat_input)
-        except Exception:
-            pass
-
-        menu_name = _env('TRANSLATE_MENU_NAME', 'Translate (Nixe)').strip() or 'Translate (Nixe)'
-        menu = app_commands.ContextMenu(name=menu_name, callback=self.translate_message_ctx)
-        self.bot.tree.add_command(menu, guild=gobj)
-
-        slash_name = (_env('TRANSLATE_SLASH_NAME', 'translate').strip().lower() or 'translate')
-        slash_desc = _env('TRANSLATE_SLASH_DESC', 'Translate text to the target language.').strip()
-        slash_cmd = app_commands.Command(name=slash_name, description=slash_desc, callback=self.translate_slash)
-        self.bot.tree.add_command(slash_cmd, guild=gobj)
-
-        self._registered_guilds.add(gid)
-        return True
-
-    async def _sync_guilds(self, gids: List[int], do_global: bool = True):
-        if do_global:
-            try:
-                await self.bot.tree.sync()
-            except Exception as e:
-                log.warning(f'[translate] global sync failed: {e!r}')
-        for gid in gids or []:
-            try:
-                await self.bot.tree.sync(guild=discord.Object(id=gid))
-            except Exception as e:
-                log.warning(f'[translate] guild sync failed gid={gid}: {e!r}')
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        if self._ready_once:
-            return
-        self._ready_once = True
-
-        if self._fixed_guild_ids:
-            gids = sorted(self._fixed_guild_ids)
-        else:
-            gids = [g.id for g in getattr(self.bot, 'guilds', [])]
-
-        for gid in gids:
-            try:
-                await self._add_commands_for_guild(gid)
-            except Exception as e:
-                log.warning(f'[translate] add commands failed gid={gid}: {e!r}')
-
-        # One-time sync to clear legacy commands and publish current ones.
-        await self._sync_guilds(gids, do_global=True)
-        total_msg = len(self.bot.tree.get_commands(type=discord.AppCommandType.message))
-        total_slash = len(self.bot.tree.get_commands(type=discord.AppCommandType.chat_input))
-        log.warning(f'[translate] ready: synced to {len(gids)} guild(s); msg={total_msg} slash={total_slash}')
-
-    @commands.Cog.listener()
-    async def on_guild_join(self, guild: discord.Guild):
-        if not self._autoguild:
-            return
-        gid = guild.id
-        try:
-            if await self._add_commands_for_guild(gid):
-                await self._sync_guilds([gid], do_global=False)
-        except Exception as e:
-            log.warning(f'[translate] on_guild_join failed gid={gid}: {e!r}')
-
+    def _cooldown_ok(self, user_id: int) -> Tuple[bool, float]:
         cd = _as_float("TRANSLATE_COOLDOWN_SEC", 5.0)
         now = asyncio.get_event_loop().time()
         last = self._last_call.get(user_id, 0.0)
@@ -421,7 +330,7 @@ class TranslateCommands(commands.Cog):
         self._last_call[user_id] = now
         return True, 0.0
 
-
+    async def _do_translate(self, text: str, target_lang: str) -> Tuple[bool, str, str]:
         provider = _pick_provider()
         if provider == "groq":
             ok, out = await _translate_groq(text, target_lang)
@@ -535,6 +444,7 @@ class TranslateCommands(commands.Cog):
         embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
         await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
 
+
 async def setup(bot: commands.Bot):
     # Allow runtime/env toggle. Default enabled.
     _en = _env('TRANSLATE_ENABLE', '1').strip().lower()
@@ -543,30 +453,77 @@ async def setup(bot: commands.Bot):
         return
 
     cog = TranslateCommands(bot)
-    gids_now = _translate_guild_ids()
-    cog.set_target_guilds(gids_now)
     await bot.add_cog(cog)
 
-    # Clean up legacy/duplicate translate commands from previous versions of THIS bot.
+    added_any = False
+
+    # Clean up legacy/duplicate message context menus from previous versions of THIS bot.
     try:
         for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
             if (cmd.name or '').lower().startswith('translate'):
                 bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
-    except Exception:
-        pass
-    try:
-        for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.chat_input)):
-            if (cmd.name or '').lower().startswith('translate'):
-                bot.tree.remove_command(cmd.name, type=discord.AppCommandType.chat_input)
+                added_any = True
     except Exception:
         pass
 
+
+    # Clean up legacy/duplicate slash commands from previous versions of THIS bot.
+    try:
+        for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.chat_input)):
+            if (cmd.name or "").lower().startswith("translate"):
+                bot.tree.remove_command(cmd.name, type=discord.AppCommandType.chat_input)
+    except Exception as e:
+        log.warning(f"[translate] legacy slash cleanup failed: {e!r}")
+
+    # Register message context menu as GUILD-ONLY to avoid global collisions.
+    gids_now = _translate_guild_ids()
+    if not gids_now:
+        try:
+            gids_now = [g.id for g in getattr(bot, "guilds", [])]
+            if gids_now:
+                log.warning(f"[translate] TRANSLATE_GUILD_ID(S) not set; falling back to all guilds ({len(gids_now)}).")
+        except Exception:
+            gids_now = []
+    if gids_now:
+        for gid in gids_now:
+            menu = app_commands.ContextMenu(
+                name="Translate (Nixe)",
+                callback=cog.translate_message_ctx,
+            )
+            bot.tree.add_command(menu, guild=discord.Object(id=gid))
+        added_any = True
+    else:
+        log.warning("[translate] No guild IDs configured for Translate (Nixe); command will not be registered.")
+
+    # Register /translate slash as GUILD-ONLY (same guild set as context menu).
     if gids_now:
         for gid in gids_now:
             try:
-                await cog._add_commands_for_guild(gid)
+                scmd = app_commands.Command(
+                    name="translate",
+                    description="Translate text (and optionally images via context menu).",
+                    callback=cog.translate_slash,
+                )
+                bot.tree.add_command(scmd, guild=discord.Object(id=gid))
             except Exception as e:
-                log.warning(f"[translate] pre-add commands failed gid={gid}: {e!r}")
-        log.warning(f"[translate] pre-registered Translate commands for {len(gids_now)} guild(s).")
-    else:
-        log.warning("[translate] No TRANSLATE_GUILD_ID/TRANSLATE_GUILD_IDS configured; will auto-register to all guilds on_ready.")
+                log.warning(f"[translate] failed to add slash command gid={gid}: {e!r}")
+        added_any = True
+
+    async def _sync_later():
+        try:
+            # First sync global tree (Translate is not added globally) to clear legacy global commands.
+            await bot.tree.sync()
+        except Exception as e:
+            log.warning(f"[translate] global sync failed: {e!r}")
+        # Then sync selected guild(s).
+        for gid in gids_now or []:
+            try:
+                await bot.tree.sync(guild=discord.Object(id=gid))
+            except Exception as e:
+                log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
+        total_cmds = len(bot.tree.get_commands(type=discord.AppCommandType.message))
+        log.warning(f"[translate] app commands guild-synced into {len(gids_now or [])} guild(s) (total={total_cmds})")
+
+    force_sync = bool(gids_now)
+    if added_any or force_sync or _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
+        bot.loop.create_task(_sync_later())

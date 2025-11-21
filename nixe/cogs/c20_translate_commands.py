@@ -134,42 +134,6 @@ IMAGE_TRANSLATE_SYS_MSG = (
     "No markdown, no prose outside JSON."
 )
 
-
-
-def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
-    """Extract readable text from Discord embeds for translation.
-
-    We include title, description, fields, author name, and footer text.
-    This is best-effort and safe to run on arbitrary embeds.
-    """
-    parts: List[str] = []
-    for e in embeds or []:
-        try:
-            if e.title:
-                parts.append(str(e.title))
-            if e.description:
-                parts.append(str(e.description))
-            for f in getattr(e, "fields", []) or []:
-                if getattr(f, "name", None):
-                    parts.append(str(f.name))
-                if getattr(f, "value", None):
-                    parts.append(str(f.value))
-            try:
-                if e.author and e.author.name:
-                    parts.append(str(e.author.name))
-            except Exception:
-                pass
-            try:
-                if e.footer and e.footer.text:
-                    parts.append(str(e.footer.text))
-            except Exception:
-                pass
-        except Exception:
-            # Never fail translation due to an embed parsing issue.
-            continue
-
-    text = "\n".join([p.strip() for p in parts if p and p.strip()])
-    return text.strip()
 def _as_float(k: str, default: float) -> float:
     try:
         return float(_env(k, str(default)))
@@ -465,41 +429,43 @@ async def setup(bot: commands.Bot):
 
     added_any = False
 
-# Clean up legacy/duplicate message context menus from previous versions of THIS bot.
-try:
-    for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
-        if (cmd.name or '').lower().startswith('translate'):
-            bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
-            added_any = True
-except Exception:
-    pass
-
-# Register message context menu as GUILD-ONLY to avoid global collisions.
-gids_now = _translate_guild_ids()
-if gids_now:
-    for gid in gids_now:
-        menu = app_commands.ContextMenu(
-            name="Translate (Nixe)",
-            callback=cog.translate_message_ctx,
-        )
-        bot.tree.add_command(menu, guild=discord.Object(id=gid))
-    added_any = True
-
-async def _sync_later():
+    # Clean up legacy/duplicate message context menus from previous versions of THIS bot.
     try:
-        # First sync global tree (Translate is not added globally) to clear legacy global commands.
-        await bot.tree.sync()
-    except Exception as e:
-        log.warning(f"[translate] global sync failed: {e!r}")
-    # Then sync selected guild(s).
-    for gid in gids_now or []:
-        try:
-            await bot.tree.sync(guild=discord.Object(id=gid))
-        except Exception as e:
-            log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
-    total_cmds = len(bot.tree.get_commands(type=discord.AppCommandType.message))
-    log.warning(f"[translate] app commands guild-synced into {len(gids_now or [])} guild(s) (total={total_cmds})")
+        for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
+            if (cmd.name or '').lower().startswith('translate'):
+                bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
+                added_any = True
+    except Exception:
+        pass
 
-force_sync = bool(gids_now)
-if added_any or force_sync or _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
-    bot.loop.create_task(_sync_later())
+    # Register message context menu as GUILD-ONLY to avoid global collisions.
+    gids_now = _translate_guild_ids()
+    if gids_now:
+        for gid in gids_now:
+            menu = app_commands.ContextMenu(
+                name="Translate (Nixe)",
+                callback=cog.translate_message_ctx,
+            )
+            bot.tree.add_command(menu, guild=discord.Object(id=gid))
+        added_any = True
+    else:
+        log.warning("[translate] No guild IDs configured for Translate (Nixe); command will not be registered.")
+
+    async def _sync_later():
+        try:
+            # First sync global tree (Translate is not added globally) to clear legacy global commands.
+            await bot.tree.sync()
+        except Exception as e:
+            log.warning(f"[translate] global sync failed: {e!r}")
+        # Then sync selected guild(s).
+        for gid in gids_now or []:
+            try:
+                await bot.tree.sync(guild=discord.Object(id=gid))
+            except Exception as e:
+                log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
+        total_cmds = len(bot.tree.get_commands(type=discord.AppCommandType.message))
+        log.warning(f"[translate] app commands guild-synced into {len(gids_now or [])} guild(s) (total={total_cmds})")
+
+    force_sync = bool(gids_now)
+    if added_any or force_sync or _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
+        bot.loop.create_task(_sync_later())

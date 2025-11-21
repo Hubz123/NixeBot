@@ -226,15 +226,10 @@ class TranslateCommands(commands.Cog):
         embed = discord.Embed(title="Translation", description=out)
         embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
         await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
+
+    @app_commands.command(name="translate", description="Translate a text using separate translate providers.")
     @app_commands.describe(text="Text to translate", target_lang="Target language code (default from env)")
     async def translate_slash(self, interaction: discord.Interaction, text: str, target_lang: Optional[str] = None):
-        if not _as_bool('TRANSLATE_ENABLE_SLASH', False):
-            await interaction.response.send_message(
-                "Slash /translate is disabled. Use Apps > Translate (message context menu).",
-                ephemeral=True,
-            )
-            return
-
         ok_cd, wait = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
             await interaction.response.send_message(f"Cooldown. Try again in {wait:.1f}s.", ephemeral=True)
@@ -268,7 +263,9 @@ async def setup(bot: commands.Bot):
     cog = TranslateCommands(bot)
     await bot.add_cog(cog)
 
-    # Register message context menu
+    added_any = False
+
+    # Register message context menu (Apps > Translate)
     try:
         menu = app_commands.ContextMenu(
             name="Translate",
@@ -276,27 +273,36 @@ async def setup(bot: commands.Bot):
         )
         if not any(cmd.name == "Translate" for cmd in bot.tree.get_commands(type=discord.AppCommandType.message)):
             bot.tree.add_command(menu)
+            added_any = True
     except Exception:
         log.debug("[translate] context menu registration skipped", exc_info=True)
 
-    # Optional one-time sync if user enables it
-    # Optional slash command registration (default OFF; prefer Apps > Translate)
+    # Disable slash by default (Apps-first). Enable only if TRANSLATE_ENABLE_SLASH=1
     try:
-        if _as_bool('TRANSLATE_ENABLE_SLASH', False):
-            slash = app_commands.Command(
-                name='translate',
-                description='Translate a text using separate translate providers.',
-                callback=cog.translate_slash,
-            )
-            if not any(cmd.name == 'translate' for cmd in bot.tree.get_commands(type=discord.AppCommandType.chat_input)):
-                bot.tree.add_command(slash)
-                log.warning('[translate] slash /translate registered')
+        enable_slash = _env("TRANSLATE_ENABLE_SLASH", "0") == "1"
+        if not enable_slash:
+            # best-effort remove chat_input command named "translate"
+            for cmd in bot.tree.get_commands(type=discord.AppCommandType.chat_input):
+                if cmd.name == "translate":
+                    bot.tree.remove_command("translate", type=discord.AppCommandType.chat_input)
+                    added_any = True  # treat as change so we sync
+                    log.warning("[translate] slash /translate disabled (Apps-first)")
+                    break
     except Exception:
-        log.debug('[translate] slash registration skipped', exc_info=True)
+        log.debug("[translate] slash disable skipped", exc_info=True)
 
+    # Auto-sync only when something changed, or when TRANSLATE_SYNC_ON_BOOT=1
     try:
-        if _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
-            await bot.tree.sync()
-            log.warning("[translate] app commands synced on boot")
+        force_sync = _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1"
+        if added_any or force_sync:
+            async def _sync_later():
+                await bot.wait_until_ready()
+                try:
+                    synced = await bot.tree.sync()
+                    log.warning("[translate] app commands synced (%d)", len(synced))
+                except Exception:
+                    log.debug("[translate] tree.sync failed", exc_info=True)
+
+            bot.loop.create_task(_sync_later())
     except Exception:
-        log.debug("[translate] tree.sync skipped", exc_info=True)
+        log.debug("[translate] tree.sync scheduling skipped", exc_info=True)

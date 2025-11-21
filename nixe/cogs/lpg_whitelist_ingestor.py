@@ -93,7 +93,6 @@ class LPGWhitelistIngestor(commands.Cog):
             return {"attachments": []}
 
     def _save_db(self, data: Dict[str, Any]) -> None:
-(self, data: Dict[str, Any]) -> None:
         try:
             self._ensure_dir(self.db_path)
             with open(self.db_path, "w", encoding="utf-8") as f:

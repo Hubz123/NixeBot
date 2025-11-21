@@ -54,6 +54,28 @@ def _translate_ephemeral() -> bool:
     """Whether to send translate responses ephemeral; default False (public)."""
     return _as_bool('TRANSLATE_EPHEMERAL', False)
 
+
+def _translate_guild_ids() -> list[int]:
+    """Parse guild IDs for fast per-guild sync (optional).
+
+    Set TRANSLATE_GUILD_ID to a comma/space separated list of guild IDs to sync
+    commands immediately into those guilds.
+    """
+    raw = _env('TRANSLATE_GUILD_ID', '').strip()
+    if not raw:
+        return [761163966030151701]
+    parts = re.split(r'[ ,;]+', raw)
+    gids: list[int] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            gids.append(int(p))
+        except Exception:
+            continue
+    return gids
+
 def _pretty_provider(tag: str) -> str:
     """Render provider tag like 'gemini' or 'groq' into a nice label."""
     t = (tag or '').lower()
@@ -298,8 +320,24 @@ async def setup(bot: commands.Bot):
             async def _sync_later():
                 await bot.wait_until_ready()
                 try:
-                    synced = await bot.tree.sync()
-                    log.warning("[translate] app commands synced (%d)", len(synced))
+                    gids = _translate_guild_ids()
+                    if gids:
+                        total = 0
+                        for gid in gids:
+                            g = discord.Object(id=gid)
+                            try:
+                                bot.tree.copy_global_to(guild=g)
+                            except Exception:
+                                pass
+                            try:
+                                ss = await bot.tree.sync(guild=g)
+                                total += len(ss)
+                            except Exception:
+                                log.debug("[translate] tree.sync(guild=%s) failed", gid, exc_info=True)
+                        log.warning("[translate] app commands guild-synced into %s guild(s) (total=%d)", len(gids), total)
+                    else:
+                        synced = await bot.tree.sync()
+                        log.warning("[translate] app commands synced (%d)", len(synced))
                 except Exception:
                     log.debug("[translate] tree.sync failed", exc_info=True)
 

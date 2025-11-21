@@ -1,28 +1,37 @@
 """
 c20_translate_commands.py
 
-Add-only cog:
-- Adds a Message Context Menu command "Translate" and a slash command /translate.
-- Uses separate API keys so it does NOT touch existing LPG Gemini or Phish Groq keys.
+Translate cog (guild-only, add-only):
+- Provides Message Context Menu "Translate (Nixe)" and optional /translate slash.
+- Supports translating plain text, embeds (when message content is empty or only a URL),
+  and images via Gemini Vision OCR + translation.
+- Uses separate API keys (TRANSLATE_*) so it does NOT touch LPG Gemini or Phish Groq keys.
 
-Secrets (put in .env only):
+Secrets (.env only):
   TRANSLATE_GEMINI_API_KEY=...
   TRANSLATE_GROQ_API_KEY=...
 
 Optional configs (runtime_env.json or env):
+  TRANSLATE_ENABLE=1
   TRANSLATE_PROVIDER=gemini|groq   (default: gemini if key present else groq)
   TRANSLATE_TARGET_LANG=id        (default: id)
   TRANSLATE_GEMINI_MODEL=gemini-2.5-flash-lite
   TRANSLATE_GROQ_MODEL=llama-3.1-8b-instant
+  TRANSLATE_IMAGE_MODEL=gemini-2.5-flash
+  TRANSLATE_TIMEOUT_SEC=12
   TRANSLATE_MAX_CHARS=1800
   TRANSLATE_COOLDOWN_SEC=5
-  TRANSLATE_SYNC_ON_BOOT=0        (set 1 once if you need to sync app commands)
-  TRANSLATE_ALLOW_FALLBACK=0      (set 1 to allow fallback to GEMINI_API_KEY / GROQ_API_KEY)
+  TRANSLATE_EPHEMERAL=1
+  TRANSLATE_CTX_NAME="Translate (Nixe)"
+  TRANSLATE_SLASH_ENABLE=1
+  TRANSLATE_GUILD_ID=<single guild id>
+  TRANSLATE_GUILD_IDS=<comma separated ids>
+  TRANSLATE_ALLOW_FALLBACK=1  (allow fallback to GEMINI_API_KEY / GEMINI_API_KEY_B)
 """
 
 from __future__ import annotations
 
-import os, json, logging, re, asyncio
+import os, json, logging, re, asyncio, base64
 from typing import Optional, Tuple, List, Dict, Any
 
 import discord
@@ -31,202 +40,128 @@ from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-def _env(k: str, default: str = "") -> str:
-    v = os.getenv(k)
-    return v if v is not None and v != "" else default
+# -------------------------
+# small helpers
+# -------------------------
 
-def _as_int(k: str, default: int) -> int:
+def _env(key: str, default: str = "") -> str:
+    return os.getenv(key, default)
+
+def _as_bool(key: str, default: bool = False) -> bool:
+    v = _env(key, "1" if default else "0").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+def _as_float(key: str, default: float = 0.0) -> float:
     try:
-        return int(float(_env(k, str(default))))
+        return float(_env(key, str(default)))
     except Exception:
         return default
 
+def _clean_output(s: str) -> str:
+    s = s.strip()
+    # strip code fences if model adds them
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", s)
+        s = re.sub(r"\n?```$", "", s)
+    return s.strip()
 
-def _as_bool(k: str, default: bool=False) -> bool:
-    v = _env(k, str(int(default))).strip().lower()
-    if v in ('1','true','yes','on','enable','enabled'):
-        return True
-    if v in ('0','false','no','off','disable','disabled'):
-        return False
-    return default
-
-def _translate_ephemeral() -> bool:
-    """Whether to send translate responses ephemeral; default False (public)."""
-    return _as_bool('TRANSLATE_EPHEMERAL', False)
-
-
-def _translate_guild_ids() -> list[int]:
-    """Parse guild IDs for per-guild registration.
-
-    Supports:
-    - TRANSLATE_GUILD_ID (legacy, comma/space separated)
-    - TRANSLATE_GUILD_IDS (preferred, comma/space separated)
-
-    If empty, setup() will fall back to all guilds the bot is currently in.
-    """
-    raw = (_env("TRANSLATE_GUILD_IDS", "").strip() or _env("TRANSLATE_GUILD_ID", "").strip())
-    if not raw:
-        return []
-    parts = re.split(r"[ ,;]+", raw)
-    gids: list[int] = []
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        try:
-            gids.append(int(p))
-        except Exception:
-            continue
-    return gids
-
-def _pretty_provider(tag: str) -> str:
-    """Render provider tag like 'gemini' or 'groq' into a nice label."""
-    t = (tag or '').lower()
-    if 'gemini' in t:
-        return 'Gemini'
-    if 'groq' in t:
-        return 'Groq'
-    return tag or 'unknown'
-
-
-def _split_chunks(text: str, max_chars: int) -> List[str]:
-    """Split text into <=max_chars chunks, preserving paragraphs when possible."""
-    text=(text or "").strip()
-    if not text or max_chars<=0:
-        return []
-    if len(text)<=max_chars:
+def _chunk_text(text: str, max_chars: int) -> List[str]:
+    if len(text) <= max_chars:
         return [text]
-    paras=text.split("\n\n")
-    chunks: List[str]=[]
-    buf=""
-    for p in paras:
-        p=p.strip()
-        if not p: 
-            continue
-        cand=(buf+"\n\n"+p) if buf else p
-        if len(cand)<=max_chars:
-            buf=cand
+    chunks: List[str] = []
+    buf = ""
+    for p in text.split("\n\n"):
+        cand = (buf + "\n\n" + p) if buf else p
+        if len(cand) <= max_chars:
+            buf = cand
             continue
         if buf:
-            chunks.append(buf); buf=""
-        if len(p)>max_chars:
-            for k in range(0,len(p),max_chars):
+            chunks.append(buf); buf = ""
+        if len(p) > max_chars:
+            for k in range(0, len(p), max_chars):
                 chunks.append(p[k:k+max_chars])
         else:
-            buf=p
-    if buf: chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
     return chunks
 
-
-# JSON schema for image OCR+translation output (Gemini Vision).
-IMAGE_TRANSLATE_SCHEMA = {
-    "ok": True,
-    "text": "<detected text from image>",
-    "translation": "<translated text>",
-    "source_lang": "<auto-detected source lang>",
-    "target_lang": "<target>",
-    "reason": "<short reason or notes>"
-}
-
-IMAGE_TRANSLATE_SYS_MSG = (
-    "You are an OCR+translation engine. "
-    "First read all visible text in the image accurately. "
-    "Then translate it to the requested target language. "
-    "Return ONLY compact JSON matching this schema: "
-    + json.dumps(IMAGE_TRANSLATE_SCHEMA, ensure_ascii=False) + ". "
-    "No markdown, no prose outside JSON."
-)
+def _looks_like_only_urls(text: str) -> bool:
+    if not text:
+        return True
+    t = re.sub(r"https?://\S+", " ", text, flags=re.I)
+    t = re.sub(r"[\W_]+", " ", t)
+    return len(t.strip()) == 0
 
 def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
-    """Extract readable text from Discord embeds.
+    """Extract readable text from embeds, preferring description."""
+    parts: List[str] = []
+    for e in embeds or []:
+        if e.description:
+            parts.append(str(e.description))
 
-    Priority:
-    1) descriptions
-    2) field values
-    3) titles / author / footer (only if needed)
+        # fields as fallback
+        for f in getattr(e, "fields", []) or []:
+            if getattr(f, "value", None):
+                parts.append(str(f.value))
 
-    Also strips obvious platform/meta noise and URLs.
-    """
-    if not embeds:
-        return ""
-
-    desc_parts: List[str] = []
-    field_parts: List[str] = []
-    meta_parts: List[str] = []
-
-    for e in embeds:
+        # title/author/footer only if still empty later
+        if e.title:
+            parts.append(str(e.title))
         try:
-            if getattr(e, "description", None):
-                desc_parts.append(str(e.description))
-            for f in getattr(e, "fields", []) or []:
-                if getattr(f, "value", None):
-                    field_parts.append(str(f.value))
-            if getattr(e, "title", None):
-                meta_parts.append(str(e.title))
-            try:
-                if e.author and getattr(e.author, "name", None):
-                    meta_parts.append(str(e.author.name))
-            except Exception:
-                pass
-            try:
-                if e.footer and getattr(e.footer, "text", None):
-                    meta_parts.append(str(e.footer.text))
-            except Exception:
-                pass
+            if e.author and e.author.name:
+                parts.append(str(e.author.name))
         except Exception:
+            pass
+        try:
+            if e.footer and e.footer.text:
+                parts.append(str(e.footer.text))
+        except Exception:
+            pass
+
+    text = "\n".join(p.strip() for p in parts if p and p.strip())
+    # light cleaning for common platform noise
+    cleaned: List[str] = []
+    for line in text.splitlines():
+        ln = line.strip()
+        if not ln:
             continue
+        if re.fullmatch(r"https?://\S+", ln, flags=re.I):
+            continue
+        if ln.lower() in ("x", "twitter", "view on x", "open in x"):
+            continue
+        if re.fullmatch(r"@\w+", ln):
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
 
-    raw = "\n".join([p for p in (desc_parts + field_parts + (meta_parts if not desc_parts and not field_parts else [])) if p])
-
-    def _clean_extracted_text(text: str) -> str:
-        # Split into lines and clean obvious noise.
-        out_lines: List[str] = []
-        seen: set = set()
-        for ln in (text or "").splitlines():
-            s = ln.strip()
-            if not s:
+def _translate_guild_ids() -> List[int]:
+    # new format
+    raw = _env("TRANSLATE_GUILD_IDS", "").strip()
+    if raw:
+        out: List[int] = []
+        for tok in raw.split(","):
+            tok = tok.strip()
+            if not tok:
                 continue
-            # Drop URLs / link-only lines
-            if re.fullmatch(r"https?://\S+", s, flags=re.I):
-                continue
-            # Drop very short non-informative lines (e.g., "X", "…")
-            if len(s) <= 2 and not re.search(r"[A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff]", s):
-                continue
-            # Drop common platform/meta labels
-            if re.fullmatch(r"(?i)(x|twitter|view on x|view on twitter|open in browser|posted on x)", s):
-                continue
-            # Drop handle-only / author boilerplate
-            if re.fullmatch(r"@\w{1,32}", s):
-                continue
-            if re.fullmatch(r".*\(@\w{1,32}\).*", s) and len(s) < 80:
-                # Likely author/header line, skip unless it contains substantial text
-                continue
-
-            key = s.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out_lines.append(s)
-
-        return "\n".join(out_lines).strip()
-
-    cleaned = _clean_extracted_text(raw)
-    return cleaned
-def _as_float(k: str, default: float) -> float:
-    try:
-        return float(_env(k, str(default)))
-    except Exception:
-        return default
-
-def _is_secret_key(k: str) -> bool:
-    u = k.upper()
-    return u.endswith("_TOKEN") or u.endswith("_API_KEY") or u.endswith("_SECRET")
+            try:
+                out.append(int(tok))
+            except Exception:
+                pass
+        return out
+    # legacy single id
+    raw2 = _env("TRANSLATE_GUILD_ID", "").strip()
+    if raw2:
+        try:
+            return [int(raw2)]
+        except Exception:
+            return []
+    return []
 
 def _pick_provider() -> str:
-    p = _env("TRANSLATE_PROVIDER", "").lower().strip()
-    if p in ("gemini", "groq"):
-        return p
-    # auto pick by available keys
+    pv = _env("TRANSLATE_PROVIDER", "").strip().lower()
+    if pv in ("gemini", "groq"):
+        return pv
     if _pick_gemini_key():
         return "gemini"
     if _pick_groq_key():
@@ -237,7 +172,7 @@ def _pick_gemini_key() -> str:
     key = _env("TRANSLATE_GEMINI_API_KEY", "")
     if key:
         return key
-    if _env("TRANSLATE_ALLOW_FALLBACK", "0") == "1":
+    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
         return _env("GEMINI_API_KEY", _env("GEMINI_API_KEY_B", _env("GEMINI_BACKUP_API_KEY", "")))
     return ""
 
@@ -245,41 +180,36 @@ def _pick_groq_key() -> str:
     key = _env("TRANSLATE_GROQ_API_KEY", "")
     if key:
         return key
-    if _env("TRANSLATE_ALLOW_FALLBACK", "0") == "1":
+    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
         return _env("GROQ_API_KEY", "")
     return ""
 
-def _clean_output(s: str) -> str:
-    s = (s or "").strip()
-    # strip code fences if present
-    if s.startswith("```"):
-        s = re.sub(r"^```\w*\n|```$", "", s, flags=re.S).strip()
-    # strip surrounding quotes
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1].strip()
-    return s
+# -------------------------
+# Gemini / Groq text translate
+# -------------------------
 
-async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
-    import aiohttp
+async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_gemini_key()
     if not key:
-        return False, "No TRANSLATE_GEMINI_API_KEY configured."
-    model = _env("TRANSLATE_GEMINI_MODEL", _env("GEMINI_MODEL", "gemini-2.5-flash-lite"))
-    prompt = (
-        f"Translate the following text to {target_lang}. "
-        "Return ONLY the translated text, no explanations, no quotes, no markdown.\n\n"
-        f"TEXT:\n{text}"
+        return False, "missing TRANSLATE_GEMINI_API_KEY"
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
+    sys_msg = _env(
+        "TRANSLATE_SYS_MSG",
+        f"You are a translation engine. Translate user text to {target_lang}. "
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [{"text": prompt}]
-        }],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
-    }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    timeout = aiohttp.ClientTimeout(total=_as_float("TRANSLATE_TIMEOUT_SEC", 12.0))
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
+        ],
+        "generationConfig": {"temperature": 0.2},
+    }
+
     try:
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=_as_float("TRANSLATE_TIMEOUT_SEC", 12.0))
         async with aiohttp.ClientSession(timeout=timeout) as s:
             async with s.post(url, json=payload) as resp:
                 raw = await resp.text()
@@ -293,66 +223,32 @@ async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
                     if "text" in p:
                         out += p["text"]
                 out = _clean_output(out)
-                return True, out or "(empty)"
+                # accept JSON or plain text fallback
+                try:
+                    j = json.loads(out)
+                    out2 = str(j.get("translation", "") or out)
+                    return True, out2.strip() or "(empty)"
+                except Exception:
+                    return True, out or "(empty)"
     except Exception as e:
         return False, f"Gemini request failed: {e!r}"
 
-
-async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
-    """OCR + translate an image using Gemini Vision. Returns ok, detected_text, translated_text, reason."""
-    try:
-        from google import genai  # type: ignore
-    except Exception as e:
-        return False, "", "", f"gemini sdk missing: {e!r}"
-
-    key = _env("TRANSLATE_GEMINI_API_KEY", "")
-    if not key and _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        key = _env("GEMINI_API_KEY", "")
-    if not key:
-        return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
-
-    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
-    try:
-        client = genai.Client(api_key=key)
-        resp = client.models.generate_content(
-            model=model,
-            contents=[{
-                "role": "user",
-                "parts": [
-                    {"text": IMAGE_TRANSLATE_SYS_MSG + f" Target language: {target_lang}."},
-                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
-                ],
-            }],
-        )
-        raw = _clean_output((resp.text or "").strip())
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return True, raw, raw, "non_json_output"
-        detected = str(data.get("text", "") or "")
-        translated = str(data.get("translation", "") or "")
-        reason = str(data.get("reason", "") or "ok")
-        return True, detected, translated, reason
-    except Exception as e:
-        return False, "", "", f"gemini vision failed: {e!r}"
-
-async def _translate_groq(text: str, target_lang: str) -> Tuple[bool, str]:
+async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
     if not key:
-        return False, "No TRANSLATE_GROQ_API_KEY configured."
-    model = _env("TRANSLATE_GROQ_MODEL", _env("GROQ_MODEL_TEXT", _env("GROQ_MODEL", "llama-3.1-8b-instant")))
+        return False, "missing TRANSLATE_GROQ_API_KEY"
+    model = _env("TRANSLATE_GROQ_MODEL", "llama-3.1-8b-instant")
+    sys_msg = (
+        f"You are a translation engine. Translate user text to {target_lang}. "
+        "Output ONLY the translation, no commentary."
+    )
     try:
-        from groq import Groq
-    except Exception:
-        Groq = None
-    if Groq is None:
-        return False, "Groq SDK not available in this environment."
+        from groq import Groq  # type: ignore
+    except Exception as e:
+        return False, f"Groq SDK missing: {e!r}"
+
     try:
         client = Groq(api_key=key)
-        sys_msg = (
-            f"You are a translation engine. Translate user text to {target_lang}. "
-            "Output ONLY the translation, no commentary."
-        )
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -360,31 +256,96 @@ async def _translate_groq(text: str, target_lang: str) -> Tuple[bool, str]:
                 {"role": "user", "content": text},
             ],
             temperature=0.2,
-            max_tokens=2000,
         )
-        out = resp.choices[0].message.content if resp.choices else ""
-        out = _clean_output(out)
+        out = (resp.choices[0].message.content or "").strip()
         return True, out or "(empty)"
     except Exception as e:
         return False, f"Groq request failed: {e!r}"
 
-def _looks_like_only_urls(text: str) -> bool:
-    """Return True if text contains no human text besides URLs."""
-    if not text:
-        return True
-    # Remove markdown angle brackets and whitespace
-    t = text.strip()
-    # Strip URLs
-    t = re.sub(r"https?://\S+", " ", t, flags=re.IGNORECASE)
-    # Strip leftover punctuation/symbols
-    t = re.sub(r"[\W_]+", " ", t, flags=re.UNICODE)
-    return len(t.strip()) == 0
+# -------------------------
+# Gemini Vision OCR + translate image
+# -------------------------
 
+def _detect_image_mime(image_bytes: bytes) -> str:
+    # quick magic
+    if image_bytes[:4] == b"\x89PNG":
+        return "image/png"
+    if image_bytes[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if image_bytes[:3] == b"GIF":
+        return "image/gif"
+    return "image/png"
+
+async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
+    """
+    OCR+translate an image using Gemini Vision REST API.
+
+    Note: We intentionally avoid the google-genai SDK here because several environments
+    (including yours) ship with an httpx version that is incompatible with recent SDK
+    releases, causing noisy follow_redirects / destructor errors. REST is stable.
+    """
+    key = _pick_gemini_key()
+    if not key:
+        return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
+    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
+    schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
+    prompt = (
+        "You are an OCR+translation engine.\n"
+        "1) Extract all readable text from the image.\n"
+        f"2) Translate it to {target_lang}.\n"
+        f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+        "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
+    )
+    mime = _detect_image_mime(image_bytes)
+
+    try:
+        import aiohttp
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    }},
+                ],
+            }],
+            "generationConfig": {"temperature": 0.2},
+        }
+        timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json(content_type=None)
+
+        candidates = data.get("candidates") or []
+        parts = []
+        if candidates:
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+        out = ""
+        for p in parts:
+            if isinstance(p, dict) and "text" in p:
+                out += str(p["text"])
+        out = _clean_output(out)
+        try:
+            j = json.loads(out)
+        except Exception:
+            return True, out, out, "non_json_output"
+        detected = str(j.get("text", "") or "")
+        translated = str(j.get("translation", "") or "")
+        reason = str(j.get("reason", "") or "ok")
+        return True, detected, translated, reason
+    except Exception as e:
+        return False, "", "", f"vision_failed:{e!r}"
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._last_call = {}  # user_id -> monotonic seconds
-        self._registered = False  # ensure commands registered once after ready
+        self._last_call: Dict[int, float] = {}
+        self._registered = False
+        self._register_lock = asyncio.Lock()
 
     def _cooldown_ok(self, user_id: int) -> Tuple[bool, float]:
         cd = _as_float("TRANSLATE_COOLDOWN_SEC", 5.0)
@@ -394,109 +355,128 @@ class TranslateCommands(commands.Cog):
             return False, cd - (now - last)
         self._last_call[user_id] = now
         return True, 0.0
+
     async def _ensure_registered(self):
-        """Register context menu and slash commands after the bot is ready.
-
-        In n38, setup may run before guild cache is populated (Render cold boot),
-        so we defer registration to avoid empty guild list and CommandNotFound.
-        """
-        if self._registered:
+        if not _as_bool("TRANSLATE_ENABLE", True):
             return
-        try:
+        async with self._register_lock:
+            if self._registered:
+                return
             await self.bot.wait_until_ready()
-        except Exception:
-            # If wait_until_ready fails, still attempt with current cache.
-            pass
 
-        gids_now = _translate_guild_ids()
-        if not gids_now:
-            gids_now = [g.id for g in getattr(self.bot, "guilds", [])]
+            gids = _translate_guild_ids()
+            if not gids:
+                gids = [g.id for g in getattr(self.bot, "guilds", [])]
 
-        if not gids_now:
-            log.warning("[translate] no guild IDs available after ready; skipping registration")
-            return
+            ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
 
-        # Clean up legacy/duplicate commands from previous versions of THIS bot.
-        try:
-            for cmd in list(self.bot.tree.get_commands(type=discord.AppCommandType.message)):
-                if (cmd.name or "").lower().startswith("translate"):
-                    self.bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
-        except Exception as e:
-            log.warning(f"[translate] cleanup legacy ctx failed: {e!r}")
-
-        try:
-            for cmd in list(self.bot.tree.get_commands()):
-                if (cmd.name or "").lower().startswith("translate"):
-                    self.bot.tree.remove_command(cmd.name)
-        except Exception as e:
-            log.warning(f"[translate] cleanup legacy slash failed: {e!r}")
-
-        ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
-        slash_enable = _env("TRANSLATE_SLASH_ENABLE", "1").strip() not in ("0", "false", "no", "off")
-
-        added_any = False
-        for gid in gids_now:
+            # cleanup translate* commands from this bot
             try:
-                mcmd = app_commands.ContextMenu(
-                    name=ctx_name,
-                    callback=self.translate_message_ctx,
-                )
-                self.bot.tree.add_command(mcmd, guild=discord.Object(id=gid))
-                added_any = True
-            except Exception as e:
-                log.warning(f"[translate] failed to add ctx menu gid={gid}: {e!r}")
+                for cmd in list(self.bot.tree.get_commands()):
+                    if cmd.name.lower().startswith("translate"):
+                        try:
+                            self.bot.tree.remove_command(cmd.name, type=cmd.type)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
-            if slash_enable:
+            # add commands per guild
+            for gid in gids:
+                gobj = discord.Object(id=gid)
                 try:
-                    scmd = app_commands.Command(
-                        name="translate",
-                        description="Translate text, embeds, or images",
-                        callback=self.translate_slash,
+                    # remove any per-guild leftovers
+                    for cmd in list(self.bot.tree.get_commands(guild=gobj)):
+                        if cmd.name.lower().startswith("translate"):
+                            try:
+                                self.bot.tree.remove_command(cmd.name, type=cmd.type, guild=gobj)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                try:
+                    self.bot.tree.add_command(
+                        app_commands.ContextMenu(name=ctx_name, callback=self.translate_message_ctx),
+                        guild=gobj,
                     )
-                    self.bot.tree.add_command(scmd, guild=discord.Object(id=gid))
-                    added_any = True
-                except Exception as e:
-                    log.warning(f"[translate] failed to add slash command gid={gid}: {e!r}")
+                except Exception:
+                    pass
 
-        async def _sync_later():
-            try:
-                await self.bot.tree.sync()  # clear legacy global
-            except Exception as e:
-                log.warning(f"[translate] global sync failed: {e!r}")
-            for gid in gids_now:
+                if _as_bool("TRANSLATE_SLASH_ENABLE", True):
+                    try:
+                        self.bot.tree.add_command(self.translate_slash, guild=gobj)
+                    except Exception:
+                        pass
+
+            # sync once global to flush legacy, then per guild
+            if _as_bool("TRANSLATE_SYNC_ON_BOOT", True):
                 try:
-                    await self.bot.tree.sync(guild=discord.Object(id=gid))
+                    await self.bot.tree.sync()
                 except Exception as e:
-                    log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
-            total_cmds = len(self.bot.tree.get_commands(type=discord.AppCommandType.message))
-            log.warning(f"[translate] app commands guild-synced into {len(gids_now)} guild(s) (total={total_cmds})")
+                    log.warning("[translate] global sync failed: %r", e)
+                for gid in gids:
+                    try:
+                        await self.bot.tree.sync(guild=discord.Object(id=gid))
+                    except Exception as e:
+                        log.warning("[translate] guild sync failed gid=%s: %r", gid, e)
 
-        try:
-            self.bot.loop.create_task(_sync_later())
-        except Exception as e:
-            log.warning(f"[translate] failed to schedule sync: {e!r}")
+            self._registered = True
+            log.info("[translate] registered ctx+slash to gids=%s", gids)
 
-        self._registered = bool(added_any)
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # ensure commands registered after ready (Render-safe)
+        if not self._registered:
+            self.bot.loop.create_task(self._ensure_registered())
 
-    async def _do_translate(self, text: str, target_lang: str) -> Tuple[bool, str, str]:
-        provider = _pick_provider()
-        if provider == "groq":
-            ok, out = await _translate_groq(text, target_lang)
-            return ok, out, "groq"
-        ok, out = await _translate_gemini(text, target_lang)
-        return ok, out, "gemini"
-
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild):
+        if _translate_guild_ids():
+            return  # explicit list; don't auto-add
+        self._registered = False
+        self.bot.loop.create_task(self._ensure_registered())
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
-        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
-        if not ok_cd:
-            await interaction.response.send_message(
-                f"Cooldown. Try again in {wait_s:.1f}s.",
-                ephemeral=True
-            )
+        if not _as_bool("TRANSLATE_ENABLE", True):
+            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
             return
 
-        # Collect text candidates from content and embeds (Twitter/YouTube previews).
+        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
+        if not ok_cd:
+            await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
+            return
+
+        ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+
+        target = _env("TRANSLATE_TARGET_LANG", "id").strip() or "id"
+
+        # image path
+        image_bytes: Optional[bytes] = None
+        if message.attachments:
+            att = message.attachments[0]
+            fn = (att.filename or "").lower()
+            if any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                try:
+                    image_bytes = await att.read()
+                except Exception:
+                    image_bytes = None
+
+        if image_bytes:
+            ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
+            if not ok:
+                await interaction.followup.send(reason, ephemeral=ephemeral)
+                return
+            emb = discord.Embed(title="Translation (Image)")
+            if detected:
+                emb.add_field(name="Detected Text", value=detected[:1024], inline=False)
+            emb.add_field(name=f"Translation → {target}", value=translated[:1024] or "(empty)", inline=False)
+            emb.set_footer(text=f"Translated by Gemini • target={target} • {reason}")
+            await interaction.followup.send(embed=emb, ephemeral=ephemeral)
+            return
+
+        # text / embeds
         raw_text = (message.content or "").strip()
         text = raw_text
         if message.embeds and (not raw_text or _looks_like_only_urls(raw_text)):
@@ -505,109 +485,73 @@ class TranslateCommands(commands.Cog):
             if emb_text:
                 text = emb_text
 
-        # If still no text, but there is an image attachment, OCR+translate the image.
-        image_bytes: Optional[bytes] = None
-        if not text and message.attachments:
-            for a in message.attachments:
-                fn = (a.filename or "").lower()
-                if any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
-                    try:
-                        b = await a.read()
-                        if b:
-                            image_bytes = b
-                            break
-                    except Exception:
-                        continue
+        if not text:
+            await interaction.followup.send("No text to translate.", ephemeral=ephemeral)
+            return
 
-        target = _env("TRANSLATE_TARGET_LANG", "id").strip()
+        provider = _pick_provider()
+        max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
+        chunks = _chunk_text(text, max_chars)
 
-        # Image path
-        if image_bytes is not None and not text:
-            await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
-            ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
+        for idx, ch in enumerate(chunks, 1):
+            if provider == "groq":
+                ok, out = await _groq_translate_text(ch, target)
+            else:
+                ok, out = await _gemini_translate_text(ch, target)
+
             if not ok:
-                await interaction.followup.send(translated or reason, ephemeral=_translate_ephemeral())
+                await interaction.followup.send(out, ephemeral=ephemeral)
                 return
 
-            desc = translated or "(empty)"
-            embed = discord.Embed(title="Translation (Image)", description=desc)
-            if detected:
-                embed.add_field(name="Detected Text", value=detected[:1024], inline=False)
-            embed.set_footer(text=f"Translated by Gemini • target={target}")
-            await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
+            emb = discord.Embed(title="Translation")
+            emb.description = out[:4096]
+            if len(chunks) > 1:
+                emb.set_footer(text=f"Part {idx}/{len(chunks)} • Translated by {provider} • target={target}")
+            else:
+                emb.set_footer(text=f"Translated by {provider} • target={target}")
+            await interaction.followup.send(embed=emb, ephemeral=ephemeral)
+
+    @app_commands.command(name="translate", description="Translate text to target language")
+    @app_commands.describe(text="Text to translate", target="Target language code, e.g. id, en, ja")
+    async def translate_slash(self, interaction: discord.Interaction, text: str, target: Optional[str] = None):
+        if not _as_bool("TRANSLATE_ENABLE", True):
+            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
             return
 
-        # Text path
-        text = (text or "").strip()
-        if not text:
-            await interaction.response.send_message("No text found to translate in that message.", ephemeral=True)
-            return
-
-        max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
-        chunks = _split_chunks(text, max_chars)
-        if not chunks:
-            await interaction.response.send_message("Text is empty.", ephemeral=True)
-            return
-
-        if len(chunks) > 1:
-            await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
-            total = len(chunks)
-            for idx, ch in enumerate(chunks, start=1):
-                ok, out, prov = await self._do_translate(ch, target)
-                if not ok:
-                    await interaction.followup.send(out, ephemeral=_translate_ephemeral())
-                    return
-                embed = discord.Embed(title=f"Translation ({idx}/{total})", description=out)
-                embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-                await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
-            return
-
-        ok, out, prov = await self._do_translate(chunks[0], target)
-        if not ok:
-            await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
-            return
-
-        embed = discord.Embed(title="Translation", description=out)
-        embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-        await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
-
-    async def translate_slash(self, interaction: discord.Interaction, text: str, target_lang: Optional[str] = None):
-        ok_cd, wait = self._cooldown_ok(interaction.user.id)
+        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
-            await interaction.response.send_message(f"Cooldown. Try again in {wait:.1f}s.", ephemeral=True)
+            await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
             return
 
-        text = (text or "").strip()
-        if not text:
-            await interaction.response.send_message("Text is empty.", ephemeral=True)
-            return
+        ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
 
-        max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
-        if len(text) > max_chars:
-            text = text[:max_chars] + "…"
+        tgt = (target or _env("TRANSLATE_TARGET_LANG", "id")).strip() or "id"
+        provider = _pick_provider()
+        max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
+        chunks = _chunk_text(text, max_chars)
 
-        target = (target_lang or _env("TRANSLATE_TARGET_LANG", "id")).strip()
-        ok, out, prov = await self._do_translate(text, target)
-        if not ok:
-            await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
-            return
-        embed = discord.Embed(title="Translation", description=out)
-        embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-        await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
+        for idx, ch in enumerate(chunks, 1):
+            if provider == "groq":
+                ok, out = await _groq_translate_text(ch, tgt)
+            else:
+                ok, out = await _gemini_translate_text(ch, tgt)
+
+            if not ok:
+                await interaction.followup.send(out, ephemeral=ephemeral)
+                return
+
+            emb = discord.Embed(title="Translation")
+            emb.description = out[:4096]
+            if len(chunks) > 1:
+                emb.set_footer(text=f"Part {idx}/{len(chunks)} • Translated by {provider} • target={tgt}")
+            else:
+                emb.set_footer(text=f"Translated by {provider} • target={tgt}")
+            await interaction.followup.send(embed=emb, ephemeral=ephemeral)
 
 
 async def setup(bot: commands.Bot):
-    # Allow runtime/env toggle. Default enabled.
-    _en = _env('TRANSLATE_ENABLE', '1').strip().lower()
-    if _en in ('0','false','no','off','disable','disabled'):
-        log.warning('[translate] disabled via TRANSLATE_ENABLE=0')
-        return
-
     cog = TranslateCommands(bot)
     await bot.add_cog(cog)
-
-    # Defer command registration until the bot is ready (guild cache populated).
-    try:
-        bot.loop.create_task(cog._ensure_registered())
-    except Exception as e:
-        log.warning(f"[translate] failed to schedule registration: {e!r}")
+    # register after ready
+    bot.loop.create_task(cog._ensure_registered())

@@ -320,6 +320,7 @@ class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_call = {}  # user_id -> monotonic seconds
+        self._registered = False  # ensure commands registered once after ready
 
     def _cooldown_ok(self, user_id: int) -> Tuple[bool, float]:
         cd = _as_float("TRANSLATE_COOLDOWN_SEC", 5.0)
@@ -329,6 +330,89 @@ class TranslateCommands(commands.Cog):
             return False, cd - (now - last)
         self._last_call[user_id] = now
         return True, 0.0
+    async def _ensure_registered(self):
+        """Register context menu and slash commands after the bot is ready.
+
+        In n38, setup may run before guild cache is populated (Render cold boot),
+        so we defer registration to avoid empty guild list and CommandNotFound.
+        """
+        if self._registered:
+            return
+        try:
+            await self.bot.wait_until_ready()
+        except Exception:
+            # If wait_until_ready fails, still attempt with current cache.
+            pass
+
+        gids_now = _translate_guild_ids()
+        if not gids_now:
+            gids_now = [g.id for g in getattr(self.bot, "guilds", [])]
+
+        if not gids_now:
+            log.warning("[translate] no guild IDs available after ready; skipping registration")
+            return
+
+        # Clean up legacy/duplicate commands from previous versions of THIS bot.
+        try:
+            for cmd in list(self.bot.tree.get_commands(type=discord.AppCommandType.message)):
+                if (cmd.name or "").lower().startswith("translate"):
+                    self.bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
+        except Exception as e:
+            log.warning(f"[translate] cleanup legacy ctx failed: {e!r}")
+
+        try:
+            for cmd in list(self.bot.tree.get_commands()):
+                if (cmd.name or "").lower().startswith("translate"):
+                    self.bot.tree.remove_command(cmd.name)
+        except Exception as e:
+            log.warning(f"[translate] cleanup legacy slash failed: {e!r}")
+
+        ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
+        slash_enable = _env("TRANSLATE_SLASH_ENABLE", "1").strip() not in ("0", "false", "no", "off")
+
+        added_any = False
+        for gid in gids_now:
+            try:
+                mcmd = app_commands.ContextMenu(
+                    name=ctx_name,
+                    callback=self.translate_message_ctx,
+                )
+                self.bot.tree.add_command(mcmd, guild=discord.Object(id=gid))
+                added_any = True
+            except Exception as e:
+                log.warning(f"[translate] failed to add ctx menu gid={gid}: {e!r}")
+
+            if slash_enable:
+                try:
+                    scmd = app_commands.Command(
+                        name="translate",
+                        description="Translate text, embeds, or images",
+                        callback=self.translate_slash,
+                    )
+                    self.bot.tree.add_command(scmd, guild=discord.Object(id=gid))
+                    added_any = True
+                except Exception as e:
+                    log.warning(f"[translate] failed to add slash command gid={gid}: {e!r}")
+
+        async def _sync_later():
+            try:
+                await self.bot.tree.sync()  # clear legacy global
+            except Exception as e:
+                log.warning(f"[translate] global sync failed: {e!r}")
+            for gid in gids_now:
+                try:
+                    await self.bot.tree.sync(guild=discord.Object(id=gid))
+                except Exception as e:
+                    log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
+            total_cmds = len(self.bot.tree.get_commands(type=discord.AppCommandType.message))
+            log.warning(f"[translate] app commands guild-synced into {len(gids_now)} guild(s) (total={total_cmds})")
+
+        try:
+            self.bot.loop.create_task(_sync_later())
+        except Exception as e:
+            log.warning(f"[translate] failed to schedule sync: {e!r}")
+
+        self._registered = bool(added_any)
 
     async def _do_translate(self, text: str, target_lang: str) -> Tuple[bool, str, str]:
         provider = _pick_provider()
@@ -455,75 +539,8 @@ async def setup(bot: commands.Bot):
     cog = TranslateCommands(bot)
     await bot.add_cog(cog)
 
-    added_any = False
-
-    # Clean up legacy/duplicate message context menus from previous versions of THIS bot.
+    # Defer command registration until the bot is ready (guild cache populated).
     try:
-        for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
-            if (cmd.name or '').lower().startswith('translate'):
-                bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
-                added_any = True
-    except Exception:
-        pass
-
-
-    # Clean up legacy/duplicate slash commands from previous versions of THIS bot.
-    try:
-        for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.chat_input)):
-            if (cmd.name or "").lower().startswith("translate"):
-                bot.tree.remove_command(cmd.name, type=discord.AppCommandType.chat_input)
+        bot.loop.create_task(cog._ensure_registered())
     except Exception as e:
-        log.warning(f"[translate] legacy slash cleanup failed: {e!r}")
-
-    # Register message context menu as GUILD-ONLY to avoid global collisions.
-    gids_now = _translate_guild_ids()
-    if not gids_now:
-        try:
-            gids_now = [g.id for g in getattr(bot, "guilds", [])]
-            if gids_now:
-                log.warning(f"[translate] TRANSLATE_GUILD_ID(S) not set; falling back to all guilds ({len(gids_now)}).")
-        except Exception:
-            gids_now = []
-    if gids_now:
-        for gid in gids_now:
-            menu = app_commands.ContextMenu(
-                name="Translate (Nixe)",
-                callback=cog.translate_message_ctx,
-            )
-            bot.tree.add_command(menu, guild=discord.Object(id=gid))
-        added_any = True
-    else:
-        log.warning("[translate] No guild IDs configured for Translate (Nixe); command will not be registered.")
-
-    # Register /translate slash as GUILD-ONLY (same guild set as context menu).
-    if gids_now:
-        for gid in gids_now:
-            try:
-                scmd = app_commands.Command(
-                    name="translate",
-                    description="Translate text (and optionally images via context menu).",
-                    callback=cog.translate_slash,
-                )
-                bot.tree.add_command(scmd, guild=discord.Object(id=gid))
-            except Exception as e:
-                log.warning(f"[translate] failed to add slash command gid={gid}: {e!r}")
-        added_any = True
-
-    async def _sync_later():
-        try:
-            # First sync global tree (Translate is not added globally) to clear legacy global commands.
-            await bot.tree.sync()
-        except Exception as e:
-            log.warning(f"[translate] global sync failed: {e!r}")
-        # Then sync selected guild(s).
-        for gid in gids_now or []:
-            try:
-                await bot.tree.sync(guild=discord.Object(id=gid))
-            except Exception as e:
-                log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
-        total_cmds = len(bot.tree.get_commands(type=discord.AppCommandType.message))
-        log.warning(f"[translate] app commands guild-synced into {len(gids_now or [])} guild(s) (total={total_cmds})")
-
-    force_sync = bool(gids_now)
-    if added_any or force_sync or _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
-        bot.loop.create_task(_sync_later())
+        log.warning(f"[translate] failed to schedule registration: {e!r}")

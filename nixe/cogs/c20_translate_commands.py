@@ -132,39 +132,6 @@ def _clean_output(s: str) -> str:
         s = s[1:-1].strip()
     return s
 
-
-def _split_chunks(text: str, max_chars: int) -> list[str]:
-    """Split text into <=max_chars chunks, preserving paragraphs when possible."""
-    text = text.strip()
-    if not text or max_chars <= 0:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-    # First split by double-newline (paragraphs)
-    paras = text.split("\n\n")
-    chunks: list[str] = []
-    buf = ""
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-        candidate = (buf + "\n\n" + p) if buf else p
-        if len(candidate) <= max_chars:
-            buf = candidate
-            continue
-        if buf:
-            chunks.append(buf)
-            buf = ""
-        # If a single paragraph is too big, hard-slice it
-        if len(p) > max_chars:
-            for i in range(0, len(p), max_chars):
-                chunks.append(p[i:i+max_chars])
-        else:
-            buf = p
-    if buf:
-        chunks.append(buf)
-    return chunks
-
 async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
     import aiohttp
     key = _pick_gemini_key()
@@ -267,27 +234,13 @@ class TranslateCommands(commands.Cog):
         if not text:
             await interaction.response.send_message("No text found to translate in that message.", ephemeral=True)
             return
+
         max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
-        chunks = _split_chunks(text, max_chars)
-        if not chunks:
-            await interaction.response.send_message("Text is empty.", ephemeral=True)
-            return
+        if len(text) > max_chars:
+            text = text[:max_chars] + "…"
 
         target = _env("TRANSLATE_TARGET_LANG", "id")
-        if len(chunks) > 1:
-            await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
-            total = len(chunks)
-            for idx, ch in enumerate(chunks, start=1):
-                ok, out, prov = await self._do_translate(ch, target)
-                if not ok:
-                    await interaction.followup.send(out, ephemeral=_translate_ephemeral())
-                    return
-                embed = discord.Embed(title=f"Translation ({idx}/{total})", description=out)
-                embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-                await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
-            return
-
-        ok, out, prov = await self._do_translate(chunks[0], target)
+        ok, out, prov = await self._do_translate(text, target)
         if not ok:
             await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
             return
@@ -308,27 +261,13 @@ class TranslateCommands(commands.Cog):
         if not text:
             await interaction.response.send_message("Text is empty.", ephemeral=True)
             return
+
         max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
-        chunks = _split_chunks(text, max_chars)
-        if not chunks:
-            await interaction.response.send_message("Text is empty.", ephemeral=True)
-            return
+        if len(text) > max_chars:
+            text = text[:max_chars] + "…"
 
         target = (target_lang or _env("TRANSLATE_TARGET_LANG", "id")).strip()
-        if len(chunks) > 1:
-            await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
-            total = len(chunks)
-            for idx, ch in enumerate(chunks, start=1):
-                ok, out, prov = await self._do_translate(ch, target)
-                if not ok:
-                    await interaction.followup.send(out, ephemeral=_translate_ephemeral())
-                    return
-                embed = discord.Embed(title=f"Translation ({idx}/{total})", description=out)
-                embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-                await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
-            return
-
-        ok, out, prov = await self._do_translate(chunks[0], target)
+        ok, out, prov = await self._do_translate(text, target)
         if not ok:
             await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
             return
@@ -348,10 +287,11 @@ async def setup(bot: commands.Bot):
 
     added_any = False
 
-    # Clean up legacy/duplicate context menus from previous versions.
+    # Clean up legacy/duplicate context menus from previous versions of THIS bot.
+    # Safe even if other bots have similarly named commands.
     try:
         for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
-            if cmd.name in ("Translate", "Translate (Nixe)"):
+            if (cmd.name or '').lower().startswith('translate'):
                 bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
                 added_any = True
     except Exception:
@@ -411,6 +351,9 @@ async def setup(bot: commands.Bot):
                 except Exception:
                     log.debug("[translate] tree.sync failed", exc_info=True)
 
-            bot.loop.create_task(_sync_later())
+            gids_now = _translate_guild_ids()
+            force_sync = bool(gids_now)
+            if added_any or force_sync or _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
+                bot.loop.create_task(_sync_later())
     except Exception:
         log.debug("[translate] tree.sync scheduling skipped", exc_info=True)

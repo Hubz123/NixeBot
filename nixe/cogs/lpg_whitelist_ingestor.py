@@ -61,13 +61,39 @@ class LPGWhitelistIngestor(commands.Cog):
             pass
 
     def _load_db(self) -> Dict[str, Any]:
+        """Load persisted whitelist DB.
+
+        Supports legacy formats (list-only) and self-heals corrupt shapes.
+        Always returns a dict with key 'attachments' -> list.
+        """
         try:
             with open(self.db_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                raw = json.load(f)
+            # Legacy: file was just a list of entries
+            if isinstance(raw, list):
+                log.warning("[lpg-wl-ingest] legacy db format (list) detected; normalizing to dict")
+                return {"attachments": raw}
+            if isinstance(raw, dict):
+                # Some older shapes may store the list under a different key
+                if "attachments" not in raw:
+                    for k in ("items", "data", "whitelist", "images"):
+                        if k in raw and isinstance(raw[k], list):
+                            log.warning("[lpg-wl-ingest] db missing 'attachments'; using '%s' list and normalizing", k)
+                            return {"attachments": raw[k]}
+                    raw["attachments"] = []
+                # Self-heal if attachments is not a list
+                if not isinstance(raw.get("attachments"), list):
+                    log.warning("[lpg-wl-ingest] db 'attachments' is not a list; resetting")
+                    raw["attachments"] = []
+                return raw
+            # Unknown type
+            log.warning("[lpg-wl-ingest] db has unexpected type %s; resetting", type(raw).__name__)
+            return {"attachments": []}
         except Exception:
             return {"attachments": []}
 
     def _save_db(self, data: Dict[str, Any]) -> None:
+(self, data: Dict[str, Any]) -> None:
         try:
             self._ensure_dir(self.db_path)
             with open(self.db_path, "w", encoding="utf-8") as f:
@@ -121,7 +147,9 @@ class LPGWhitelistIngestor(commands.Cog):
             return 0
 
         data = self._load_db()
-        items: List[Dict[str, Any]] = data.get("attachments", [])
+        if isinstance(data, list):
+            data = {"attachments": data}
+        items: List[Dict[str, Any]] = (data or {}).get("attachments", [])
         seen = {(it.get("message_id"), it.get("attachment_id")) for it in items}
         added = 0
 

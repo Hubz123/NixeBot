@@ -22,7 +22,7 @@ Optional configs (runtime_env.json or env):
 
 from __future__ import annotations
 
-import os, json, logging, re, asyncio, base64
+import os, json, logging, re, asyncio
 from typing import Optional, Tuple, List, Dict, Any
 
 import discord
@@ -85,6 +85,27 @@ def _pretty_provider(tag: str) -> str:
         return 'Groq'
     return tag or 'unknown'
 
+
+
+# JSON schema for image OCR+translation output (Gemini Vision).
+IMAGE_TRANSLATE_SCHEMA = {
+    "ok": True,
+    "text": "<detected text from image>",
+    "translation": "<translated text>",
+    "source_lang": "<auto-detected source lang>",
+    "target_lang": "<target>",
+    "reason": "<short reason or notes>"
+}
+
+IMAGE_TRANSLATE_SYS_MSG = (
+    "You are an OCR+translation engine. "
+    "First read all visible text in the image accurately. "
+    "Then translate it to the requested target language. "
+    "Return ONLY compact JSON matching this schema: "
+    + json.dumps(IMAGE_TRANSLATE_SCHEMA, ensure_ascii=False) + ". "
+    "No markdown, no prose outside JSON."
+)
+
 def _as_float(k: str, default: float) -> float:
     try:
         return float(_env(k, str(default)))
@@ -132,6 +153,8 @@ def _clean_output(s: str) -> str:
         s = s[1:-1].strip()
     return s
 
+
+
 def _split_chunks(text: str, max_chars: int) -> List[str]:
     """Split text into <=max_chars chunks, preserving paragraphs when possible."""
     text = (text or "").strip()
@@ -146,22 +169,46 @@ def _split_chunks(text: str, max_chars: int) -> List[str]:
         p = p.strip()
         if not p:
             continue
-        candidate = (buf + "\n\n" + p) if buf else p
-        if len(candidate) <= max_chars:
-            buf = candidate
+        cand = (buf + "\n\n" + p) if buf else p
+        if len(cand) <= max_chars:
+            buf = cand
             continue
         if buf:
             chunks.append(buf)
             buf = ""
         if len(p) > max_chars:
-            for i in range(0, len(p), max_chars):
-                chunks.append(p[i:i+max_chars])
+            for k in range(0, len(p), max_chars):
+                chunks.append(p[k:k+max_chars])
         else:
             buf = p
     if buf:
         chunks.append(buf)
     return chunks
 
+
+
+def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
+    """Best-effort extraction of text from Discord embeds (Twitter/YouTube previews, etc.)."""
+    parts: List[str] = []
+    for e in embeds or []:
+        try:
+            if getattr(e, "title", None):
+                parts.append(str(e.title))
+            if getattr(e, "description", None):
+                parts.append(str(e.description))
+            if getattr(e, "author", None) and getattr(e.author, "name", None):
+                parts.append(str(e.author.name))
+            for f in getattr(e, "fields", []) or []:
+                if getattr(f, "name", None):
+                    parts.append(str(f.name))
+                if getattr(f, "value", None):
+                    parts.append(str(f.value))
+            if getattr(e, "footer", None) and getattr(e.footer, "text", None):
+                parts.append(str(e.footer.text))
+        except Exception:
+            continue
+    text = "\n".join([p for p in parts if p and not str(p).strip().startswith("http")])
+    return text.strip()
 
 async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
     import aiohttp
@@ -202,47 +249,46 @@ async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
         return False, f"Gemini request failed: {e!r}"
 
 
-async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str]:
-    """OCR + translate text from an image using Gemini Vision (separate translate key)."""
-    import aiohttp
-    key = _pick_gemini_key()
-    if not key:
-        return False, "No TRANSLATE_GEMINI_API_KEY configured (required for image translate)."
 
-    model = _env("TRANSLATE_GEMINI_VISION_MODEL",
-                 _env("GEMINI_VISION_MODEL",
-                      _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")))
-    mime = _env("TRANSLATE_IMAGE_MIME", "image/png")
-    b64 = base64.b64encode(image_bytes).decode("ascii")
-    prompt = (
-        f"Extract all visible text from this image and translate it to {target_lang}. "
-        "Return ONLY the translated text, no explanations, no markdown, no quotes."
-    )
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"text": prompt},
-                {"inlineData": {"mimeType": mime, "data": b64}},
-            ]
-        }],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2000}
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
+    """OCR + translate an image using Gemini Vision. Returns ok, detected_text, translated_text, reason."""
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=_as_float("TRANSLATE_IMAGE_TIMEOUT_SEC", 20.0))) as s:
-            async with s.post(url, json=payload) as r:
-                if r.status != 200:
-                    txt = await r.text()
-                    return False, f"Gemini vision http_error={r.status}: {txt[:200]}"
-                data = await r.json()
-        cand = (data.get("candidates") or [{}])[0]
-        parts = (((cand.get("content") or {}).get("parts")) or [])
-        out = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
-        out = _clean_output(out)
-        return True, out or "(empty)"
+        from google import genai  # type: ignore
     except Exception as e:
-        return False, f"Gemini vision request failed: {e!r}"
+        return False, "", "", f"gemini sdk missing: {e!r}"
+
+    key = _env("TRANSLATE_GEMINI_API_KEY", "")
+    if not key and _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
+        key = _env("GEMINI_API_KEY", "")
+    if not key:
+        return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
+
+    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
+    try:
+        client = genai.Client(api_key=key)
+        resp = client.models.generate_content(
+            model=model,
+            contents=[
+                {"role": "user", "parts": [
+                    {"text": IMAGE_TRANSLATE_SYS_MSG + f" Target language: {target_lang}."},
+                    {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
+                ]},
+            ],
+        )
+        raw = (resp.text or "").strip()
+        raw = _clean_output(raw)
+        try:
+            data = json.loads(raw)
+        except Exception:
+            # Non-JSON fallback; treat raw as both detected and translated
+            return True, raw, raw, "non_json_output"
+
+        detected = str(data.get("text", "") or "")
+        translated = str(data.get("translation", "") or "")
+        reason = str(data.get("reason", "") or "ok")
+        return True, detected, translated, reason
+    except Exception as e:
+        return False, "", "", f"gemini vision failed: {e!r}"
 
 async def _translate_groq(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
@@ -298,73 +344,87 @@ class TranslateCommands(commands.Cog):
         ok, out = await _translate_gemini(text, target_lang)
         return ok, out, "gemini"
 
-    async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
-        ok_cd, wait = self._cooldown_ok(interaction.user.id)
-        if not ok_cd:
-            await interaction.response.send_message(f"Cooldown. Try again in {wait:.1f}s.", ephemeral=True)
-            return
 
-        text = (message.content or "").strip()
-        att = message.attachments[0] if message.attachments else None
-        has_image = bool(att and (att.content_type or "").startswith("image/"))
-
-        target = _env("TRANSLATE_TARGET_LANG", "id")
-        max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
-
-        # If text is empty but an image is attached, OCR+translate the image.
-        if not text and has_image:
-            try:
-                max_bytes = _as_int("TRANSLATE_IMAGE_MAX_BYTES", 7500000)
-                b = await att.read()
-                if len(b) > max_bytes:
-                    await interaction.response.send_message(f"Image too large for translate (> {max_bytes} bytes).", ephemeral=True)
-                    return
-                ok, out = await _translate_image_gemini(b, target)
-                prov = "gemini-vision"
-            except Exception as e:
-                await interaction.response.send_message(f"Image read failed: {e!r}", ephemeral=True)
-                return
-            if not ok:
-                await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
-                return
-            embed = discord.Embed(title="Translation (Image)", description=out)
-            embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-            await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
-            return
-
-        if not text:
-            await interaction.response.send_message("No text found to translate in that message.", ephemeral=True)
-            return
-
-        chunks = _split_chunks(text, max_chars)
-        if not chunks:
-            await interaction.response.send_message("Text is empty.", ephemeral=True)
-            return
-
-        if len(chunks) > 1:
-            await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
-            total = len(chunks)
-            for idx, ch in enumerate(chunks, start=1):
-                ok, out, prov = await self._do_translate(ch, target)
-                if not ok:
-                    await interaction.followup.send(out, ephemeral=_translate_ephemeral())
-                    return
-                embed = discord.Embed(title=f"Translation ({idx}/{total})", description=out)
-                embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-                await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
-            return
-
-        ok, out, prov = await self._do_translate(chunks[0], target)
-        if not ok:
-            await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
-            return
-        embed = discord.Embed(title="Translation", description=out)
-        embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-        await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
+async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
+    ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
+    if not ok_cd:
+        await interaction.response.send_message(
+            f"Cooldown. Try again in {wait_s:.1f}s.",
+            ephemeral=True
+        )
         return
 
-    @app_commands.command(name="translate", description="Translate a text using separate translate providers.")
-    @app_commands.describe(text="Text to translate", target_lang="Target language code (default from env)")
+    # Collect text candidates from content and embeds (Twitter/YouTube previews).
+    text = (message.content or "").strip()
+    if not text and message.embeds:
+        emb_list = [e for e in message.embeds if isinstance(e, discord.Embed)]
+        text = _extract_text_from_embeds(emb_list)
+
+    # If still no text, but there is an image attachment, OCR+translate the image.
+    image_bytes: Optional[bytes] = None
+    if not text and message.attachments:
+        for a in message.attachments:
+            fn = (a.filename or "").lower()
+            if any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                try:
+                    b = await a.read()
+                    if b:
+                        image_bytes = b
+                        break
+                except Exception:
+                    continue
+
+    target = _env("TRANSLATE_TARGET_LANG", "id").strip()
+
+    # Image path
+    if image_bytes is not None and not text:
+        await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
+        ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
+        if not ok:
+            await interaction.followup.send(translated or reason, ephemeral=_translate_ephemeral())
+            return
+
+        desc = translated or "(empty)"
+        embed = discord.Embed(title="Translation (Image)", description=desc)
+        if detected:
+            embed.add_field(name="Detected Text", value=detected[:1024], inline=False)
+        embed.set_footer(text=f"Translated by Gemini • target={target}")
+        await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
+        return
+
+    # Text path (content or embeds)
+    text = (text or "").strip()
+    if not text:
+        await interaction.response.send_message("No text found to translate in that message.", ephemeral=True)
+        return
+
+    max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
+    chunks = _split_chunks(text, max_chars)
+    if not chunks:
+        await interaction.response.send_message("Text is empty.", ephemeral=True)
+        return
+
+    if len(chunks) > 1:
+        await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
+        total = len(chunks)
+        for idx, ch in enumerate(chunks, start=1):
+            ok, out, prov = await self._do_translate(ch, target)
+            if not ok:
+                await interaction.followup.send(out, ephemeral=_translate_ephemeral())
+                return
+            embed = discord.Embed(title=f"Translation ({idx}/{total})", description=out)
+            embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
+            await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
+        return
+
+    ok, out, prov = await self._do_translate(chunks[0], target)
+    if not ok:
+        await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
+        return
+
+    embed = discord.Embed(title="Translation", description=out)
+    embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
+    await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
     async def translate_slash(self, interaction: discord.Interaction, text: str, target_lang: Optional[str] = None):
         ok_cd, wait = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
@@ -377,30 +437,18 @@ class TranslateCommands(commands.Cog):
             return
 
         max_chars = _as_int("TRANSLATE_MAX_CHARS", 1800)
-        chunks = _split_chunks(text, max_chars)
-        if len(chunks) > 1:
-            await interaction.response.defer(ephemeral=_translate_ephemeral(), thinking=True)
-            total = len(chunks)
-            target = (target_lang or _env("TRANSLATE_TARGET_LANG", "id")).strip()
-            for idx, ch in enumerate(chunks, start=1):
-                ok, out, prov = await self._do_translate(ch, target)
-                if not ok:
-                    await interaction.followup.send(out, ephemeral=_translate_ephemeral())
-                    return
-                embed = discord.Embed(title=f"Translation ({idx}/{total})", description=out)
-                embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
-                await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
-            return
+        if len(text) > max_chars:
+            text = text[:max_chars] + "…"
 
         target = (target_lang or _env("TRANSLATE_TARGET_LANG", "id")).strip()
-        ok, out, prov = await self._do_translate(chunks[0], target)
+        ok, out, prov = await self._do_translate(text, target)
         if not ok:
             await interaction.response.send_message(out, ephemeral=_translate_ephemeral())
             return
         embed = discord.Embed(title="Translation", description=out)
         embed.set_footer(text=f"Translated by {_pretty_provider(prov)} • target={target}")
         await interaction.response.send_message(embed=embed, ephemeral=_translate_ephemeral())
-        return
+
 async def setup(bot: commands.Bot):
     # Allow runtime/env toggle. Default enabled.
     _en = _env('TRANSLATE_ENABLE', '1').strip().lower()
@@ -413,22 +461,23 @@ async def setup(bot: commands.Bot):
 
     added_any = False
 
-    # Clean up legacy/duplicate message context menus from previous versions of THIS bot.
-    try:
-        for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
-            if (cmd.name or "").lower().startswith("translate"):
-                bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
-                added_any = True
-    except Exception:
-        pass
+
+# Clean up legacy/duplicate message context menus from previous versions of THIS bot.
+try:
+    for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
+        if (cmd.name or '').lower().startswith('translate'):
+            bot.tree.remove_command(cmd.name, type=discord.AppCommandType.message)
+            added_any = True
+except Exception:
+    pass
 
     # Register message context menu (Apps > Translate)
     try:
         menu = app_commands.ContextMenu(
-            name="Translate (Nixe)",
+            name="Translate",
             callback=cog.translate_message_ctx,
         )
-        if not any(cmd.name == "Translate (Nixe)" for cmd in bot.tree.get_commands(type=discord.AppCommandType.message)):
+        if not any(cmd.name == "Translate" for cmd in bot.tree.get_commands(type=discord.AppCommandType.message)):
             bot.tree.add_command(menu)
             added_any = True
     except Exception:

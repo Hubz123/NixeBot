@@ -86,6 +86,34 @@ def _pretty_provider(tag: str) -> str:
     return tag or 'unknown'
 
 
+def _split_chunks(text: str, max_chars: int) -> List[str]:
+    """Split text into <=max_chars chunks, preserving paragraphs when possible."""
+    text=(text or "").strip()
+    if not text or max_chars<=0:
+        return []
+    if len(text)<=max_chars:
+        return [text]
+    paras=text.split("\n\n")
+    chunks: List[str]=[]
+    buf=""
+    for p in paras:
+        p=p.strip()
+        if not p: 
+            continue
+        cand=(buf+"\n\n"+p) if buf else p
+        if len(cand)<=max_chars:
+            buf=cand
+            continue
+        if buf:
+            chunks.append(buf); buf=""
+        if len(p)>max_chars:
+            for k in range(0,len(p),max_chars):
+                chunks.append(p[k:k+max_chars])
+        else:
+            buf=p
+    if buf: chunks.append(buf)
+    return chunks
+
 
 # JSON schema for image OCR+translation output (Gemini Vision).
 IMAGE_TRANSLATE_SCHEMA = {
@@ -106,6 +134,42 @@ IMAGE_TRANSLATE_SYS_MSG = (
     "No markdown, no prose outside JSON."
 )
 
+
+
+def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
+    """Extract readable text from Discord embeds for translation.
+
+    We include title, description, fields, author name, and footer text.
+    This is best-effort and safe to run on arbitrary embeds.
+    """
+    parts: List[str] = []
+    for e in embeds or []:
+        try:
+            if e.title:
+                parts.append(str(e.title))
+            if e.description:
+                parts.append(str(e.description))
+            for f in getattr(e, "fields", []) or []:
+                if getattr(f, "name", None):
+                    parts.append(str(f.name))
+                if getattr(f, "value", None):
+                    parts.append(str(f.value))
+            try:
+                if e.author and e.author.name:
+                    parts.append(str(e.author.name))
+            except Exception:
+                pass
+            try:
+                if e.footer and e.footer.text:
+                    parts.append(str(e.footer.text))
+            except Exception:
+                pass
+        except Exception:
+            # Never fail translation due to an embed parsing issue.
+            continue
+
+    text = "\n".join([p.strip() for p in parts if p and p.strip()])
+    return text.strip()
 def _as_float(k: str, default: float) -> float:
     try:
         return float(_env(k, str(default)))
@@ -153,63 +217,6 @@ def _clean_output(s: str) -> str:
         s = s[1:-1].strip()
     return s
 
-
-
-def _split_chunks(text: str, max_chars: int) -> List[str]:
-    """Split text into <=max_chars chunks, preserving paragraphs when possible."""
-    text = (text or "").strip()
-    if not text or max_chars <= 0:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-    paras = text.split("\n\n")
-    chunks: List[str] = []
-    buf = ""
-    for p in paras:
-        p = p.strip()
-        if not p:
-            continue
-        cand = (buf + "\n\n" + p) if buf else p
-        if len(cand) <= max_chars:
-            buf = cand
-            continue
-        if buf:
-            chunks.append(buf)
-            buf = ""
-        if len(p) > max_chars:
-            for k in range(0, len(p), max_chars):
-                chunks.append(p[k:k+max_chars])
-        else:
-            buf = p
-    if buf:
-        chunks.append(buf)
-    return chunks
-
-
-
-def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
-    """Best-effort extraction of text from Discord embeds (Twitter/YouTube previews, etc.)."""
-    parts: List[str] = []
-    for e in embeds or []:
-        try:
-            if getattr(e, "title", None):
-                parts.append(str(e.title))
-            if getattr(e, "description", None):
-                parts.append(str(e.description))
-            if getattr(e, "author", None) and getattr(e.author, "name", None):
-                parts.append(str(e.author.name))
-            for f in getattr(e, "fields", []) or []:
-                if getattr(f, "name", None):
-                    parts.append(str(f.name))
-                if getattr(f, "value", None):
-                    parts.append(str(f.value))
-            if getattr(e, "footer", None) and getattr(e.footer, "text", None):
-                parts.append(str(e.footer.text))
-        except Exception:
-            continue
-    text = "\n".join([p for p in parts if p and not str(p).strip().startswith("http")])
-    return text.strip()
-
 async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
     import aiohttp
     key = _pick_gemini_key()
@@ -249,7 +256,6 @@ async def _translate_gemini(text: str, target_lang: str) -> Tuple[bool, str]:
         return False, f"Gemini request failed: {e!r}"
 
 
-
 async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
     """OCR + translate an image using Gemini Vision. Returns ok, detected_text, translated_text, reason."""
     try:
@@ -268,21 +274,19 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         client = genai.Client(api_key=key)
         resp = client.models.generate_content(
             model=model,
-            contents=[
-                {"role": "user", "parts": [
+            contents=[{
+                "role": "user",
+                "parts": [
                     {"text": IMAGE_TRANSLATE_SYS_MSG + f" Target language: {target_lang}."},
                     {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
-                ]},
-            ],
+                ],
+            }],
         )
-        raw = (resp.text or "").strip()
-        raw = _clean_output(raw)
+        raw = _clean_output((resp.text or "").strip())
         try:
             data = json.loads(raw)
         except Exception:
-            # Non-JSON fallback; treat raw as both detected and translated
             return True, raw, raw, "non_json_output"
-
         detected = str(data.get("text", "") or "")
         translated = str(data.get("translation", "") or "")
         reason = str(data.get("reason", "") or "ok")
@@ -392,7 +396,7 @@ async def translate_message_ctx(self, interaction: discord.Interaction, message:
         await interaction.followup.send(embed=embed, ephemeral=_translate_ephemeral())
         return
 
-    # Text path (content or embeds)
+    # Text path
     text = (text or "").strip()
     if not text:
         await interaction.response.send_message("No text found to translate in that message.", ephemeral=True)
@@ -461,7 +465,6 @@ async def setup(bot: commands.Bot):
 
     added_any = False
 
-
 # Clean up legacy/duplicate message context menus from previous versions of THIS bot.
 try:
     for cmd in list(bot.tree.get_commands(type=discord.AppCommandType.message)):
@@ -471,60 +474,32 @@ try:
 except Exception:
     pass
 
-    # Register message context menu (Apps > Translate)
-    try:
+# Register message context menu as GUILD-ONLY to avoid global collisions.
+gids_now = _translate_guild_ids()
+if gids_now:
+    for gid in gids_now:
         menu = app_commands.ContextMenu(
-            name="Translate",
+            name="Translate (Nixe)",
             callback=cog.translate_message_ctx,
         )
-        if not any(cmd.name == "Translate" for cmd in bot.tree.get_commands(type=discord.AppCommandType.message)):
-            bot.tree.add_command(menu)
-            added_any = True
-    except Exception:
-        log.debug("[translate] context menu registration skipped", exc_info=True)
+        bot.tree.add_command(menu, guild=discord.Object(id=gid))
+    added_any = True
 
-    # Disable slash by default (Apps-first). Enable only if TRANSLATE_ENABLE_SLASH=1
+async def _sync_later():
     try:
-        enable_slash = _env("TRANSLATE_ENABLE_SLASH", "0") == "1"
-        if not enable_slash:
-            # best-effort remove chat_input command named "translate"
-            for cmd in bot.tree.get_commands(type=discord.AppCommandType.chat_input):
-                if cmd.name == "translate":
-                    bot.tree.remove_command("translate", type=discord.AppCommandType.chat_input)
-                    added_any = True  # treat as change so we sync
-                    log.warning("[translate] slash /translate disabled (Apps-first)")
-                    break
-    except Exception:
-        log.debug("[translate] slash disable skipped", exc_info=True)
+        # First sync global tree (Translate is not added globally) to clear legacy global commands.
+        await bot.tree.sync()
+    except Exception as e:
+        log.warning(f"[translate] global sync failed: {e!r}")
+    # Then sync selected guild(s).
+    for gid in gids_now or []:
+        try:
+            await bot.tree.sync(guild=discord.Object(id=gid))
+        except Exception as e:
+            log.warning(f"[translate] guild sync failed gid={gid}: {e!r}")
+    total_cmds = len(bot.tree.get_commands(type=discord.AppCommandType.message))
+    log.warning(f"[translate] app commands guild-synced into {len(gids_now or [])} guild(s) (total={total_cmds})")
 
-    # Auto-sync only when something changed, or when TRANSLATE_SYNC_ON_BOOT=1
-    try:
-        force_sync = _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1"
-        if added_any or force_sync:
-            async def _sync_later():
-                await bot.wait_until_ready()
-                try:
-                    gids = _translate_guild_ids()
-                    if gids:
-                        total = 0
-                        for gid in gids:
-                            g = discord.Object(id=gid)
-                            try:
-                                bot.tree.copy_global_to(guild=g)
-                            except Exception:
-                                pass
-                            try:
-                                ss = await bot.tree.sync(guild=g)
-                                total += len(ss)
-                            except Exception:
-                                log.debug("[translate] tree.sync(guild=%s) failed", gid, exc_info=True)
-                        log.warning("[translate] app commands guild-synced into %s guild(s) (total=%d)", len(gids), total)
-                    else:
-                        synced = await bot.tree.sync()
-                        log.warning("[translate] app commands synced (%d)", len(synced))
-                except Exception:
-                    log.debug("[translate] tree.sync failed", exc_info=True)
-
-            bot.loop.create_task(_sync_later())
-    except Exception:
-        log.debug("[translate] tree.sync scheduling skipped", exc_info=True)
+force_sync = bool(gids_now)
+if added_any or force_sync or _env("TRANSLATE_SYNC_ON_BOOT", "0") == "1":
+    bot.loop.create_task(_sync_later())

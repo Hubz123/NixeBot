@@ -138,28 +138,80 @@ IMAGE_TRANSLATE_SYS_MSG = (
 )
 
 def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
-    """Extract readable text from Discord embeds (title/description/fields)."""
-    parts: List[str] = []
-    for e in embeds or []:
+    """Extract readable text from Discord embeds.
+
+    Priority:
+    1) descriptions
+    2) field values
+    3) titles / author / footer (only if needed)
+
+    Also strips obvious platform/meta noise and URLs.
+    """
+    if not embeds:
+        return ""
+
+    desc_parts: List[str] = []
+    field_parts: List[str] = []
+    meta_parts: List[str] = []
+
+    for e in embeds:
         try:
-            if e.title:
-                parts.append(str(e.title))
-            if e.description:
-                parts.append(str(e.description))
+            if getattr(e, "description", None):
+                desc_parts.append(str(e.description))
             for f in getattr(e, "fields", []) or []:
-                if getattr(f, "name", None):
-                    parts.append(str(f.name))
                 if getattr(f, "value", None):
-                    parts.append(str(f.value))
-            if getattr(getattr(e, "footer", None), "text", None):
-                parts.append(str(e.footer.text))
-            if getattr(getattr(e, "author", None), "name", None):
-                parts.append(str(e.author.name))
+                    field_parts.append(str(f.value))
+            if getattr(e, "title", None):
+                meta_parts.append(str(e.title))
+            try:
+                if e.author and getattr(e.author, "name", None):
+                    meta_parts.append(str(e.author.name))
+            except Exception:
+                pass
+            try:
+                if e.footer and getattr(e.footer, "text", None):
+                    meta_parts.append(str(e.footer.text))
+            except Exception:
+                pass
         except Exception:
             continue
-    text = "\n".join([p.strip() for p in parts if p and p.strip()])
-    return text.strip()
 
+    raw = "\n".join([p for p in (desc_parts + field_parts + (meta_parts if not desc_parts and not field_parts else [])) if p])
+
+    def _clean_extracted_text(text: str) -> str:
+        # Split into lines and clean obvious noise.
+        out_lines: List[str] = []
+        seen: set = set()
+        for ln in (text or "").splitlines():
+            s = ln.strip()
+            if not s:
+                continue
+            # Drop URLs / link-only lines
+            if re.fullmatch(r"https?://\S+", s, flags=re.I):
+                continue
+            # Drop very short non-informative lines (e.g., "X", "…")
+            if len(s) <= 2 and not re.search(r"[A-Za-z0-9\u3040-\u30ff\u4e00-\u9fff]", s):
+                continue
+            # Drop common platform/meta labels
+            if re.fullmatch(r"(?i)(x|twitter|view on x|view on twitter|open in browser|posted on x)", s):
+                continue
+            # Drop handle-only / author boilerplate
+            if re.fullmatch(r"@\w{1,32}", s):
+                continue
+            if re.fullmatch(r".*\(@\w{1,32}\).*", s) and len(s) < 80:
+                # Likely author/header line, skip unless it contains substantial text
+                continue
+
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out_lines.append(s)
+
+        return "\n".join(out_lines).strip()
+
+    cleaned = _clean_extracted_text(raw)
+    return cleaned
 def _as_float(k: str, default: float) -> float:
     try:
         return float(_env(k, str(default)))
@@ -316,6 +368,18 @@ async def _translate_groq(text: str, target_lang: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Groq request failed: {e!r}"
 
+def _looks_like_only_urls(text: str) -> bool:
+    """Return True if text contains no human text besides URLs."""
+    if not text:
+        return True
+    # Remove markdown angle brackets and whitespace
+    t = text.strip()
+    # Strip URLs
+    t = re.sub(r"https?://\S+", " ", t, flags=re.IGNORECASE)
+    # Strip leftover punctuation/symbols
+    t = re.sub(r"[\W_]+", " ", t, flags=re.UNICODE)
+    return len(t.strip()) == 0
+
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -433,10 +497,13 @@ class TranslateCommands(commands.Cog):
             return
 
         # Collect text candidates from content and embeds (Twitter/YouTube previews).
-        text = (message.content or "").strip()
-        if not text and message.embeds:
+        raw_text = (message.content or "").strip()
+        text = raw_text
+        if message.embeds and (not raw_text or _looks_like_only_urls(raw_text)):
             emb_list = [e for e in message.embeds if isinstance(e, discord.Embed)]
-            text = _extract_text_from_embeds(emb_list)
+            emb_text = _extract_text_from_embeds(emb_list)
+            if emb_text:
+                text = emb_text
 
         # If still no text, but there is an image attachment, OCR+translate the image.
         image_bytes: Optional[bytes] = None

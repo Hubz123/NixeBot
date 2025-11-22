@@ -35,6 +35,7 @@ import os, json, logging, re, asyncio, base64
 from typing import Optional, Tuple, List, Dict, Any
 
 import discord
+import aiohttp
 from discord import app_commands
 from discord.ext import commands
 
@@ -159,7 +160,183 @@ def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
             continue
         cleaned.append(ln)
     return "\n".join(cleaned).strip()
+# -------------------------
+# Extra helpers for context-menu translate
+# - forwarded/reply wrappers
+# - embed-only images (link previews)
+# -------------------------
 
+def _is_message_effectively_empty(msg) -> bool:
+    """Return True if message-like object has no usable text/embeds/attachments."""
+    try:
+        content = (getattr(msg, "content", "") or "").strip()
+        if content:
+            return False
+        atts = getattr(msg, "attachments", None) or []
+        if atts:
+            return False
+        embeds = getattr(msg, "embeds", None) or []
+        if embeds:
+            emb_text = _extract_text_from_embeds(list(embeds))
+            if (emb_text or "").strip():
+                return False
+        return True
+    except Exception:
+        return True
+def _pick_best_source_message(msg):
+    """Select best message-like source for translation (unwrap reply/forward wrappers)."""
+    if not _is_message_effectively_empty(msg):
+        return msg
+
+    debug = False
+    try:
+        debug = _as_bool("TRANSLATE_DEBUG_LOG", False)
+    except Exception:
+        debug = False
+
+    # 1) Reply wrapper via reference.resolved
+    try:
+        ref = getattr(msg, "reference", None)
+        resolved = getattr(ref, "resolved", None) if ref else None
+        if resolved and not _is_message_effectively_empty(resolved):
+            if debug:
+                log.info("[translate] unwrap reference -> %s", type(resolved).__name__)
+            return resolved
+    except Exception:
+        pass
+
+    # 2) Forwarded posts via message_snapshots (discord.py 2.4+).
+    try:
+        snaps = getattr(msg, "message_snapshots", None) or []
+        for snap in snaps:
+            inner = getattr(snap, "message", None) or getattr(snap, "resolved", None) or snap
+            if inner and not _is_message_effectively_empty(inner):
+                if debug:
+                    log.info("[translate] unwrap snapshot -> %s", type(inner).__name__)
+                return inner
+    except Exception:
+        pass
+
+    return msg
+def _extract_image_urls_from_embeds(embeds: List[discord.Embed]) -> List[str]:
+    urls: List[str] = []
+    for e in embeds or []:
+        try:
+            img = getattr(e, "image", None)
+            if img and getattr(img, "url", None):
+                urls.append(str(img.url))
+            th = getattr(e, "thumbnail", None)
+            if th and getattr(th, "url", None):
+                urls.append(str(th.url))
+        except Exception:
+            continue
+    # de-dupe while preserving order
+    out: List[str] = []
+    seen = set()
+    for u in urls:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+async def _fetch_image_bytes(url: str, max_bytes: int = 6_000_000) -> Optional[bytes]:
+    if not url:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                ct = (resp.headers.get("Content-Type") or "").lower()
+                if not any(x in ct for x in ("image/", "octet-stream")):
+                    # allow discord proxy images which sometimes use octet-stream
+                    return None
+                data = await resp.content.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    return None
+                return data
+    except Exception:
+        return None
+
+def _has_image_candidates(msg) -> bool:
+    """Cheap check for whether msg likely contains any image (attachments or embed images)."""
+    try:
+        for att in (getattr(msg, "attachments", None) or []):
+            fn = (getattr(att, "filename", "") or "").lower()
+            url = str(getattr(att, "url", "") or getattr(att, "proxy_url", "") or "").lower()
+            ct = (getattr(att, "content_type", "") or "").lower()
+            if any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                return True
+            if any(url.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                return True
+            if "image/" in ct:
+                return True
+    except Exception:
+        pass
+    try:
+        for e in (getattr(msg, "embeds", None) or []):
+            img = getattr(e, "image", None)
+            thumb = getattr(e, "thumbnail", None)
+            if img and getattr(img, "url", None):
+                return True
+            if thumb and getattr(thumb, "url", None):
+                return True
+            # some snapshot embeds expose dict-like images
+            if hasattr(e, "to_dict"):
+                d = e.to_dict()
+                if d.get("image", {}).get("url") or d.get("thumbnail", {}).get("url"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+async def _find_any_image_bytes(msg) -> Optional[bytes]:
+    """Find first image bytes from attachments or embeds. Works for snapshot-like objects."""
+    # 1) attachments (scan all)
+    try:
+        for att in (getattr(msg, "attachments", None) or []):
+            fn = (getattr(att, "filename", "") or "").lower()
+            url = (getattr(att, "url", None) or getattr(att, "proxy_url", None) or "")
+            ct = (getattr(att, "content_type", "") or "").lower()
+
+            is_img = (
+                any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"))
+                or any(str(url).lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"))
+                or ("image/" in ct)
+            )
+            if not is_img:
+                continue
+
+            # try read() if available
+            try:
+                read_fn = getattr(att, "read", None)
+                if callable(read_fn):
+                    b = await read_fn()
+                    if b:
+                        return b
+            except Exception:
+                pass
+
+            # url fetch fallback (for snapshot attachments)
+            if url:
+                b = await _fetch_image_bytes(str(url))
+                if b:
+                    return b
+    except Exception:
+        pass
+
+    # 2) embed images (link previews / bot embeds)
+    try:
+        embeds = list(getattr(msg, "embeds", None) or [])
+        for u in _extract_image_urls_from_embeds(embeds):
+            b = await _fetch_image_bytes(u)
+            if b:
+                return b
+    except Exception:
+        pass
+
+    return None
 def _translate_guild_ids() -> List[int]:
     # new format
     raw = _env("TRANSLATE_GUILD_IDS", "").strip()
@@ -495,47 +672,78 @@ class TranslateCommands(commands.Cog):
         ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
         await interaction.response.defer(thinking=True, ephemeral=ephemeral)
 
+        # Context-menu provides a partial Message; refetch for full embeds/attachments.
+        try:
+            if interaction.channel and hasattr(interaction.channel, "fetch_message"):
+                message = await interaction.channel.fetch_message(message.id)
+        except Exception:
+            pass
+
+        # Unwrap reply/forward wrappers if needed.
+        src_msg = _pick_best_source_message(message)
+
         target = _env("TRANSLATE_TARGET_LANG", "id").strip() or "id"
+        debug = _as_bool("TRANSLATE_DEBUG_LOG", False)
 
-        # image path
-        image_bytes: Optional[bytes] = None
-        if message.attachments:
-            att = message.attachments[0]
-            fn = (att.filename or "").lower()
-            if any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
-                try:
-                    image_bytes = await att.read()
-                except Exception:
-                    image_bytes = None
+        try:
+            log.info(
+                "[translate] ctx invoke uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
+                getattr(interaction.user, "id", None),
+                getattr(message, "id", None),
+                type(src_msg).__name__,
+                len((getattr(src_msg, "content", "") or "")),
+                len(getattr(src_msg, "embeds", None) or []),
+                len(getattr(src_msg, "attachments", None) or []),
+                len(getattr(message, "message_snapshots", None) or []),
+                target,
+            )
+        except Exception:
+            pass
 
-        if image_bytes:
-            ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
-            if not ok:
-                await interaction.followup.send(reason, ephemeral=ephemeral)
-                return
-            emb = discord.Embed(title="Translation (Image)")
-            if detected:
-                emb.add_field(name="Detected Text", value=detected[:1024], inline=False)
-            emb.add_field(name=f"Translation → {target}", value=translated[:1024] or "(empty)", inline=False)
-            emb.set_footer(text=f"Translated by Gemini • target={target} • {reason}")
-            await interaction.followup.send(embed=emb, ephemeral=ephemeral)
-            return
-
-        # text / embeds
-        raw_text = (message.content or "").strip()
+        # 1) Text / embed text path FIRST
+        raw_text = (getattr(src_msg, "content", "") or "").strip()
         text = raw_text
-        if message.embeds and (not raw_text or _looks_like_only_urls(raw_text)):
-            emb_list = [e for e in message.embeds if isinstance(e, discord.Embed)]
-            emb_text = _extract_text_from_embeds(emb_list)
+
+        embeds = list(getattr(src_msg, "embeds", None) or [])
+        if embeds and (not raw_text or _looks_like_only_urls(raw_text)):
+            emb_text = _extract_text_from_embeds(embeds)
             if emb_text:
                 text = emb_text
 
+        text = (text or "").strip()
+
+        # 2) OCR handling
+        has_images = _has_image_candidates(src_msg)
+        ocr_on_image = _as_bool("TRANSLATE_OCR_ON_IMAGE", False)
+
+        # If no text at all, try OCR first (fallback-only).
         if not text:
-            await interaction.followup.send("No text to translate.", ephemeral=ephemeral)
+            image_bytes = await _find_any_image_bytes(src_msg)
+            if image_bytes:
+                ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
+                if not ok:
+                    await interaction.followup.send(reason, ephemeral=ephemeral)
+                    return
+                emb = discord.Embed(title="Translation (Image)")
+                if detected:
+                    emb.add_field(name="Detected Text", value=detected[:1024], inline=False)
+                emb.add_field(name=f"Translation → {target}", value=translated[:1024] or "(empty)", inline=False)
+                emb.set_footer(text=f"Translated by Gemini • target={target} • {reason}")
+                await interaction.followup.send(embed=emb, ephemeral=ephemeral)
+                return
+
+        # Still nothing and no images to OCR.
+        if not text and not has_images:
+            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
             return
 
         provider = _pick_provider()
-        max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
+
+        try:
+            max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
+        except Exception:
+            max_chars = 1800
+
         chunks = _chunk_text(text, max_chars)
 
         for idx, ch in enumerate(chunks, 1):
@@ -556,6 +764,25 @@ class TranslateCommands(commands.Cog):
                 emb.set_footer(text=f"Translated by {provider} • target={target}")
             await interaction.followup.send(embed=emb, ephemeral=ephemeral)
 
+        # 3) If message has text AND images, optionally OCR images too.
+        if has_images and ocr_on_image:
+            try:
+                image_bytes = await _find_any_image_bytes(src_msg)
+                if image_bytes:
+                    ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
+                    if ok:
+                        emb = discord.Embed(title="Translation (Image)")
+                        if detected:
+                            emb.add_field(name="Detected Text", value=detected[:1024], inline=False)
+                        emb.add_field(name=f"Translation → {target}", value=translated[:1024] or "(empty)", inline=False)
+                        emb.set_footer(text=f"Translated by Gemini • target={target} • {reason}")
+                        await interaction.followup.send(embed=emb, ephemeral=ephemeral)
+                    else:
+                        if debug:
+                            await interaction.followup.send(f"OCR failed: {reason}", ephemeral=ephemeral)
+            except Exception as e:
+                if debug:
+                    await interaction.followup.send(f"OCR error: {e!r}", ephemeral=ephemeral)
     @app_commands.command(name="translate", description="Translate text to target language")
     @app_commands.describe(text="Text to translate", target="Target language code, e.g. id, en, ja")
     async def translate_slash(self, interaction: discord.Interaction, text: str, target: Optional[str] = None):

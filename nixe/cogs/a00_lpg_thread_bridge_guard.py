@@ -329,11 +329,15 @@ class LPGThreadBridgeGuard(commands.Cog):
                         os.environ["LPG_BURST_TIMEOUT_MS"] = str(fb_ms)
                         bok, bscore, bvia, breason = await _burst(data)
                         bscore = float(bscore or 0.0)
+                        r2 = str(breason or "")
+                        r2low = r2.lower()
+                        if not (r2low.startswith("early(") or "early(ok)" in r2low or r2low.startswith("ok")):
+                            r2 = f"lastchance({breason})"
                         return (
                             bool(bok and bscore >= self.thr),
                             bscore,
-                            str(bvia or "gemini:lastchance"),
-                            f"lastchance({breason})",
+                            str(bvia or "gemini:burst"),
+                            r2,
                         )
                 except Exception as e:
                     log.debug(
@@ -366,11 +370,15 @@ class LPGThreadBridgeGuard(commands.Cog):
                     ok, score, via, reason = await _burst(data)
                     score = float(score or 0.0)
                     verdict_ok = bool(ok and score >= self.thr)
+                    r2 = str(reason or "")
+                    r2low = r2.lower()
+                    if not (r2low.startswith("early(") or "early(ok)" in r2low or r2low.startswith("ok")):
+                        r2 = f"lastchance({reason})"
                     return (
                         verdict_ok,
                         score,
-                        str(via or "gemini:lastchance"),
-                        f"lastchance({reason})",
+                        str(via or "gemini:burst"),
+                        r2,
                     )
             except Exception:
                 pass

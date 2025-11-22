@@ -216,8 +216,7 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
                 {"inline_data": {"mime_type": mime, "data": b64}}
             ]
         }],
-        "generationConfig": {"temperature": 0.0, "topP": 0.0, "topK": 1, "candidateCount": 1, "maxOutputTokens": 128},
-        "response_mime_type": "application/json"
+        "generationConfig": {"temperature": 0.0, "topP": 0.0, "topK": 1, "candidateCount": 1, "maxOutputTokens": 128, "responseMimeType": "application/json"},
     }
 
     per_timeout = _pick_timeout_sec()

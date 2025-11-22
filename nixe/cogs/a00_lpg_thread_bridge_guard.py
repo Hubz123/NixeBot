@@ -16,6 +16,11 @@ log = logging.getLogger("nixe.cogs.a00_lpg_thread_bridge_guard")
 # -- simple pHash + helpers (minimal) --
 from io import BytesIO
 import json
+import re, base64
+try:
+    import aiohttp
+except Exception:  # pragma: no cover
+    aiohttp = None
 from pathlib import Path
 try:
     from PIL import Image
@@ -145,6 +150,182 @@ def _norm_tone(t: str) -> str:
     return "soft"
 
 
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = str(os.getenv(key, str(int(default))) or "").strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except Exception:
+        return default
+
+def _load_neg_text() -> list[str]:
+    """
+    Load LPG_NEGATIVE_TEXT from environment.
+
+    Supports:
+    - JSON list string: ["a","b"]
+    - comma/semicolon/newline separated string
+    """
+    raw = (os.getenv("LPG_NEGATIVE_TEXT") or "").strip()
+    if not raw:
+        return []
+    try:
+        if raw.startswith("[") or raw.startswith("{"):
+            j = json.loads(raw)
+            if isinstance(j, list):
+                return [str(x).strip() for x in j if str(x).strip()]
+            if isinstance(j, str):
+                raw2 = j
+            else:
+                raw2 = raw
+        else:
+            raw2 = raw
+    except Exception:
+        raw2 = raw
+    out: list[str] = []
+    for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
+        s = part.strip()
+        if s:
+            out.append(s)
+    return out
+
+def _detect_image_mime(image_bytes: bytes) -> str:
+    # quick magic
+    if image_bytes[:4] == b"\x89PNG":
+        return "image/png"
+    if image_bytes[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if image_bytes[:3] == b"GIF":
+        return "image/gif"
+    return "image/png"
+
+def _maybe_convert_to_jpeg(image_bytes: bytes) -> tuple[bytes, str]:
+    """
+    Convert to JPEG for Gemini Vision if PIL is available and mime is not jpeg/png.
+    Returns (bytes, mime).
+    """
+    mime = _detect_image_mime(image_bytes)
+    if mime in ("image/jpeg", "image/png"):
+        return image_bytes, mime
+    if Image is None:
+        return image_bytes, mime
+    try:
+        im = Image.open(BytesIO(image_bytes)).convert("RGB")
+        buf = BytesIO()
+        im.save(buf, format="JPEG", quality=92)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return image_bytes, mime
+
+async def _ocr_neg_text(image_bytes: bytes, timeout_ms: int = 3500) -> tuple[bool, str, str]:
+    """
+    OCR image with Gemini Vision, returning (ok, ocr_text, reason).
+    Uses same key pool as LPG classify (GEMINI_API_KEYS or legacy).
+    """
+    if aiohttp is None:
+        return False, "", "aiohttp_missing"
+
+    keys_raw = (os.getenv("GEMINI_API_KEYS", "") or "").strip()
+
+    keys: list[str] = []
+    if keys_raw:
+        keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
+    if not keys:
+        for kn in ("GEMINI_API_KEY", "GEMINI_API_KEY_B", "GEMINI_BACKUP_API_KEY"):
+            kv = (os.getenv(kn, "") or "").strip()
+            if kv:
+                keys.append(kv)
+    if not keys:
+        return False, "", "no_gemini_key"
+
+    model = (os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite") or "").strip()
+    if not model:
+        model = "gemini-2.5-flash-lite"
+
+    img_bytes, mime = _maybe_convert_to_jpeg(image_bytes)
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+    sys_prompt = (
+        "You are an OCR engine. Extract all readable text from the image. "
+        "Return ONLY compact JSON: {\"text\": \"...\"}. No commentary."
+    )
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": sys_prompt},
+                    {"inline_data": {"mime_type": mime, "data": b64}},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "topP": 0.1,
+            "topK": 1,
+            "maxOutputTokens": 256,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    last_err = ""
+    tsec = max(1.5, float(timeout_ms) / 1000.0)
+    timeout = aiohttp.ClientTimeout(total=tsec)
+
+    for key in keys:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as resp:
+                    txt = await resp.text()
+                    if resp.status != 200:
+                        last_err = f"http_{resp.status}"
+                        continue
+                    try:
+                        j = json.loads(txt)
+                        cand = (j.get("candidates") or [{}])[0]
+                        parts = cand.get("content", {}).get("parts") or []
+                        out = "".join([p.get("text", "") for p in parts]).strip()
+                        if not out:
+                            last_err = "empty_output"
+                            continue
+                        # out may be json or raw text
+                        if out.startswith("{"):
+                            try:
+                                oj = json.loads(out)
+                                ocr_text = str(oj.get("text", "") or "")
+                            except Exception:
+                                ocr_text = out
+                        else:
+                            ocr_text = out
+                        ocr_text = (ocr_text or "").strip()
+                        if not ocr_text:
+                            last_err = "empty_ocr"
+                            continue
+                        return True, ocr_text, "ok"
+                    except Exception:
+                        # salvage braces
+                        m = re.search(r"\{.*\}", txt, flags=re.S)
+                        if m:
+                            try:
+                                oj = json.loads(m.group(0))
+                                ocr_text = str(oj.get("text", "") or "").strip()
+                                if ocr_text:
+                                    return True, ocr_text, "salvaged"
+                            except Exception:
+                                pass
+                        last_err = "parse_error"
+                        continue
+        except Exception as e:
+            last_err = f"vision_failed:{e.__class__.__name__}"
+            continue
+
+    return False, "", last_err or "vision_failed"
+
 class LPGThreadBridgeGuard(commands.Cog):
     """Lucky Pull guard (thread-aware) — fully env-aligned.
     - Only deletes when image is classified as Lucky (Gemini) unless LPG_REQUIRE_CLASSIFY=0.
@@ -225,6 +406,12 @@ class LPGThreadBridgeGuard(commands.Cog):
             for s in str(os.getenv("LPG_PERSONA_ALLOWED_PROVIDERS", "")).split(",")
             if s.strip()
         ]
+        # Negative text hard-veto (OCR) to prevent false positives on reward/selection UIs
+        self.neg_hard_veto = _env_bool("LPG_NEGATIVE_HARD_VETO", True)
+        self.neg_minlen = _env_int("LPG_NEGATIVE_HARD_VETO_MINLEN", 3)
+        self.neg_tokens = [t.lower() for t in _load_neg_text() if t and len(t.strip()) >= self.neg_minlen]
+        self.neg_ocr_timeout_ms = _env_int("LPG_NEGATIVE_OCR_TIMEOUT_MS", 3500)
+
 
         log.warning(
             "[lpg-thread-bridge] enabled=%s guards=%s redirect=%s thr=%.2f strict=%s timeout=%.1fs require_classify=%s | persona: enable=%s mode=%s tone=%s reason=%s only_for=%s allow_prov=%s",
@@ -255,6 +442,22 @@ class LPGThreadBridgeGuard(commands.Cog):
         name = (getattr(att, "filename", "") or "").lower()
         return name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
 
+    async def _negtext_veto(self, image_bytes: bytes) -> Tuple[bool, str]:
+        """
+        Run OCR and hard-veto lucky classification if any negative token is found.
+        Returns (vetoed, reason).
+        """
+        if not self.neg_hard_veto or not self.neg_tokens:
+            return False, "veto_disabled"
+        ok, ocr_text, r = await _ocr_neg_text(image_bytes, timeout_ms=self.neg_ocr_timeout_ms)
+        if not ok or not ocr_text:
+            return False, f"ocr_skip({r})"
+        low = ocr_text.lower()
+        for tok in self.neg_tokens:
+            if tok and tok in low:
+                return True, f"negtext_veto(ocr:{tok})"
+        return False, "no_neg_match"
+
     async def _classify(self, message: discord.Message) -> tuple[bool, float, str, str]:
         """Classify image with resilient Gemini + BURST fallback.
         Returns: (lucky_ok, score, provider, reason)
@@ -273,6 +476,12 @@ class LPGThreadBridgeGuard(commands.Cog):
                 return (False, 0.0, "none", "empty_bytes")
             if len(data) > self.max_bytes:
                 data = data[: self.max_bytes]
+
+            # Hard negative-text veto via OCR (prevents Epiphany/reward selection false positives)
+            vetoed, vreason = await self._negtext_veto(data)
+            if vetoed:
+                log.info("[lpg-thread-bridge] NEG_VETO lucky=False reason=%s", vreason)
+                return (False, 0.0, "negtext_veto", vreason)
 
             # primary path: gemini_bridge (may be monkeypatched by overlay)
             res = await asyncio.wait_for(

@@ -1,5 +1,6 @@
 # nixe/helpers/lpa_provider_bridge.py — image-first provider dispatch; no ENV change
 import os, importlib
+from typing import Any, Tuple
 
 # --- Groq model sanitizer (prevents hardcoded maverick/scout) ---
 try:

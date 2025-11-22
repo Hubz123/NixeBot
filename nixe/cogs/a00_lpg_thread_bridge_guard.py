@@ -326,7 +326,7 @@ class LPGThreadBridgeGuard(commands.Cog):
                             _burst = None
                     if _burst is not None:
                         fb_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1200"))
-                        os.environ.setdefault("LPG_BURST_TIMEOUT_MS", str(fb_ms))
+                        os.environ["LPG_BURST_TIMEOUT_MS"] = str(fb_ms)
                         bok, bscore, bvia, breason = await _burst(data)
                         bscore = float(bscore or 0.0)
                         return (
@@ -362,11 +362,13 @@ class LPGThreadBridgeGuard(commands.Cog):
                         _burst = None
                 if _burst is not None:
                     fb_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1200"))
-                    os.environ.setdefault("LPG_BURST_TIMEOUT_MS", str(fb_ms))
+                    os.environ["LPG_BURST_TIMEOUT_MS"] = str(fb_ms)
                     ok, score, via, reason = await _burst(data)
+                    score = float(score or 0.0)
+                    verdict_ok = bool(ok and score >= self.thr)
                     return (
-                        bool(ok),
-                        float(score or 0.0),
+                        verdict_ok,
+                        score,
                         str(via or "gemini:lastchance"),
                         f"lastchance({reason})",
                     )

@@ -143,6 +143,14 @@ def _negative_phrases() -> List[str]:
                     words.append(s)
 
     defaults = [
+        # Promotional / event banners (NOT pull results)
+        "activity banner", "event banner", "limited-time event", "event rewards", "version update", "patch notes", "announcement", "login bonus", "free claim", "free to claim", "free outfit", "free skin", "costume set", "event", "version", "banner", "promo", "福利", "活动", "公告", "免费领", "免费领取", "时装", "套装", "全新服装", "皮肤", "礼包",
+        # Reward / selector / shop UIs (NOT pull results)
+        "rescue merit", "available rewards", "guaranteed rescue", "only once",
+        "obtain", "not owned", "reward list", "reward select", "claim reward",
+        "exchange", "shop", "store", "purchase", "selector", "currency", "merit",
+
+
         # Save/load & meta UI
         "save data", "save_date", "card count", "save slot", "save record",
         "obtained equipment",
@@ -278,10 +286,11 @@ def _build_payload(image_bytes: bytes) -> dict:
         "Any screen showing Save data, Card Count, Manifest Ego, Memory Fragments, equipment or "
         "artifact grids, character details, stat pages, emblem info, or reforging UI is NOT a pull result.\n"
         "Any external website, spreadsheet, or build table (for example skill charts or planners) "
-        "is NOT a pull result.\n\n"
+        "is NOT a pull result.\n\nPromotional/event/announcement banners are NOT pull results. They usually contain big headline text and a collage of character arts, often mentioning events/versions/free rewards (e.g., 'event', 'version update', '福利', '活动', '公告', '免费领', '时装', '套装'). If you see these, set lucky=false.\n\n"
         "Rules:\n"
         "- First decide if the screenshot is a gacha pull result at all. If it is clearly a "
         "loadout / deck / save_data / epiphany / build_sheet / planner, set lucky=false.\n"
+        "- If the UI looks like a reward/claim/selector/shop screen with ownership/claim labels (e.g., 'Available rewards', 'Only once', 'Guaranteed', 'Obtain', 'Not owned', 'Exchange', 'Shop', 'Merit/Currency'), it is NOT a pull result: set lucky=false.\n"
         "- If the image clearly shows a multi-result gacha result (>=8 result slots at once) you may set "
         "lucky=true, and you MUST set screen_type='result_multi_pull', "
         "is_multi_result_screen=true, and slot_count>=8.\n"

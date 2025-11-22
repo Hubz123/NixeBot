@@ -29,6 +29,7 @@ def _build_sys_prompt() -> str:
         "event", "version", "banner", "promo", "announcement", "福利", "版本", "活动",
         "免费", "领取", "时装", "套装", "抽+", "抽", "换装", "skin", "costume",
         "reward", "login bonus", "patch notes"
+        "rescue merit", "available rewards", "guaranteed", "only once", "obtain", "not owned", "reward list", "reward select", "claim reward", "exchange", "shop", "store", "purchase", "selector", "currency", "merit", "redeem",
     ]
     neg = fixed_neg + _load_neg_text()
     neg_txt = ", ".join(f'"{p}"' for p in neg if p)

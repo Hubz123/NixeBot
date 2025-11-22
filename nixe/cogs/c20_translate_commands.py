@@ -65,6 +65,31 @@ def _clean_output(s: str) -> str:
         s = re.sub(r"\n?```$", "", s)
     return s.strip()
 
+def _normalize_for_compare(s: str) -> str:
+    s = re.sub(r"https?://\S+", " ", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
+    ns = _normalize_for_compare(src)
+    no = _normalize_for_compare(out)
+    if not ns or not no:
+        return False
+    if ns == no:
+        return True
+    # rough similarity based on char overlap
+    common = sum(1 for a, b in zip(ns, no) if a == b)
+    sim = common / max(len(ns), len(no))
+    if sim > 0.90:
+        return True
+    # if target is latin-based but output is heavy CJK/Hangul, likely untranslated
+    if target_lang.lower() in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl"):
+        nonlatin = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", out))
+        if nonlatin > 8 and nonlatin / max(1, len(out)) > 0.20:
+            return True
+    return False
+
+
 def _chunk_text(text: str, max_chars: int) -> List[str]:
     if len(text) <= max_chars:
         return [text]
@@ -194,44 +219,64 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         return False, "missing TRANSLATE_GEMINI_API_KEY"
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
-    sys_msg = _env(
+
+    base_sys = _env(
         "TRANSLATE_SYS_MSG",
-        f"You are a translation engine. Translate user text to {target_lang}. "
+        f"You are a translation engine. Translate the user's text into {target_lang}. "
+        "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
+        f"If the text is already in {target_lang}, return it unchanged. "
         f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
-        ],
-        "generationConfig": {"temperature": 0.2},
-    }
+    strict_sys = _env(
+        "TRANSLATE_SYS_MSG_STRICT",
+        f"STRICT MODE. Translate ALL user text into {target_lang}. "
+        "No source-language remnants except proper nouns/usernames/URLs. "
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+    )
 
-    try:
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=_as_float("TRANSLATE_TIMEOUT_SEC", 12.0))
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.post(url, json=payload) as resp:
-                raw = await resp.text()
-                if resp.status >= 400:
-                    return False, f"Gemini error {resp.status}: {raw[:200]}"
-                data = json.loads(raw)
-                cand = (data.get("candidates") or [{}])[0]
-                parts = ((cand.get("content") or {}).get("parts") or [])
-                out = ""
-                for p in parts:
-                    if "text" in p:
-                        out += p["text"]
-                out = _clean_output(out)
-                # accept JSON or plain text fallback
-                try:
-                    j = json.loads(out)
-                    out2 = str(j.get("translation", "") or out)
-                    return True, out2.strip() or "(empty)"
-                except Exception:
-                    return True, out or "(empty)"
-    except Exception as e:
-        return False, f"Gemini request failed: {e!r}"
+    async def _call(sys_msg: str) -> Tuple[bool, str]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
+            ],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        }
+        try:
+            import aiohttp  # type: ignore
+        except Exception as e:
+            return False, f"aiohttp missing: {e!r}"
+
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.post(url, json=payload, timeout=20) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        return False, f"Gemini HTTP {resp.status}: {body[:200]}"
+                    j = await resp.json()
+                    cand = (j.get("candidates") or [{}])[0]
+                    parts = (((cand.get("content") or {}).get("parts")) or [])
+                    out = ""
+                    for p in parts:
+                        if "text" in p:
+                            out += p["text"]
+                    out = _clean_output(out)
+                    # accept JSON or plain text fallback
+                    try:
+                        jj = json.loads(out)
+                        out2 = str(jj.get("translation", "") or out)
+                        return True, out2.strip() or "(empty)"
+                    except Exception:
+                        return True, out.strip() or "(empty)"
+        except Exception as e:
+            return False, f"Gemini request failed: {e!r}"
+
+    ok, out = await _call(base_sys)
+    if ok and _seems_untranslated(text, out, target_lang):
+        ok2, out2 = await _call(strict_sys)
+        if ok2 and out2:
+            out = out2
+    return ok, out
 
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()

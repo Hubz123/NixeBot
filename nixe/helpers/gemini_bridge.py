@@ -1,35 +1,44 @@
-import os, aiohttp, json, base64, asyncio, re, time
-
-# --- image mime sniff / optional convert for Gemini Vision ---
+import os, aiohttp, json, base64, asyncio, re, time, io
 def _sniff_mime(image_bytes: bytes) -> str:
-    hb = image_bytes[:16] if image_bytes else b''
-    if hb.startswith(b'\xff\xd8\xff'):
-        return 'image/jpeg'
-    if hb.startswith(b'\x89PNG\r\n\x1a\n'):
-        return 'image/png'
-    if len(hb) >= 12 and hb[:4] == b'RIFF' and hb[8:12] == b'WEBP':
-        return 'image/webp'
-    if hb.startswith(b'GIF87a') or hb.startswith(b'GIF89a'):
-        return 'image/gif'
-    if hb.startswith(b'BM'):
-        return 'image/bmp'
-    return 'application/octet-stream'
+    """Best-effort mime sniff by magic bytes."""
+    if not image_bytes:
+        return "image/jpeg"
+    b = image_bytes
+    if b.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if b.startswith(b"GIF87a") or b.startswith(b"GIF89a"):
+        return "image/gif"
+    if b.startswith(b"BM"):
+        return "image/bmp"
+    # WEBP: RIFF....WEBP
+    if len(b) >= 12 and b[0:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    return "application/octet-stream"
 
-def _maybe_convert_to_jpeg(image_bytes: bytes, mime: str) -> tuple[bytes, str]:
-    # Gemini reliably supports JPEG/PNG; convert others if PIL available.
-    if mime in ('image/jpeg', 'image/png'):
+
+def _prepare_inline_image(image_bytes: bytes) -> tuple[bytes, str]:
+    """
+    Ensure inline_data bytes + mime are coherent for Gemini.
+    If format isn't jpeg/png, try best-effort convert to jpeg (PIL optional).
+    """
+    mime = _sniff_mime(image_bytes)
+
+    if mime in ("image/jpeg", "image/png"):
         return image_bytes, mime
+
+    # Attempt convert to JPEG if PIL available.
     try:
-        from PIL import Image  # optional dependency
-        import io
+        from PIL import Image  # type: ignore
         im = Image.open(io.BytesIO(image_bytes))
-        im = im.convert('RGB')
+        im = im.convert("RGB")
         buf = io.BytesIO()
-        im.save(buf, format='JPEG', quality=92)
-        return buf.getvalue(), 'image/jpeg'
+        im.save(buf, format="JPEG", quality=92)
+        return buf.getvalue(), "image/jpeg"
     except Exception:
+        # Fallback to original bytes with sniffed mime.
         return image_bytes, mime
-
 
 def _env(k: str, default: str = "") -> str:
     v = os.getenv(k)
@@ -197,15 +206,14 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
     models = _env_models_list()
     sys_prompt = _build_sys_prompt()
 
-    mime = _sniff_mime(image_bytes)
-    img2, mime2 = _maybe_convert_to_jpeg(image_bytes, mime)
-    b64 = base64.b64encode(img2).decode("ascii")
+    img_bytes, mime = _prepare_inline_image(image_bytes)
+    b64 = base64.b64encode(img_bytes).decode("ascii")
     payload = {
         "contents": [{
             "role": "user",
             "parts": [
                 {"text": sys_prompt},
-                {"inline_data": {"mime_type": mime2, "data": b64}}
+                {"inline_data": {"mime_type": mime, "data": b64}}
             ]
         }],
         "generationConfig": {"temperature": 0.0, "topP": 0.0, "topK": 1, "candidateCount": 1, "maxOutputTokens": 128},

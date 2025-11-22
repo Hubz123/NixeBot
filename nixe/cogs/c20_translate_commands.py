@@ -259,38 +259,6 @@ async def _fetch_image_bytes(url: str, max_bytes: int = 6_000_000) -> Optional[b
     except Exception:
         return None
 
-def _has_image_candidates(msg) -> bool:
-    """Cheap check for whether msg likely contains any image (attachments or embed images)."""
-    try:
-        for att in (getattr(msg, "attachments", None) or []):
-            fn = (getattr(att, "filename", "") or "").lower()
-            url = str(getattr(att, "url", "") or getattr(att, "proxy_url", "") or "").lower()
-            ct = (getattr(att, "content_type", "") or "").lower()
-            if any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
-                return True
-            if any(url.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
-                return True
-            if "image/" in ct:
-                return True
-    except Exception:
-        pass
-    try:
-        for e in (getattr(msg, "embeds", None) or []):
-            img = getattr(e, "image", None)
-            thumb = getattr(e, "thumbnail", None)
-            if img and getattr(img, "url", None):
-                return True
-            if thumb and getattr(thumb, "url", None):
-                return True
-            # some snapshot embeds expose dict-like images
-            if hasattr(e, "to_dict"):
-                d = e.to_dict()
-                if d.get("image", {}).get("url") or d.get("thumbnail", {}).get("url"):
-                    return True
-    except Exception:
-        pass
-    return False
-
 async def _find_any_image_bytes(msg) -> Optional[bytes]:
     """Find first image bytes from attachments or embeds. Works for snapshot-like objects."""
     # 1) attachments (scan all)
@@ -592,6 +560,15 @@ class TranslateCommands(commands.Cog):
 
             ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
 
+            # Force-remove legacy /translate slash if present (global cached).
+            if _as_bool("TRANSLATE_FORCE_REMOVE_SLASH", True):
+                try:
+                    self.bot.tree.remove_command("translate", type=discord.AppCommandType.chat_input)
+                    log.info("[translate] forced remove of chat_input /translate from local tree")
+                except Exception as e:
+                    log.debug("[translate] force remove slash skipped: %r", e)
+
+
             # cleanup translate* commands from this bot
             try:
                 for cmd in list(self.bot.tree.get_commands()):
@@ -625,14 +602,15 @@ class TranslateCommands(commands.Cog):
                 except Exception:
                     pass
 
-                if _as_bool("TRANSLATE_SLASH_ENABLE", True):
+                if _as_bool("TRANSLATE_SLASH_ENABLE", False):
                     try:
                         self.bot.tree.add_command(self.translate_slash, guild=gobj)
                     except Exception:
                         pass
 
             # sync once global to flush legacy, then per guild
-            if _as_bool("TRANSLATE_SYNC_ON_BOOT", True):
+            do_global_sync = _as_bool("TRANSLATE_SYNC_ON_BOOT", True) or _as_bool("TRANSLATE_FORCE_REMOVE_SLASH", True)
+            if do_global_sync:
                 try:
                     await self.bot.tree.sync()
                 except Exception as e:
@@ -712,11 +690,7 @@ class TranslateCommands(commands.Cog):
 
         text = (text or "").strip()
 
-        # 2) OCR handling
-        has_images = _has_image_candidates(src_msg)
-        ocr_on_image = _as_bool("TRANSLATE_OCR_ON_IMAGE", False)
-
-        # If no text at all, try OCR first (fallback-only).
+        # 2) OCR fallback ONLY if no text
         if not text:
             image_bytes = await _find_any_image_bytes(src_msg)
             if image_bytes:
@@ -732,8 +706,7 @@ class TranslateCommands(commands.Cog):
                 await interaction.followup.send(embed=emb, ephemeral=ephemeral)
                 return
 
-        # Still nothing and no images to OCR.
-        if not text and not has_images:
+        if not text:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
             return
 
@@ -763,65 +736,6 @@ class TranslateCommands(commands.Cog):
             else:
                 emb.set_footer(text=f"Translated by {provider} • target={target}")
             await interaction.followup.send(embed=emb, ephemeral=ephemeral)
-
-        # 3) If message has text AND images, optionally OCR images too.
-        if has_images and ocr_on_image:
-            try:
-                image_bytes = await _find_any_image_bytes(src_msg)
-                if image_bytes:
-                    ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
-                    if ok:
-                        emb = discord.Embed(title="Translation (Image)")
-                        if detected:
-                            emb.add_field(name="Detected Text", value=detected[:1024], inline=False)
-                        emb.add_field(name=f"Translation → {target}", value=translated[:1024] or "(empty)", inline=False)
-                        emb.set_footer(text=f"Translated by Gemini • target={target} • {reason}")
-                        await interaction.followup.send(embed=emb, ephemeral=ephemeral)
-                    else:
-                        if debug:
-                            await interaction.followup.send(f"OCR failed: {reason}", ephemeral=ephemeral)
-            except Exception as e:
-                if debug:
-                    await interaction.followup.send(f"OCR error: {e!r}", ephemeral=ephemeral)
-    @app_commands.command(name="translate", description="Translate text to target language")
-    @app_commands.describe(text="Text to translate", target="Target language code, e.g. id, en, ja")
-    async def translate_slash(self, interaction: discord.Interaction, text: str, target: Optional[str] = None):
-        if not _as_bool("TRANSLATE_ENABLE", True):
-            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
-            return
-
-        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
-        if not ok_cd:
-            await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
-            return
-
-        ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
-        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-
-        tgt = (target or _env("TRANSLATE_TARGET_LANG", "id")).strip() or "id"
-        provider = _pick_provider()
-        max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
-        chunks = _chunk_text(text, max_chars)
-
-        for idx, ch in enumerate(chunks, 1):
-            if provider == "groq":
-                ok, out = await _groq_translate_text(ch, tgt)
-            else:
-                ok, out = await _gemini_translate_text(ch, tgt)
-
-            if not ok:
-                await interaction.followup.send(out, ephemeral=ephemeral)
-                return
-
-            emb = discord.Embed(title="Translation")
-            emb.description = out[:4096]
-            if len(chunks) > 1:
-                emb.set_footer(text=f"Part {idx}/{len(chunks)} • Translated by {provider} • target={tgt}")
-            else:
-                emb.set_footer(text=f"Translated by {provider} • target={tgt}")
-            await interaction.followup.send(embed=emb, ephemeral=ephemeral)
-
-
 async def setup(bot: commands.Bot):
     cog = TranslateCommands(bot)
     await bot.add_cog(cog)

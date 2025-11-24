@@ -162,35 +162,79 @@ def _env_int(key: str, default: int) -> int:
 
 def _load_neg_text() -> list[str]:
     """
-    Load LPG_NEGATIVE_TEXT from environment.
+    Load negative-text cues for Lucky Pull guard.
 
-    Supports:
-    - JSON list string: ["a","b"]
-    - comma/semicolon/newline separated string
+    Sources (merged):
+    - LPG_NEGATIVE_TEXT from environment (JSON list string or comma/semicolon/newline separated).
+    - LPG_NEGATIVE_TEXT_FILE (optional): UTF-8 text file, one token per line, "#" comments allowed.
+
+    Returns a lowercased, de-duplicated list.
     """
+    out: list[str] = []
+
     raw = (os.getenv("LPG_NEGATIVE_TEXT") or "").strip()
-    if not raw:
-        return []
-    try:
-        if raw.startswith("[") or raw.startswith("{"):
-            j = json.loads(raw)
-            if isinstance(j, list):
-                return [str(x).strip() for x in j if str(x).strip()]
-            if isinstance(j, str):
-                raw2 = j
+    if raw:
+        try:
+            if raw.startswith("[") or raw.startswith("{"):
+                j = json.loads(raw)
+                if isinstance(j, list):
+                    out.extend([str(x).strip() for x in j if str(x).strip()])
+                elif isinstance(j, str):
+                    raw2 = j
+                    for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
+                        s = part.strip()
+                        if s:
+                            out.append(s)
+                else:
+                    raw2 = raw
+                    for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
+                        s = part.strip()
+                        if s:
+                            out.append(s)
             else:
                 raw2 = raw
-        else:
+                for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
+                    s = part.strip()
+                    if s:
+                        out.append(s)
+        except Exception:
             raw2 = raw
-    except Exception:
-        raw2 = raw
-    out: list[str] = []
-    for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
-        s = part.strip()
-        if s:
-            out.append(s)
-    return out
+            for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
+                s = part.strip()
+                if s:
+                    out.append(s)
 
+    path = (os.getenv("LPG_NEGATIVE_TEXT_FILE") or "").strip()
+    if path:
+        log = logging.getLogger(__name__)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    out.append(s)
+            log.info(f"[lpg-negtext] loaded file={path} tokens={len(out)}")
+        except FileNotFoundError:
+            log.warning(f"[lpg-negtext] file not found: {path} (using inline list only)")
+        except Exception as e:
+            log.warning(f"[lpg-negtext] failed to read {path}: {e} (using inline list only)")
+
+    if not out:
+        return []
+
+    # normalize + dedup (case-insensitive), preserve first-seen order
+    seen: set[str] = set()
+    norm: list[str] = []
+    for t in out:
+        s = str(t).strip().lower()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        norm.append(s)
+    return norm
 def _detect_image_mime(image_bytes: bytes) -> str:
     # quick magic
     if image_bytes[:4] == b"\x89PNG":

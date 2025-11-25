@@ -99,7 +99,6 @@ attack
 apply
 agony
 mark
-draw
 card selection
 choose a card
 reward selection

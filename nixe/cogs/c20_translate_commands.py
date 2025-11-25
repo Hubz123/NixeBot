@@ -637,105 +637,229 @@ class TranslateCommands(commands.Cog):
         self._registered = False
         self.bot.loop.create_task(self._ensure_registered())
 
-    async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
-        if not _as_bool("TRANSLATE_ENABLE", True):
-            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
-            return
+async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
+    if not _as_bool("TRANSLATE_ENABLE", True):
+        await interaction.response.send_message("Translate is disabled.", ephemeral=True)
+        return
 
-        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
-        if not ok_cd:
-            await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
-            return
+    ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
+    if not ok_cd:
+        await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
+        return
 
-        ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
-        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+    ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
+    await interaction.response.defer(thinking=True, ephemeral=ephemeral)
 
-        # Context-menu provides a partial Message; refetch for full embeds/attachments.
+    # Context-menu provides a partial Message; refetch for full embeds/attachments.
+    try:
+        if interaction.channel and hasattr(interaction.channel, "fetch_message"):
+            message = await interaction.channel.fetch_message(message.id)
+    except Exception:
+        # best-effort only
+        pass
+
+    # Unwrap reply/forward wrappers if needed.
+    src_msg = _pick_best_source_message(message)
+
+    target = _env("TRANSLATE_TARGET_LANG", "id").strip() or "id"
+    debug = _as_bool("TRANSLATE_DEBUG_LOG", False)
+
+    try:
+        log.info(
+            "[translate] ctx invoke uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
+            getattr(interaction.user, "id", None),
+            getattr(message, "id", None),
+            type(src_msg).__name__,
+            len((getattr(src_msg, "content", "") or "")),
+            len(getattr(src_msg, "embeds", None) or []),
+            len(getattr(src_msg, "attachments", None) or []),
+            len(getattr(message, "message_snapshots", None) or []),
+            target,
+        )
+    except Exception:
+        pass
+
+    # -------------------------
+    # 1) Collect base text (chat / embed text)
+    # -------------------------
+    raw_text = (getattr(src_msg, "content", "") or "").strip()
+    text_for_chat = raw_text
+
+    embeds = list(getattr(src_msg, "embeds", None) or [])
+    if embeds and (not raw_text or _looks_like_only_urls(raw_text)):
+        emb_text = _extract_text_from_embeds(embeds)
+        if emb_text:
+            text_for_chat = emb_text
+
+    text_for_chat = (text_for_chat or "").strip()
+
+    # -------------------------
+    # 2) Collect images (attachments + embed images)
+    # -------------------------
+    try:
+        max_images = int(float(_env("TRANSLATE_MAX_IMAGES", "3")))
+    except Exception:
+        max_images = 3
+    if max_images < 0:
+        max_images = 0
+
+    image_entries = []  # List[bytes]
+    if max_images > 0:
+        # 2a) attachments
         try:
-            if interaction.channel and hasattr(interaction.channel, "fetch_message"):
-                message = await interaction.channel.fetch_message(message.id)
+            for att in (getattr(src_msg, "attachments", None) or []):
+                if len(image_entries) >= max_images:
+                    break
+                fn = (getattr(att, "filename", "") or "").lower()
+                url = (getattr(att, "url", None) or getattr(att, "proxy_url", None) or "")
+                ct = (getattr(att, "content_type", "") or "").lower()
+                is_img = (
+                    any(fn.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"))
+                    or any(str(url).lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"))
+                    or ("image/" in ct)
+                )
+                if not is_img:
+                    continue
+                b = None
+                try:
+                    read_fn = getattr(att, "read", None)
+                    if callable(read_fn):
+                        b = await read_fn()
+                except Exception:
+                    b = None
+                if not b and url:
+                    try:
+                        b = await _fetch_image_bytes(str(url))
+                    except Exception:
+                        b = None
+                if b:
+                    image_entries.append(b)
         except Exception:
-            pass
+            if debug:
+                log.exception("[translate] error while scanning attachments for images")
 
-        # Unwrap reply/forward wrappers if needed.
-        src_msg = _pick_best_source_message(message)
-
-        target = _env("TRANSLATE_TARGET_LANG", "id").strip() or "id"
-        debug = _as_bool("TRANSLATE_DEBUG_LOG", False)
-
+        # 2b) embed images (link previews / bot embeds)
         try:
-            log.info(
-                "[translate] ctx invoke uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
-                getattr(interaction.user, "id", None),
-                getattr(message, "id", None),
-                type(src_msg).__name__,
-                len((getattr(src_msg, "content", "") or "")),
-                len(getattr(src_msg, "embeds", None) or []),
-                len(getattr(src_msg, "attachments", None) or []),
-                len(getattr(message, "message_snapshots", None) or []),
-                target,
+            if len(image_entries) < max_images:
+                embeds2 = list(getattr(src_msg, "embeds", None) or [])
+                for u in _extract_image_urls_from_embeds(embeds2):
+                    if len(image_entries) >= max_images:
+                        break
+                    try:
+                        b = await _fetch_image_bytes(u)
+                    except Exception:
+                        b = None
+                    if b:
+                        image_entries.append(b)
+        except Exception:
+            if debug:
+                log.exception("[translate] error while scanning embeds for images")
+
+    # Jika tidak ada teks chat/embed dan tidak ada gambar sama sekali -> langsung beri pesan kosong.
+    if not text_for_chat and not image_entries:
+        await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
+        return
+
+    # -------------------------
+    # 3) Bangun embed gabungan (gambar dulu, lalu chat)
+    # -------------------------
+    embed = discord.Embed(title="Translation")
+
+    # 3a) Proses gambar-gambar (prioritas)
+    image_any_ok = False
+    for idx, img_bytes in enumerate(image_entries, 1):
+        ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, target)
+        field_name = f"🖼 Gambar #{idx}"
+        if not ok_img:
+            # Gagal untuk gambar ini saja; lanjut ke gambar berikutnya / chat.
+            embed.add_field(
+                name=field_name,
+                value=(f"Gagal menerjemahkan gambar ini: {reason}"[:1024] or "(error)"),
+                inline=False,
             )
-        except Exception:
-            pass
+            continue
 
-        # 1) Text / embed text path FIRST
-        raw_text = (getattr(src_msg, "content", "") or "").strip()
-        text = raw_text
+        if (detected or "").strip():
+            # tampilkan teks asli + terjemahan
+            value_lines = []
+            value_lines.append("**Detected text:**")
+            value_lines.append((detected or "(empty)")[:600])
+            value_lines.append("")
+            value_lines.append(f"**Translated → {target}:**")
+            value_lines.append((translated_img or "(empty)")[:600])
+            val = "\n".join(value_lines)
+        else:
+            # tidak ada teks terbaca
+            if (translated_img or "").strip():
+                # kadang model hanya mengembalikan terjemahan
+                val = f"**Translated → {target}:**\n{(translated_img or '(empty)')[:1024]}"
+            else:
+                val = "_Tidak ada teks terbaca di gambar ini._"
 
-        embeds = list(getattr(src_msg, "embeds", None) or [])
-        if embeds and (not raw_text or _looks_like_only_urls(raw_text)):
-            emb_text = _extract_text_from_embeds(embeds)
-            if emb_text:
-                text = emb_text
+        embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
+        image_any_ok = True
 
-        text = (text or "").strip()
-
-        # 2) OCR fallback ONLY if no text
-        if not text:
-            image_bytes = await _find_any_image_bytes(src_msg)
-            if image_bytes:
-                ok, detected, translated, reason = await _translate_image_gemini(image_bytes, target)
-                if not ok:
-                    await interaction.followup.send(reason, ephemeral=ephemeral)
-                    return
-                emb = discord.Embed(title="Translation (Image)")
-                if detected:
-                    emb.add_field(name="Detected Text", value=detected[:1024], inline=False)
-                emb.add_field(name=f"Translation → {target}", value=translated[:1024] or "(empty)", inline=False)
-                emb.set_footer(text=f"Translated by Gemini • target={target} • {reason}")
-                await interaction.followup.send(embed=emb, ephemeral=ephemeral)
-                return
-
-        if not text:
-            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
-            return
-
-        provider = _pick_provider()
-
+    # 3b) Proses chat user (jika ada text_for_chat)
+    provider = _pick_provider()
+    translated_chat = ""
+    if text_for_chat:
+        # chunking seperti sebelumnya, tapi kita gabungkan hasil ke satu field
         try:
-            max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
-        except Exception:
-            max_chars = 1800
+            try:
+                max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
+            except Exception:
+                max_chars = 1800
+            chunks = _chunk_text(text_for_chat, max_chars)
+            out_parts = []
+            for ch in chunks:
+                if provider == "groq":
+                    ok, out = await _groq_translate_text(ch, target)
+                else:
+                    ok, out = await _gemini_translate_text(ch, target)
+                if not ok:
+                    # Kalau gagal text-translate, kirim error dan stop
+                    await interaction.followup.send(out, ephemeral=ephemeral)
+                    return
+                out_parts.append(out)
+            translated_chat = "\n".join(out_parts).strip()
+        except Exception as e:
+            if debug:
+                log.exception("[translate] chat translation failed: %r", e)
+            translated_chat = ""
 
-        chunks = _chunk_text(text, max_chars)
+        # Susun field chat user
+        src_preview = text_for_chat[:600]
+        if translated_chat and translated_chat.strip() != text_for_chat.strip():
+            # ada hasil terjemahan berbeda
+            value_lines = []
+            value_lines.append("**Source:**")
+            value_lines.append(src_preview)
+            value_lines.append("")
+            value_lines.append(f"**Translated → {target}:**")
+            value_lines.append(translated_chat[:600])
+            chat_val = "\n".join(value_lines)
+        else:
+            # sama atau gagal terjemah; tampilkan source + note
+            value_lines = []
+            value_lines.append("**Source:**")
+            value_lines.append(src_preview)
+            value_lines.append("")
+            value_lines.append(f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._")
+            chat_val = "\n".join(value_lines)
 
-        for idx, ch in enumerate(chunks, 1):
-            if provider == "groq":
-                ok, out = await _groq_translate_text(ch, target)
-            else:
-                ok, out = await _gemini_translate_text(ch, target)
+        embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
 
-            if not ok:
-                await interaction.followup.send(out, ephemeral=ephemeral)
-                return
+    # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
+    if not embed.fields:
+        await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
+        return
 
-            emb = discord.Embed(title="Translation")
-            emb.description = out[:4096]
-            if len(chunks) > 1:
-                emb.set_footer(text=f"Part {idx}/{len(chunks)} • Translated by {provider} • target={target}")
-            else:
-                emb.set_footer(text=f"Translated by {provider} • target={target}")
-            await interaction.followup.send(embed=emb, ephemeral=ephemeral)
+    # Footer info provider untuk debug ringan
+    footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
+    embed.set_footer(text=" • ".join(footer_bits))
+
+    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+
 async def setup(bot: commands.Bot):
     cog = TranslateCommands(bot)
     await bot.add_cog(cog)

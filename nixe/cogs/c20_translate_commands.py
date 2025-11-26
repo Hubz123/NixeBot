@@ -32,7 +32,7 @@ Optional configs (runtime_env.json or env):
 from __future__ import annotations
 
 import os, json, logging, re, asyncio, base64
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Set
 
 import discord
 import aiohttp
@@ -92,24 +92,41 @@ def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
 
 
 def _chunk_text(text: str, max_chars: int) -> List[str]:
+    """Split long text into chunks at natural boundaries (sentences/words)."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = (text or "").strip()
     if len(text) <= max_chars:
         return [text]
     chunks: List[str] = []
-    buf = ""
-    for p in text.split("\n\n"):
-        cand = (buf + "\n\n" + p) if buf else p
-        if len(cand) <= max_chars:
-            buf = cand
-            continue
-        if buf:
-            chunks.append(buf); buf = ""
-        if len(p) > max_chars:
-            for k in range(0, len(p), max_chars):
-                chunks.append(p[k:k+max_chars])
-        else:
-            buf = p
-    if buf:
-        chunks.append(buf)
+    remaining = text
+    # We try to break near the end of the window, but not before 60% of max_chars,
+    # so chunks stay reasonably large.
+    hard_min = max_chars * 6 // 10
+    break_chars = ".!?。！？…\n;；:：、,， "
+
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars]
+        break_at = -1
+        # Prefer punctuation or newline close to the end.
+        for idx in range(len(window) - 1, hard_min - 1, -1):
+            if window[idx] in break_chars:
+                break_at = idx + 1
+                break
+        if break_at <= 0:
+            # Fallback: last space before the limit, if any.
+            space_idx = window.rfind(" ")
+            if space_idx >= hard_min:
+                break_at = space_idx + 1
+            else:
+                # Hard cut.
+                break_at = max_chars
+        chunk = remaining[:break_at].rstrip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[break_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
     return chunks
 
 def _looks_like_only_urls(text: str) -> bool:
@@ -414,8 +431,132 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
     strict_sys = _env("TRANSLATE_SYS_MSG_STRICT", strict_default)
 
     async def _call(sys_msg: str) -> Tuple[bool, str]:
-        from typing import Tuple as _TupleAlias  # avoid mypy complaints if any
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": sys_msg + "\n\nTEXT:\n" + (text or "")}],
+                }
+            ],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        }
+        try:
+            import aiohttp  # type: ignore
 
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=15) as resp:
+                    if resp.status != 200:
+                        # Friendlier handling for upstream HTTP errors (e.g. 503).
+                        try:
+                            detail = await resp.text()
+                        except Exception:
+                            detail = ""
+                        detail = (detail or "")[:500]
+                        status = resp.status
+                        # Map common statuses to user-friendly messages.
+                        if status == 503:
+                            return False, "Layanan translate Gemini sedang sibuk atau sementara tidak tersedia (HTTP 503). Coba lagi beberapa detik lagi."
+                        if status == 429:
+                            return False, "Translate Gemini sedang kena rate limit (HTTP 429). Coba lagi sebentar lagi."
+                        if 500 <= status < 600:
+                            return False, f"Server Gemini error (HTTP {status}). Coba lagi nanti."
+                        return False, f"Gemini HTTP {status}: {detail}"
+                    data = await resp.json()
+                    out = ""
+                    try:
+                        cand = (data.get("candidates") or [])[0]
+                        parts = (cand.get("content") or {}).get("parts") or []
+                        out = "".join(str(p.get("text") or "") for p in parts)
+                    except Exception:
+                        out = json.dumps(data)[:2000]
+                    out = _clean_output(out)
+                    if not out:
+                        return False, "empty Gemini response"
+                    try:
+                        jj = json.loads(out)
+                        out2 = str(jj.get("translation", "") or out)
+                        return True, out2.strip() or "(empty)"
+                    except Exception:
+                        return True, out.strip() or "(empty)"
+        except Exception as e:
+            return False, f"Gemini request failed: {e!r}"
+
+    ok, out = await _call(base_sys)
+    if ok and _seems_untranslated(text or "", out or "", target_lang):
+        ok2, out2 = await _call(strict_sys)
+        if ok2 and out2:
+            out = out2
+    return ok, out
+
+_DUAL_STYLE_LANGS: Set[str] = {
+    "ja", "jp",
+    "ko", "kr",
+    "zh", "zh-cn", "zh-hans", "zh-hant", "cn", "chs", "cht",
+}
+
+
+async def _gemini_translate_text_dual(text: str, target_lang: str) -> Tuple[bool, Dict[str, str], str]:
+    """Translate text into target_lang returning two styles (formal + casual).
+
+    Returns:
+        (ok, variants, err_msg)
+        ok = True  -> variants contains keys 'formal' and/or 'casual', err_msg is "".
+        ok = False -> err_msg is a human-readable error, variants may be empty.
+    """
+    key = _pick_gemini_key()
+    if not key:
+        return False, {}, "missing TRANSLATE_GEMINI_API_KEY"
+
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    schema = _env("TRANSLATE_SCHEMA_DUAL", '{"formal": "...", "casual": "...", "reason": "..."}')
+
+    lang = (target_lang or "").lower()
+
+    # Style guidance differs slightly for each CJK language.
+    if lang in ("ja", "jp"):
+        style_note = (
+            " Produce two Japanese outputs: "
+            "(1) 'formal' = natural, polite Japanese (です・ます調) suitable for most written messages; "
+            "(2) 'casual' = natural daily-chat style (タメ口/くだけた表現) that close friends might use. "
+        )
+    elif lang in ("ko", "kr"):
+        style_note = (
+            " Produce two Korean outputs: "
+            "(1) 'formal' = natural polite Korean (해요체, '-요' form) suitable for most situations; "
+            "(2) 'casual' = natural informal speech (반말) as used with close friends. "
+        )
+    else:
+        # zh / cn / chs / cht etc.
+        style_note = (
+            " Produce two Chinese outputs: "
+            "(1) 'formal' = natural, standard written Chinese suitable for a wide audience; "
+            "(2) 'casual' = natural daily-chat style as used in friendly conversations or chat apps. "
+        )
+
+    base_default = (
+        f"You are a translation engine. Translate the user's text into {target_lang} in two styles: "
+        "(1) a formal/polite written style, and (2) a casual/daily-conversation style. "
+        "Return ONLY compact JSON matching this schema: {schema}. No prose outside JSON. "
+        "Field 'formal' MUST contain the formal translation. "
+        "Field 'casual' MUST contain the casual/daily-chat translation. "
+        "Field 'reason' MAY briefly explain key choices or be an empty string. "
+        + style_note
+    )
+    base_sys = _env("TRANSLATE_SYS_MSG_DUAL", base_default)
+
+    strict_default = (
+        f"STRICT MODE. Translate ALL user text into {target_lang} in two styles (formal + casual). "
+        "Do NOT leave untranslated fragments except proper nouns, usernames, or URLs. "
+        "Return ONLY compact JSON matching this schema: {schema}. No prose outside JSON. "
+        "Field 'formal' MUST contain the formal translation. "
+        "Field 'casual' MUST contain the casual/daily-chat translation. "
+        "Field 'reason' MAY briefly explain key choices or be an empty string. "
+        + style_note
+    )
+    strict_sys = _env("TRANSLATE_SYS_MSG_DUAL_STRICT", strict_default)
+
+    async def _call(sys_msg: str) -> Tuple[bool, str, str, str]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
             "contents": [
@@ -436,7 +577,15 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
                             detail = await resp.text()
                         except Exception:
                             detail = ""
-                        return False, f"Gemini HTTP {resp.status}: {detail[:500]}"
+                        detail = (detail or "")[:500]
+                        status = resp.status
+                        if status == 503:
+                            return False, "", "", "Layanan translate Gemini sedang sibuk atau sementara tidak tersedia (HTTP 503). Coba lagi beberapa detik lagi."
+                        if status == 429:
+                            return False, "", "", "Translate Gemini sedang kena rate limit (HTTP 429). Coba lagi sebentar lagi."
+                        if 500 <= status < 600:
+                            return False, "", "", f"Server Gemini error (HTTP {status}). Coba lagi nanti."
+                        return False, "", "", f"Gemini HTTP {status}: {detail}"
                     data = await resp.json()
                     out = ""
                     try:
@@ -444,26 +593,42 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
                         parts = (cand.get("content") or {}).get("parts") or []
                         out = "".join(str(p.get("text") or "") for p in parts)
                     except Exception:
-                        # Fallback: dump JSON compactly
                         out = json.dumps(data)[:2000]
                     out = _clean_output(out)
                     if not out:
-                        return False, "empty Gemini response"
+                        return False, "", "", "empty Gemini response"
                     try:
                         jj = json.loads(out)
-                        out2 = str(jj.get("translation", "") or out)
-                        return True, out2.strip() or "(empty)"
+                        formal = str(jj.get("formal", "") or "").strip()
+                        casual = str(jj.get("casual", "") or "").strip()
+                        # Fallback: some schemas may still use 'translation'.
+                        if not formal and "translation" in jj and not casual:
+                            formal = str(jj.get("translation") or "").strip()
+                        if not formal and not casual:
+                            # As last resort, treat raw text as formal.
+                            return True, out.strip() or "(empty)", "", ""
+                        return True, formal or "", casual or "", ""
                     except Exception:
-                        return True, out.strip() or "(empty)"
+                        # If JSON parse fails, treat entire output as the formal variant.
+                        return True, out.strip() or "(empty)", "", ""
         except Exception as e:
-            return False, f"Gemini request failed: {e!r}"
+            return False, "", "", f"Gemini request failed: {e!r}"
 
-    ok, out = await _call(base_sys)
-    if ok and _seems_untranslated(text or "", out or "", target_lang):
-        ok2, out2 = await _call(strict_sys)
-        if ok2 and out2:
-            out = out2
-    return ok, out
+    ok, formal, casual, err = await _call(base_sys)
+    if ok and _seems_untranslated(text or "", formal or "", target_lang):
+        ok2, formal2, casual2, err2 = await _call(strict_sys)
+        if ok2 and (formal2 or casual2):
+            formal, casual, err = formal2, casual2, ""
+    if not ok:
+        return False, {}, err or "translate_dual_failed"
+    if not (formal or casual):
+        return False, {}, "Model tidak mengembalikan hasil terjemahan."
+    variants: Dict[str, str] = {
+        "formal": formal or "",
+        "casual": casual or "",
+    }
+    return True, variants, ""
+
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
     if not key:
@@ -550,6 +715,19 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
             async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    try:
+                        detail = await resp.text()
+                    except Exception:
+                        detail = ""
+                    detail = (detail or "")[:200]
+                    if resp.status == 503:
+                        return False, "", "", "vision_http_503"
+                    if resp.status == 429:
+                        return False, "", "", "vision_http_429"
+                    if 500 <= resp.status < 600:
+                        return False, "", "", f"vision_http_{resp.status}"
+                    return False, "", "", f"vision_http_{resp.status}:{detail}"
                 data = await resp.json(content_type=None)
 
         candidates = data.get("candidates") or []
@@ -670,6 +848,7 @@ class TranslateCommands(commands.Cog):
         target="Target language: id/en/ja/ko/zh",
         text="Text to translate",
     )
+
     async def translate_slash(self, interaction: discord.Interaction, target: str, text: str):
         """
         Slash command: translate arbitrary text to the given language.
@@ -719,6 +898,56 @@ class TranslateCommands(commands.Cog):
             await interaction.followup.send("Tidak ada teks untuk diterjemahkan.", ephemeral=True)
             return
 
+        # For JA/KO/ZH, try dual-style (formal + casual) first.
+        use_dual = tgt in _DUAL_STYLE_LANGS
+        if use_dual:
+            ok_dual, variants, err_dual = await _gemini_translate_text_dual(text, tgt)
+            if ok_dual and variants:
+                formal = (variants.get("formal") or "").strip()
+                casual = (variants.get("casual") or "").strip()
+                if formal or casual:
+                    embed = discord.Embed(title=f"Translate → {tgt_label}")
+
+                    # Formal block
+                    if formal:
+                        try:
+                            formal_chunks = _chunk_text(formal, 1000)
+                        except Exception:
+                            formal_chunks = [formal[:1000]]
+                        total_f = len(formal_chunks)
+                        for idx, chunk in enumerate(formal_chunks, 1):
+                            fname = f"Translated → {tgt_label} (formal)"
+                            if total_f > 1:
+                                fname = f"{fname} ({idx}/{total_f})"
+                            embed.add_field(
+                                name=fname,
+                                value=(chunk or "(empty)"),
+                                inline=False,
+                            )
+
+                    # Casual block
+                    if casual:
+                        try:
+                            casual_chunks = _chunk_text(casual, 1000)
+                        except Exception:
+                            casual_chunks = [casual[:1000]]
+                        total_c = len(casual_chunks)
+                        for idx, chunk in enumerate(casual_chunks, 1):
+                            fname = f"Translated → {tgt_label} (casual)"
+                            if total_c > 1:
+                                fname = f"{fname} ({idx}/{total_c})"
+                            embed.add_field(
+                                name=fname,
+                                value=(chunk or "(empty)"),
+                                inline=False,
+                            )
+
+                    if embed.fields:
+                        embed.set_footer(text=f"text=gemini • target={tgt} • style=formal+casual")
+                        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+                        return
+            # If dual-style fails or returns empty, fall back to single-style below.
+
         ok, out = await _gemini_translate_text(text, tgt)
         if not ok:
             await interaction.followup.send(f"Gagal menerjemahkan: {out}", ephemeral=True)
@@ -730,14 +959,6 @@ class TranslateCommands(commands.Cog):
             return
 
         embed = discord.Embed(title=f"Translate → {tgt_label}")
-
-        # Source preview
-        src_preview = text[:1024]
-        embed.add_field(
-            name="Source",
-            value=(src_preview or "(empty)"),
-            inline=False,
-        )
 
         # Paged translated text
         try:
@@ -757,7 +978,7 @@ class TranslateCommands(commands.Cog):
 
         embed.set_footer(text=f"text=gemini • target={tgt}")
         await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-
+    
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Plain-text trigger: `nixe translate [text] ke <lang> <teks>`.
@@ -825,6 +1046,67 @@ class TranslateCommands(commands.Cog):
                 await message.channel.send(msg_txt)
             return
 
+        body = body.strip()
+        if not body:
+            try:
+                await message.channel.send("Tidak ada teks untuk diterjemahkan.", reference=message)
+            except Exception:
+                await message.channel.send("Tidak ada teks untuk diterjemahkan.")
+            return
+
+        # For JA/KO/ZH, try dual-style (formal + casual) first.
+        use_dual = tgt in _DUAL_STYLE_LANGS
+        if use_dual:
+            ok_dual, variants, err_dual = await _gemini_translate_text_dual(body, tgt)
+            if ok_dual and variants:
+                formal = (variants.get("formal") or "").strip()
+                casual = (variants.get("casual") or "").strip()
+                if formal or casual:
+                    embed = discord.Embed(title=f"Translate → {tgt_label}")
+
+                    # Formal block
+                    if formal:
+                        try:
+                            formal_chunks = _chunk_text(formal, 1000)
+                        except Exception:
+                            formal_chunks = [formal[:1000]]
+                        total_f = len(formal_chunks)
+                        for idx, chunk in enumerate(formal_chunks, 1):
+                            fname = f"Translated → {tgt_label} (formal)"
+                            if total_f > 1:
+                                fname = f"{fname} ({idx}/{total_f})"
+                            embed.add_field(
+                                name=fname,
+                                value=(chunk or "(empty)"),
+                                inline=False,
+                            )
+
+                    # Casual block
+                    if casual:
+                        try:
+                            casual_chunks = _chunk_text(casual, 1000)
+                        except Exception:
+                            casual_chunks = [casual[:1000]]
+                        total_c = len(casual_chunks)
+                        for idx, chunk in enumerate(casual_chunks, 1):
+                            fname = f"Translated → {tgt_label} (casual)"
+                            if total_c > 1:
+                                fname = f"{fname} ({idx}/{total_c})"
+                            embed.add_field(
+                                name=fname,
+                                value=(chunk or "(empty)"),
+                                inline=False,
+                            )
+
+                    if embed.fields:
+                        embed.set_footer(text=f"text=gemini • target={tgt} • style=formal+casual")
+                        try:
+                            await message.channel.send(embed=embed, reference=message)
+                        except Exception:
+                            await message.channel.send(embed=embed)
+                        return
+            # If dual-style fails or returns empty, fall back to single-style below.
+
         ok, out = await _gemini_translate_text(body, tgt)
         if not ok:
             txt = f"Gagal menerjemahkan: {out}"
@@ -844,14 +1126,6 @@ class TranslateCommands(commands.Cog):
             return
 
         embed = discord.Embed(title=f"Translate → {tgt_label}")
-
-        # Source preview
-        src_preview = body[:1024]
-        embed.add_field(
-            name="Source",
-            value=(src_preview or "(empty)"),
-            inline=False,
-        )
 
         # Paged translated text
         try:
@@ -874,7 +1148,6 @@ class TranslateCommands(commands.Cog):
             await message.channel.send(embed=embed, reference=message)
         except Exception:
             await message.channel.send(embed=embed)
-
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
         if not _as_bool("TRANSLATE_ENABLE", True):
             await interaction.response.send_message("Translate is disabled.", ephemeral=True)
@@ -1026,15 +1299,6 @@ class TranslateCommands(commands.Cog):
             det_text = (detected or "").strip()
             tr_text = (translated_img or "").strip()
 
-            if det_text:
-                # Tampilkan teks asli di field terpisah (preview).
-                det_val = f"**Detected text:**\n{det_text}"
-                embed.add_field(
-                    name=f"{field_name} — Source",
-                    value=(det_val[:1024] or "(empty)"),
-                    inline=False,
-                )
-
             if tr_text:
                 # Bagi terjemahan panjang menjadi beberapa halaman embed.
                 try:
@@ -1062,9 +1326,14 @@ class TranslateCommands(commands.Cog):
             image_any_ok = image_any_ok or ok_img
 
 
+
         # 3b) Proses chat user (jika ada text_for_chat)
         provider = _pick_provider()
         translated_chat = ""
+        translated_chat_formal = ""
+        translated_chat_casual = ""
+        use_dual_chat = str(target).lower() in _DUAL_STYLE_LANGS
+
         if text_for_chat:
             # chunking teks panjang, lalu gabungkan hasil translate
             try:
@@ -1073,15 +1342,37 @@ class TranslateCommands(commands.Cog):
                 except Exception:
                     max_chars = 1800
                 chunks = _chunk_text(text_for_chat, max_chars)
-                out_parts = []
-                for ch in chunks:
-                    # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
-                    ok, out = await _gemini_translate_text(ch, target)
-                    if not ok:
-                        await interaction.followup.send(out, ephemeral=ephemeral)
-                        return
-                    out_parts.append(out)
-                translated_chat = "\n".join(out_parts).strip()
+
+                if use_dual_chat:
+                    formal_parts: List[str] = []
+                    casual_parts: List[str] = []
+                    for ch in chunks:
+                        ok2, variants, err2 = await _gemini_translate_text_dual(ch, target)
+                        if not ok2 or not variants:
+                            # gagal mode dual; fallback ke single-style
+                            use_dual_chat = False
+                            formal_parts = []
+                            casual_parts = []
+                            break
+                        formal_parts.append((variants.get("formal") or "").strip())
+                        casual_parts.append((variants.get("casual") or "").strip())
+
+                    if use_dual_chat and (formal_parts or casual_parts):
+                        translated_chat_formal = "\n".join(p for p in formal_parts if p).strip()
+                        translated_chat_casual = "\n".join(p for p in casual_parts if p).strip()
+                        # pakai salah satu sebagai "gabungan" untuk keperluan perbandingan dengan source
+                        translated_chat = translated_chat_formal or translated_chat_casual
+
+                if not use_dual_chat:
+                    out_parts: List[str] = []
+                    for ch in chunks:
+                        # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
+                        ok, out = await _gemini_translate_text(ch, target)
+                        if not ok:
+                            await interaction.followup.send(out, ephemeral=ephemeral)
+                            return
+                        out_parts.append(out)
+                    translated_chat = "\n".join(out_parts).strip()
             except Exception as e:
                 if debug:
                     log.exception("[translate] chat translation failed: %r", e)
@@ -1089,48 +1380,71 @@ class TranslateCommands(commands.Cog):
 
             # Susun field chat user
             src_preview = text_for_chat[:600]
-            if translated_chat and translated_chat.strip() != text_for_chat.strip():
-                # ada hasil terjemahan berbeda:
-                # - selalu tampilkan source sebagai preview sendiri
-                # - hasil terjemahan dipotong per-halaman embed berdasarkan panjang TERJEMAHAN,
-                #   bukan dijumlah dengan panjang source.
-                src_val = "**Source (preview):**\n" + src_preview
-                embed.add_field(
-                    name="💬 Chat user — Source",
-                    value=(src_val[:1024] or "(empty)"),
-                    inline=False,
-                )
+            if use_dual_chat and (translated_chat_formal or translated_chat_casual):
+                # Mode dual-style: dua blok, formal dan casual.
+                if translated_chat_formal:
+                    try:
+                        chat_chunks_f = _chunk_text(translated_chat_formal, 1000)
+                    except Exception:
+                        chat_chunks_f = [translated_chat_formal[:1000]]
+                    total_pages_f = len(chat_chunks_f)
+                    for page_idx, chunk in enumerate(chat_chunks_f, 1):
+                        fname = f"💬 Chat user — Translated → {target} (formal)"
+                        if total_pages_f > 1:
+                            fname = f"{fname} ({page_idx}/{total_pages_f})"
+                        embed.add_field(
+                            name=fname,
+                            value=(chunk or "(empty)"),
+                            inline=False,
+                        )
 
-                try:
-                    chat_chunks = _chunk_text(translated_chat, 1000)
-                except Exception:
-                    chat_chunks = [translated_chat[:1000]]
-                total_pages = len(chat_chunks)
-                for page_idx, chunk in enumerate(chat_chunks, 1):
-                    fname = f"💬 Chat user — Translated → {target}"
-                    if total_pages > 1:
-                        fname = f"{fname} ({page_idx}/{total_pages})"
-                    embed.add_field(
-                        name=fname,
-                        value=(chunk or "(empty)"),
-                        inline=False,
-                    )
+                if translated_chat_casual:
+                    try:
+                        chat_chunks_c = _chunk_text(translated_chat_casual, 1000)
+                    except Exception:
+                        chat_chunks_c = [translated_chat_casual[:1000]]
+                    total_pages_c = len(chat_chunks_c)
+                    for page_idx, chunk in enumerate(chat_chunks_c, 1):
+                        fname = f"💬 Chat user — Translated → {target} (casual)"
+                        if total_pages_c > 1:
+                            fname = f"{fname} ({page_idx}/{total_pages_c})"
+                        embed.add_field(
+                            name=fname,
+                            value=(chunk or "(empty)"),
+                            inline=False,
+                        )
             else:
-                # sama atau gagal terjemah; untuk kasus ini:
-                # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
-                #   menampilkan blok Chat user lagi agar embed tetap ringkas.
-                if not (image_any_ok and str(target).lower() == "id"):
-                    value_lines = []
-                    value_lines.append("**Source:**")
-                    value_lines.append(src_preview)
-                    value_lines.append("")
-                    value_lines.append(f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._")
-                    msg = "\n".join(value_lines)
-                    embed.add_field(
-                        name="💬 Chat user",
-                        value=(msg[:1024] or "(empty)"),
-                        inline=False,
-                    )
+                if translated_chat and translated_chat.strip() != text_for_chat.strip():
+                    # ada hasil terjemahan berbeda:
+                    # - tidak perlu lagi field "Source" di embed karena reply sudah mengacu ke pesan asli.
+                    # - hasil terjemahan dipotong per-halaman embed berdasarkan panjang TERJEMAHAN,
+                    #   bukan dijumlah dengan panjang source.
+
+                    try:
+                        chat_chunks = _chunk_text(translated_chat, 1000)
+                    except Exception:
+                        chat_chunks = [translated_chat[:1000]]
+                    total_pages = len(chat_chunks)
+                    for page_idx, chunk in enumerate(chat_chunks, 1):
+                        fname = f"💬 Chat user — Translated → {target}"
+                        if total_pages > 1:
+                            fname = f"{fname} ({page_idx}/{total_pages})"
+                        embed.add_field(
+                            name=fname,
+                            value=(chunk or "(empty)"),
+                            inline=False,
+                        )
+                else:
+                    # sama atau gagal terjemah; untuk kasus ini:
+                    # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
+                    #   menampilkan blok Chat user lagi agar embed tetap ringkas.
+                    if not (image_any_ok and str(target).lower() == "id"):
+                        msg = f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._"
+                        embed.add_field(
+                            name="💬 Chat user",
+                            value=(msg[:1024] or "(empty)"),
+                            inline=False,
+                        )
         # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
         if not embed.fields:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)

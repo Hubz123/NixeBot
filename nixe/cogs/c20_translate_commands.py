@@ -329,8 +329,12 @@ def _translate_guild_ids() -> List[int]:
     return []
 
 def _pick_provider() -> str:
-    # For Nixe translate: we always use Gemini.
-    # Groq is reserved exclusively for phishing, not for translate.
+    """
+    Provider selector for translate.
+
+    For Nixe translate we hard-lock to Gemini. Groq is reserved exclusively
+    for phishing classification and MUST NOT be used for translate.
+    """
     return "gemini"
 def _pick_gemini_key() -> str:
     key = _env("TRANSLATE_GEMINI_API_KEY", "")
@@ -661,8 +665,8 @@ class TranslateCommands(commands.Cog):
             pass
 
         # -------------------------
+        # 1) Collect base text (chat / embed text)
 
-        # -------------------------
         # 1) Collect base text (chat / embed text)
         # -------------------------
         raw_text = (getattr(src_msg, "content", "") or "").strip()
@@ -801,12 +805,9 @@ class TranslateCommands(commands.Cog):
                 chunks = _chunk_text(text_for_chat, max_chars)
                 out_parts = []
                 for ch in chunks:
-                    if provider == "groq":
-                        ok, out = await _groq_translate_text(ch, target)
-                    else:
-                        ok, out = await _gemini_translate_text(ch, target)
+                    # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
+                    ok, out = await _gemini_translate_text(ch, target)
                     if not ok:
-                        # Kalau gagal text-translate, kirim error dan stop
                         await interaction.followup.send(out, ephemeral=ephemeral)
                         return
                     out_parts.append(out)
@@ -825,7 +826,7 @@ class TranslateCommands(commands.Cog):
                 value_lines.append(src_preview)
                 value_lines.append("")
                 value_lines.append(f"**Translated → {target}:**")
-                value_lines.append(translated_chat[:600])
+                value_lines.append(translated_chat)
                 chat_val = "\n".join(value_lines)
             else:
                 # sama atau gagal terjemah; untuk kasus ini:

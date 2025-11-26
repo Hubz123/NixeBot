@@ -770,33 +770,50 @@ class TranslateCommands(commands.Cog):
                 )
                 continue
 
-            if (detected or "").strip():
-                # tampilkan teks asli + terjemahan
-                value_lines = []
-                value_lines.append("**Detected text:**")
-                value_lines.append((detected or "(empty)")[:600])
-                value_lines.append("")
-                value_lines.append(f"**Translated → {target}:**")
-                value_lines.append((translated_img or "(empty)")[:600])
-                val = "\n".join(value_lines)
-            else:
-                # tidak ada teks terbaca
-                if (translated_img or "").strip():
-                    # kadang model hanya mengembalikan terjemahan
-                    val = f"**Translated → {target}:**\n{(translated_img or '(empty)')[:1024]}"
-                else:
-                    val = "_Tidak ada teks terbaca di gambar ini._"
+            det_text = (detected or "").strip()
+            tr_text = (translated_img or "").strip()
 
-            embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
-            image_any_ok = True
+            if det_text:
+                # Tampilkan teks asli di field terpisah (preview).
+                det_val = f"**Detected text:**\n{det_text}"
+                embed.add_field(
+                    name=f"{field_name} — Source",
+                    value=(det_val[:1024] or "(empty)"),
+                    inline=False,
+                )
+
+            if tr_text:
+                # Bagi terjemahan panjang menjadi beberapa halaman embed.
+                try:
+                    tr_chunks = _chunk_text(tr_text, 1000)
+                except Exception:
+                    tr_chunks = [tr_text[:1000]]
+                total = len(tr_chunks)
+                for page_idx, chunk in enumerate(tr_chunks, 1):
+                    fname = f"{field_name} — Translated → {target}"
+                    if total > 1:
+                        fname = f"{fname} ({page_idx}/{total})"
+                    embed.add_field(
+                        name=fname,
+                        value=(chunk or "(empty)"),
+                        inline=False,
+                    )
+            elif not det_text:
+                # tidak ada teks terbaca sama sekali
+                embed.add_field(
+                    name=field_name,
+                    value="_Tidak ada teks terbaca di gambar ini._",
+                    inline=False,
+                )
+
+            image_any_ok = image_any_ok or ok_img
 
 
         # 3b) Proses chat user (jika ada text_for_chat)
         provider = _pick_provider()
         translated_chat = ""
-        chat_val: str | None = None
         if text_for_chat:
-            # chunking seperti sebelumnya, tapi kita gabungkan hasil ke satu field
+            # chunking teks panjang, lalu gabungkan hasil translate
             try:
                 try:
                     max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
@@ -820,14 +837,31 @@ class TranslateCommands(commands.Cog):
             # Susun field chat user
             src_preview = text_for_chat[:600]
             if translated_chat and translated_chat.strip() != text_for_chat.strip():
-                # ada hasil terjemahan berbeda
-                value_lines = []
-                value_lines.append("**Source:**")
-                value_lines.append(src_preview)
-                value_lines.append("")
-                value_lines.append(f"**Translated → {target}:**")
-                value_lines.append(translated_chat)
-                chat_val = "\n".join(value_lines)
+                # ada hasil terjemahan berbeda:
+                # - selalu tampilkan source sebagai preview sendiri
+                # - hasil terjemahan dipotong per-halaman embed berdasarkan panjang TERJEMAHAN,
+                #   bukan dijumlah dengan panjang source.
+                src_val = "**Source (preview):**\n" + src_preview
+                embed.add_field(
+                    name="💬 Chat user — Source",
+                    value=(src_val[:1024] or "(empty)"),
+                    inline=False,
+                )
+
+                try:
+                    chat_chunks = _chunk_text(translated_chat, 1000)
+                except Exception:
+                    chat_chunks = [translated_chat[:1000]]
+                total_pages = len(chat_chunks)
+                for page_idx, chunk in enumerate(chat_chunks, 1):
+                    fname = f"💬 Chat user — Translated → {target}"
+                    if total_pages > 1:
+                        fname = f"{fname} ({page_idx}/{total_pages})"
+                    embed.add_field(
+                        name=fname,
+                        value=(chunk or "(empty)"),
+                        inline=False,
+                    )
             else:
                 # sama atau gagal terjemah; untuk kasus ini:
                 # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
@@ -838,10 +872,12 @@ class TranslateCommands(commands.Cog):
                     value_lines.append(src_preview)
                     value_lines.append("")
                     value_lines.append(f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._")
-                    chat_val = "\n".join(value_lines)
-
-        if chat_val is not None:
-            embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
+                    msg = "\n".join(value_lines)
+                    embed.add_field(
+                        name="💬 Chat user",
+                        value=(msg[:1024] or "(empty)"),
+                        inline=False,
+                    )
         # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
         if not embed.fields:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)

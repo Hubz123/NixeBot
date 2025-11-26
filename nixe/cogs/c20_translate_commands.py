@@ -358,9 +358,18 @@ def _pick_groq_key() -> str:
 
 
 async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
+    """
+    Translate plain text to the given target language using Gemini.
+
+    Returns:
+        (ok, output_text)
+        ok = True  -> output_text is the translated text (or best-effort raw output).
+        ok = False -> output_text is an error message.
+    """
     key = _pick_gemini_key()
     if not key:
         return False, "missing TRANSLATE_GEMINI_API_KEY"
+
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
 
@@ -403,6 +412,58 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         + f" Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
     strict_sys = _env("TRANSLATE_SYS_MSG_STRICT", strict_default)
+
+    async def _call(sys_msg: str) -> Tuple[bool, str]:
+        from typing import Tuple as _TupleAlias  # avoid mypy complaints if any
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": sys_msg + "\n\nTEXT:\n" + (text or "")}],
+                }
+            ],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        }
+        try:
+            import aiohttp  # type: ignore
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=15) as resp:
+                    if resp.status != 200:
+                        try:
+                            detail = await resp.text()
+                        except Exception:
+                            detail = ""
+                        return False, f"Gemini HTTP {resp.status}: {detail[:500]}"
+                    data = await resp.json()
+                    out = ""
+                    try:
+                        cand = (data.get("candidates") or [])[0]
+                        parts = (cand.get("content") or {}).get("parts") or []
+                        out = "".join(str(p.get("text") or "") for p in parts)
+                    except Exception:
+                        # Fallback: dump JSON compactly
+                        out = json.dumps(data)[:2000]
+                    out = _clean_output(out)
+                    if not out:
+                        return False, "empty Gemini response"
+                    try:
+                        jj = json.loads(out)
+                        out2 = str(jj.get("translation", "") or out)
+                        return True, out2.strip() or "(empty)"
+                    except Exception:
+                        return True, out.strip() or "(empty)"
+        except Exception as e:
+            return False, f"Gemini request failed: {e!r}"
+
+    ok, out = await _call(base_sys)
+    if ok and _seems_untranslated(text or "", out or "", target_lang):
+        ok2, out2 = await _call(strict_sys)
+        if ok2 and out2:
+            out = out2
+    return ok, out
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
     if not key:

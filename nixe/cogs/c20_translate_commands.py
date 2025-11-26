@@ -329,15 +329,9 @@ def _translate_guild_ids() -> List[int]:
     return []
 
 def _pick_provider() -> str:
-    pv = _env("TRANSLATE_PROVIDER", "").strip().lower()
-    if pv in ("gemini", "groq"):
-        return pv
-    if _pick_gemini_key():
-        return "gemini"
-    if _pick_groq_key():
-        return "groq"
+    # For Nixe translate: we always use Gemini.
+    # Groq is reserved exclusively for phishing, not for translate.
     return "gemini"
-
 def _pick_gemini_key() -> str:
     key = _env("TRANSLATE_GEMINI_API_KEY", "")
     if key:
@@ -667,19 +661,25 @@ class TranslateCommands(commands.Cog):
             pass
 
         # -------------------------
+
+        # -------------------------
         # 1) Collect base text (chat / embed text)
         # -------------------------
         raw_text = (getattr(src_msg, "content", "") or "").strip()
         text_for_chat = raw_text
 
         embeds = list(getattr(src_msg, "embeds", None) or [])
-        if embeds and (not raw_text or _looks_like_only_urls(raw_text)):
+        if embeds:
             emb_text = _extract_text_from_embeds(embeds)
             if emb_text:
-                text_for_chat = emb_text
+                if not text_for_chat or _looks_like_only_urls(text_for_chat):
+                    # kalau chat kosong / cuma URL, pakai teks embed saja
+                    text_for_chat = emb_text
+                else:
+                    # kalau dua-duanya ada teks, gabungkan supaya info embed juga ikut diterjemahkan
+                    text_for_chat = f"{text_for_chat}\n\n{emb_text}"
 
         text_for_chat = (text_for_chat or "").strip()
-
         # -------------------------
         # 2) Collect images (attachments + embed images)
         # -------------------------
@@ -786,9 +786,11 @@ class TranslateCommands(commands.Cog):
             embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
             image_any_ok = True
 
+
         # 3b) Proses chat user (jika ada text_for_chat)
         provider = _pick_provider()
         translated_chat = ""
+        chat_val: str | None = None
         if text_for_chat:
             # chunking seperti sebelumnya, tapi kita gabungkan hasil ke satu field
             try:
@@ -826,16 +828,19 @@ class TranslateCommands(commands.Cog):
                 value_lines.append(translated_chat[:600])
                 chat_val = "\n".join(value_lines)
             else:
-                # sama atau gagal terjemah; tampilkan source + note
-                value_lines = []
-                value_lines.append("**Source:**")
-                value_lines.append(src_preview)
-                value_lines.append("")
-                value_lines.append(f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._")
-                chat_val = "\n".join(value_lines)
+                # sama atau gagal terjemah; untuk kasus ini:
+                # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
+                #   menampilkan blok Chat user lagi agar embed tetap ringkas.
+                if not (image_any_ok and str(target).lower() == "id"):
+                    value_lines = []
+                    value_lines.append("**Source:**")
+                    value_lines.append(src_preview)
+                    value_lines.append("")
+                    value_lines.append(f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._")
+                    chat_val = "\n".join(value_lines)
 
+        if chat_val is not None:
             embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
-
         # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
         if not embed.fields:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)

@@ -356,6 +356,7 @@ def _pick_groq_key() -> str:
 # Gemini / Groq text translate
 # -------------------------
 
+
 async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_gemini_key()
     if not key:
@@ -363,64 +364,45 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
 
-    base_sys = _env(
-        "TRANSLATE_SYS_MSG",
+    # Adjust style hints based on target language. For Japanese/Korean/Chinese we
+    # explicitly ask for polite, grammatically correct written style so the
+    # output does not read as weird slang.
+    lang = (target_lang or "").lower()
+    style_note = ""
+    if lang in ("ja", "jp"):
+        style_note = (
+            " Use natural, polite Japanese (です・ます調) appropriate for general written messages. "
+            "Avoid overly stiff keigo and avoid slang unless it is clearly present in the source."
+        )
+    elif lang in ("ko", "kr"):
+        style_note = (
+            " Use natural, polite Korean (해요체, '-요' form) appropriate for general conversation. "
+            "Avoid rude or aggressive slang unless it is clearly present in the source."
+        )
+    elif lang in ("zh", "zh-cn", "zh-hans", "zh-hant", "cn", "chs", "cht"):
+        style_note = (
+            " Use natural, standard Simplified Chinese suitable for a wide audience. "
+            "Avoid archaic or excessively literary style unless the source is clearly written that way."
+        )
+    elif lang in ("en",):
+        style_note = " Use natural, fluent English."
+
+    base_default = (
         f"You are a translation engine. Translate the user's text into {target_lang}. "
         "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
         f"If the text is already in {target_lang}, return it unchanged. "
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+        + style_note
+        + f" Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
-    strict_sys = _env(
-        "TRANSLATE_SYS_MSG_STRICT",
+    base_sys = _env("TRANSLATE_SYS_MSG", base_default)
+
+    strict_default = (
         f"STRICT MODE. Translate ALL user text into {target_lang}. "
         "No source-language remnants except proper nouns/usernames/URLs. "
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+        + style_note
+        + f" Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
-
-    async def _call(sys_msg: str) -> Tuple[bool, str]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
-            ],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
-        }
-        try:
-            import aiohttp  # type: ignore
-        except Exception as e:
-            return False, f"aiohttp missing: {e!r}"
-
-        try:
-            async with aiohttp.ClientSession() as sess:
-                async with sess.post(url, json=payload, timeout=20) as resp:
-                    if resp.status != 200:
-                        body = await resp.text()
-                        return False, f"Gemini HTTP {resp.status}: {body[:200]}"
-                    j = await resp.json()
-                    cand = (j.get("candidates") or [{}])[0]
-                    parts = (((cand.get("content") or {}).get("parts")) or [])
-                    out = ""
-                    for p in parts:
-                        if "text" in p:
-                            out += p["text"]
-                    out = _clean_output(out)
-                    # accept JSON or plain text fallback
-                    try:
-                        jj = json.loads(out)
-                        out2 = str(jj.get("translation", "") or out)
-                        return True, out2.strip() or "(empty)"
-                    except Exception:
-                        return True, out.strip() or "(empty)"
-        except Exception as e:
-            return False, f"Gemini request failed: {e!r}"
-
-    ok, out = await _call(base_sys)
-    if ok and _seems_untranslated(text, out, target_lang):
-        ok2, out2 = await _call(strict_sys)
-        if ok2 and out2:
-            out = out2
-    return ok, out
-
+    strict_sys = _env("TRANSLATE_SYS_MSG_STRICT", strict_default)
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
     if not key:
@@ -621,6 +603,216 @@ class TranslateCommands(commands.Cog):
 
             self._registered = True
             log.info("[translate] registered ctx+slash to gids=%s", gids)
+
+    @app_commands.command(name="translate", description="Translate free text with Nixe (Gemini)")
+    @app_commands.describe(
+        target="Target language: id/en/ja/ko/zh",
+        text="Text to translate",
+    )
+    async def translate_slash(self, interaction: discord.Interaction, target: str, text: str):
+        """
+        Slash command: translate arbitrary text to the given language.
+
+        This does NOT inspect message embeds/images. For full message+image
+        translation continue to use the message context-menu.
+        """
+        if not _as_bool("TRANSLATE_ENABLE", True):
+            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
+            return
+
+        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
+        if not ok_cd:
+            await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
+            return
+
+        ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+
+        raw = (target or "").strip().lower()
+
+        # Normalise target language and map common aliases.
+        if raw in ("id", "ind", "indo", "indonesia", "indonesian"):
+            tgt = "id"
+            tgt_label = "ID"
+        elif raw in ("en", "eng", "english"):
+            tgt = "en"
+            tgt_label = "EN"
+        elif raw in ("ja", "jp", "jpn", "japanese", "nihon", "nihongo"):
+            tgt = "ja"
+            tgt_label = "JA"
+        elif raw in ("ko", "kr", "kor", "korean", "hangul", "hangeul"):
+            tgt = "ko"
+            tgt_label = "KO"
+        elif raw in ("zh", "zh-cn", "zh-hans", "zh-hant", "cn", "chs", "cht", "chinese", "mandarin"):
+            tgt = "zh"
+            tgt_label = "ZH"
+        else:
+            await interaction.followup.send(
+                "Bahasa tujuan tidak dikenal. Gunakan salah satu: id, en, ja, ko, zh.",
+                ephemeral=True,
+            )
+            return
+
+        text = (text or "").strip()
+        if not text:
+            await interaction.followup.send("Tidak ada teks untuk diterjemahkan.", ephemeral=True)
+            return
+
+        ok, out = await _gemini_translate_text(text, tgt)
+        if not ok:
+            await interaction.followup.send(f"Gagal menerjemahkan: {out}", ephemeral=True)
+            return
+
+        out = (out or "").strip()
+        if not out:
+            await interaction.followup.send("Model tidak mengembalikan hasil terjemahan.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title=f"Translate → {tgt_label}")
+
+        # Source preview
+        src_preview = text[:1024]
+        embed.add_field(
+            name="Source",
+            value=(src_preview or "(empty)"),
+            inline=False,
+        )
+
+        # Paged translated text
+        try:
+            tr_chunks = _chunk_text(out, 1000)
+        except Exception:
+            tr_chunks = [out[:1000]]
+        total = len(tr_chunks)
+        for idx, chunk in enumerate(tr_chunks, 1):
+            fname = f"Translated → {tgt_label}"
+            if total > 1:
+                fname = f"{fname} ({idx}/{total})"
+            embed.add_field(
+                name=fname,
+                value=(chunk or "(empty)"),
+                inline=False,
+            )
+
+        embed.set_footer(text=f"text=gemini • target={tgt}")
+        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """Plain-text trigger: `nixe translate [text] ke <lang> <teks>`.
+
+        Examples:
+          - "nixe translate ke en aku mau tidur"
+          - "nixe translate text ke jp aku suka kamu"
+        """
+        if message.author.bot:
+            return
+        if not _as_bool("TRANSLATE_ENABLE", True):
+            return
+        if not _as_bool("TRANSLATE_TEXT_ENABLE", True):
+            # optional kill-switch; default is enabled (no config needed)
+            return
+
+        content = (getattr(message, "content", "") or "").strip()
+        if not content:
+            return
+
+        # Match leading pattern: nixe translate [text|teks] ke <lang> <body>
+        m = re.match(r"(?is)^(nixe\s+translate(?:\s+(?:text|teks))?\s+ke\s+)(\S+)\s+(.+)$", content)
+        if not m:
+            return
+
+        lang_raw = (m.group(2) or "").strip().lower()
+        body = (m.group(3) or "").strip()
+        if not body:
+            try:
+                await message.channel.send("Tidak ada teks untuk diterjemahkan.", reference=message)
+            except Exception:
+                await message.channel.send("Tidak ada teks untuk diterjemahkan.")
+            return
+
+        ok_cd, wait_s = self._cooldown_ok(getattr(message.author, "id", 0))
+        if not ok_cd:
+            txt = f"Cooldown. Coba lagi dalam {wait_s:.1f} detik."
+            try:
+                await message.channel.send(txt, reference=message)
+            except Exception:
+                await message.channel.send(txt)
+            return
+
+        # Normalise target language and map common aliases.
+        if lang_raw in ("id", "ind", "indo", "indonesia", "indonesian"):
+            tgt = "id"
+            tgt_label = "ID"
+        elif lang_raw in ("en", "eng", "english"):
+            tgt = "en"
+            tgt_label = "EN"
+        elif lang_raw in ("ja", "jp", "jpn", "japanese", "nihon", "nihongo"):
+            tgt = "ja"
+            tgt_label = "JA"
+        elif lang_raw in ("ko", "kr", "kor", "korean", "hangul", "hangeul"):
+            tgt = "ko"
+            tgt_label = "KO"
+        elif lang_raw in ("zh", "zh-cn", "zh-hans", "zh-hant", "cn", "chs", "cht", "chinese", "mandarin"):
+            tgt = "zh"
+            tgt_label = "ZH"
+        else:
+            msg_txt = "Bahasa tujuan tidak dikenal. Gunakan salah satu: id, en, ja, ko, zh."
+            try:
+                await message.channel.send(msg_txt, reference=message)
+            except Exception:
+                await message.channel.send(msg_txt)
+            return
+
+        ok, out = await _gemini_translate_text(body, tgt)
+        if not ok:
+            txt = f"Gagal menerjemahkan: {out}"
+            try:
+                await message.channel.send(txt, reference=message)
+            except Exception:
+                await message.channel.send(txt)
+            return
+
+        out = (out or "").strip()
+        if not out:
+            txt = "Model tidak mengembalikan hasil terjemahan."
+            try:
+                await message.channel.send(txt, reference=message)
+            except Exception:
+                await message.channel.send(txt)
+            return
+
+        embed = discord.Embed(title=f"Translate → {tgt_label}")
+
+        # Source preview
+        src_preview = body[:1024]
+        embed.add_field(
+            name="Source",
+            value=(src_preview or "(empty)"),
+            inline=False,
+        )
+
+        # Paged translated text
+        try:
+            tr_chunks = _chunk_text(out, 1000)
+        except Exception:
+            tr_chunks = [out[:1000]]
+        total = len(tr_chunks)
+        for idx, chunk in enumerate(tr_chunks, 1):
+            fname = f"Translated → {tgt_label}"
+            if total > 1:
+                fname = f"{fname} ({idx}/{total})"
+            embed.add_field(
+                name=fname,
+                value=(chunk or "(empty)"),
+                inline=False,
+            )
+
+        embed.set_footer(text=f"text=gemini • target={tgt}")
+        try:
+            await message.channel.send(embed=embed, reference=message)
+        except Exception:
+            await message.channel.send(embed=embed)
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
         if not _as_bool("TRANSLATE_ENABLE", True):

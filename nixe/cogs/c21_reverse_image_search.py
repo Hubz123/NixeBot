@@ -179,6 +179,14 @@ class ReverseImageCog(commands.Cog):
                 # If registration fails, do not crash the bot; just skip.
                 pass
 
+            # Optionally sync the tree so the context menu appears in Discord UI.
+            if _as_bool("REVERSE_IMAGE_SYNC_ON_BOOT", True):
+                try:
+                    await self.bot.tree.sync()
+                except Exception:
+                    # best-effort only; do not crash if sync fails
+                    pass
+
             if _as_bool("REVERSE_IMAGE_SYNC_ON_BOOT", True):
                 try:
                     await self.bot.tree.sync()

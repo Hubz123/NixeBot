@@ -628,6 +628,72 @@ async def _gemini_translate_text_dual(text: str, target_lang: str) -> Tuple[bool
     }
     return True, variants, ""
 
+
+async def _gemini_japanese_to_romaji(text: str) -> Tuple[bool, str, str]:
+    """Convert Japanese text (kanji/kana) into Latin romaji using Gemini.
+
+    Returns:
+        (ok, romaji, err_msg)
+        ok = True  -> romaji contains the romaji text.
+        ok = False -> err_msg is a human-readable error.
+    """
+    text = (text or "").strip()
+    if not text:
+        return False, "", "empty_text"
+
+    key = _pick_gemini_key()
+    if not key:
+        return False, "", "missing TRANSLATE_GEMINI_API_KEY"
+
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    base_default = (
+        "You convert Japanese text (kanji, hiragana, katakana) into Latin romaji. "
+        "Input TEXT may span multiple sentences and lines. "
+        "Return ONLY the romaji version of TEXT, preserving line breaks. "
+        "Do NOT include Japanese characters or any commentary."
+    )
+    sys_msg = _env("TRANSLATE_JA_ROMAJI_SYS", base_default)
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}],
+            }
+        ],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 2048},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:  # type: ignore
+            async with session.post(url, json=payload, timeout=15) as resp:
+                if resp.status != 200:
+                    try:
+                        detail = await resp.text()
+                    except Exception:
+                        detail = ""
+                    detail = (detail or "")[:500]
+                    status = resp.status
+                    if status == 503:
+                        return False, "", "Layanan romaji Gemini sementara tidak tersedia (HTTP 503). Coba lagi sebentar lagi."
+                    if status == 429:
+                        return False, "", "Layanan romaji Gemini sedang kena rate limit (HTTP 429). Coba lagi beberapa detik lagi."
+                    if 500 <= status < 600:
+                        return False, "", f"Server Gemini error (HTTP {status}). Coba lagi nanti."
+                    return False, "", f"Gemini HTTP {status}: {detail}"
+                data = await resp.json()
+                out = ""
+                try:
+                    cand = (data.get("candidates") or [])[0]
+                    parts = (cand.get("content") or {}).get("parts") or []
+                    out = "".join(str(p.get("text") or "") for p in parts)
+                except Exception:
+                    out = json.dumps(data)[:2000]
+                return True, (out or "").strip(), ""
+    except Exception as e:
+        return False, "", f"Gemini romaji request failed: {e!r}"
+
+
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
     if not key:
@@ -921,12 +987,19 @@ class TranslateCommands(commands.Cog):
                 if formal or casual:
                     embeds = []
 
+                    add_romaji = tgt in ("ja", "jp") and _as_bool("TRANSLATE_ROMAJI_ENABLE", True)
+
                     # Formal embed
                     if formal:
+                        text_formal = formal
+                        if add_romaji:
+                            ok_r_f, romaji_f, _err_rf = await _gemini_japanese_to_romaji(formal)
+                            if ok_r_f and (romaji_f or "").strip():
+                                text_formal = f"{formal.strip()}\n\n[Romaji]\n{romaji_f.strip()}"
                         try:
-                            formal_chunks = _chunk_text(formal, 1000)
+                            formal_chunks = _chunk_text(text_formal, 1000)
                         except Exception:
-                            formal_chunks = [formal[:1000]]
+                            formal_chunks = [text_formal[:1000]]
                         total_f = len(formal_chunks)
                         embed_f = discord.Embed(title=f"Translate → {tgt_label} (formal)")
                         for idx, chunk in enumerate(formal_chunks, 1):
@@ -943,10 +1016,15 @@ class TranslateCommands(commands.Cog):
 
                     # Casual embed
                     if casual:
+                        text_casual = casual
+                        if add_romaji:
+                            ok_r_c, romaji_c, _err_rc = await _gemini_japanese_to_romaji(casual)
+                            if ok_r_c and (romaji_c or "").strip():
+                                text_casual = f"{casual.strip()}\n\n[Romaji]\n{romaji_c.strip()}"
                         try:
-                            casual_chunks = _chunk_text(casual, 1000)
+                            casual_chunks = _chunk_text(text_casual, 1000)
                         except Exception:
-                            casual_chunks = [casual[:1000]]
+                            casual_chunks = [text_casual[:1000]]
                         total_c = len(casual_chunks)
                         embed_c = discord.Embed(title=f"Translate → {tgt_label} (casual)")
                         for idx, chunk in enumerate(casual_chunks, 1):

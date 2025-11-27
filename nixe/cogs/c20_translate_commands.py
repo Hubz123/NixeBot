@@ -836,6 +836,7 @@ class TranslateCommands(commands.Cog):
             self._registered = True
             log.info("[translate] registered ctx+slash to gids=%s", gids)
 
+    @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Plain-text trigger: `nixe translate [text] ke <lang> <teks>`.
 

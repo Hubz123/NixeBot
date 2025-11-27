@@ -647,10 +647,11 @@ async def _gemini_japanese_to_romaji(text: str) -> Tuple[bool, str, str]:
 
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     base_default = (
-        "You convert Japanese text (kanji, hiragana, katakana) into Latin romaji. "
+        "You convert Japanese text (kanji, hiragana, katakana) into Latin romaji using ONE consistent style (Hepburn). "
+        "Represent long vowels explicitly with vowels, for example: use 'arigatou', 'ohayou', 'yuujin', never 'arigato' or 'ohayo'. "
         "Input TEXT may span multiple sentences and lines. "
         "Return ONLY the romaji version of TEXT, preserving line breaks. "
-        "Do NOT include Japanese characters or any commentary."
+        "Do NOT include Japanese characters or any commentary, and do not explain."
     )
     sys_msg = _env("TRANSLATE_JA_ROMAJI_SYS", base_default)
 

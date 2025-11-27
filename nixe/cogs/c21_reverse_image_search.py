@@ -146,6 +146,7 @@ class ReverseImageCog(commands.Cog):
         self._registered = False
         self._register_lock = asyncio.Lock()
 
+
     async def _ensure_registered(self) -> None:
         if self._registered:
             return
@@ -157,42 +158,66 @@ class ReverseImageCog(commands.Cog):
                 self._registered = True
                 return
 
+            # Wait until the bot is fully ready so guild list and tree are populated.
+            await self.bot.wait_until_ready()
+
+            gids = [g.id for g in getattr(self.bot, "guilds", [])]
+            if not gids:
+                # No guilds to register against; mark as done to avoid loops.
+                self._registered = True
+                return
+
             ctx_name = "Reverse image (Nixe)"
 
-            # Remove any legacy command with the same name to avoid duplicates.
+            # Remove any legacy/global commands with the same name.
             try:
-                existing = list(self.bot.tree.get_commands())
-                for cmd in existing:
-                    if isinstance(cmd, app_commands.ContextMenu) and cmd.name == ctx_name:
-                        try:
+                for cmd in list(self.bot.tree.get_commands()):
+                    try:
+                        if isinstance(cmd, app_commands.ContextMenu) and cmd.name == ctx_name:
                             self.bot.tree.remove_command(cmd.name, type=cmd.type)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Remove any per-guild leftovers.
+            for gid in gids:
+                gobj = discord.Object(id=gid)
+                try:
+                    for cmd in list(self.bot.tree.get_commands(guild=gobj)):
+                        try:
+                            if isinstance(cmd, app_commands.ContextMenu) and cmd.name == ctx_name:
+                                self.bot.tree.remove_command(cmd.name, type=cmd.type, guild=gobj)
                         except Exception:
                             pass
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            try:
-                self.bot.tree.add_command(
-                    app_commands.ContextMenu(name=ctx_name, callback=self.trace_image_ctx),
-                )
-            except Exception:
-                # If registration fails, do not crash the bot; just skip.
-                pass
+            # Add per-guild context menu commands.
+            for gid in gids:
+                gobj = discord.Object(id=gid)
+                try:
+                    self.bot.tree.add_command(
+                        app_commands.ContextMenu(name=ctx_name, callback=self.trace_image_ctx),
+                        guild=gobj,
+                    )
+                except Exception:
+                    # Best-effort; do not crash on individual guild failures.
+                    pass
 
-            # Optionally sync the tree so the context menu appears in Discord UI.
+            # Sync once globally, then per guild, so the menu appears immediately.
             if _as_bool("REVERSE_IMAGE_SYNC_ON_BOOT", True):
                 try:
                     await self.bot.tree.sync()
                 except Exception:
-                    # best-effort only; do not crash if sync fails
+                    # Avoid crashing; global sync is best-effort.
                     pass
-
-            if _as_bool("REVERSE_IMAGE_SYNC_ON_BOOT", True):
-                try:
-                    await self.bot.tree.sync()
-                except Exception:
-                    # Avoid crashing; this is best-effort only.
-                    pass
+                for gid in gids:
+                    try:
+                        await self.bot.tree.sync(guild=discord.Object(id=gid))
+                    except Exception:
+                        # Per-guild sync failures should not crash the bot.
+                        pass
 
             self._registered = True
 

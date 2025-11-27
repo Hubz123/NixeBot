@@ -23,7 +23,6 @@ Optional configs (runtime_env.json or env):
   TRANSLATE_COOLDOWN_SEC=5
   TRANSLATE_EPHEMERAL=1
   TRANSLATE_CTX_NAME="Translate (Nixe)"
-  TRANSLATE_SLASH_ENABLE=1
   TRANSLATE_GUILD_ID=<single guild id>
   TRANSLATE_GUILD_IDS=<comma separated ids>
   TRANSLATE_ALLOW_FALLBACK=1  (allow fallback to GEMINI_API_KEY / GEMINI_API_KEY_B)
@@ -821,12 +820,6 @@ class TranslateCommands(commands.Cog):
                 except Exception:
                     pass
 
-                if _as_bool("TRANSLATE_SLASH_ENABLE", False):
-                    try:
-                        self.bot.tree.add_command(self.translate_slash, guild=gobj)
-                    except Exception:
-                        pass
-
             # sync once global to flush legacy, then per guild
             do_global_sync = _as_bool("TRANSLATE_SYNC_ON_BOOT", True) or _as_bool("TRANSLATE_FORCE_REMOVE_SLASH", True)
             if do_global_sync:
@@ -843,143 +836,6 @@ class TranslateCommands(commands.Cog):
             self._registered = True
             log.info("[translate] registered ctx+slash to gids=%s", gids)
 
-    @app_commands.command(name="translate", description="Translate free text with Nixe (Gemini)")
-    @app_commands.describe(
-        target="Target language: id/en/ja/ko/zh",
-        text="Text to translate",
-    )
-
-    async def translate_slash(self, interaction: discord.Interaction, target: str, text: str):
-        """
-        Slash command: translate arbitrary text to the given language.
-
-        This does NOT inspect message embeds/images. For full message+image
-        translation continue to use the message context-menu.
-        """
-        if not _as_bool("TRANSLATE_ENABLE", True):
-            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
-            return
-
-        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
-        if not ok_cd:
-            await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
-            return
-
-        ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
-        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-
-        raw = (target or "").strip().lower()
-
-        # Normalise target language and map common aliases.
-        if raw in ("id", "ind", "indo", "indonesia", "indonesian"):
-            tgt = "id"
-            tgt_label = "ID"
-        elif raw in ("en", "eng", "english"):
-            tgt = "en"
-            tgt_label = "EN"
-        elif raw in ("ja", "jp", "jpn", "japanese", "nihon", "nihongo"):
-            tgt = "ja"
-            tgt_label = "JA"
-        elif raw in ("ko", "kr", "kor", "korean", "hangul", "hangeul"):
-            tgt = "ko"
-            tgt_label = "KO"
-        elif raw in ("zh", "zh-cn", "zh-hans", "zh-hant", "cn", "chs", "cht", "chinese", "mandarin"):
-            tgt = "zh"
-            tgt_label = "ZH"
-        else:
-            await interaction.followup.send(
-                "Bahasa tujuan tidak dikenal. Gunakan salah satu: id, en, ja, ko, zh.",
-                ephemeral=True,
-            )
-            return
-
-        text = (text or "").strip()
-        if not text:
-            await interaction.followup.send("Tidak ada teks untuk diterjemahkan.", ephemeral=True)
-            return
-
-        # For JA/KO/ZH, try dual-style (formal + casual) first.
-        use_dual = tgt in _DUAL_STYLE_LANGS
-        if use_dual:
-            ok_dual, variants, err_dual = await _gemini_translate_text_dual(text, tgt)
-            if ok_dual and variants:
-                formal = (variants.get("formal") or "").strip()
-                casual = (variants.get("casual") or "").strip()
-                if formal or casual:
-                    embed = discord.Embed(title=f"Translate → {tgt_label}")
-
-                    # Formal block
-                    if formal:
-                        try:
-                            formal_chunks = _chunk_text(formal, 1000)
-                        except Exception:
-                            formal_chunks = [formal[:1000]]
-                        total_f = len(formal_chunks)
-                        for idx, chunk in enumerate(formal_chunks, 1):
-                            fname = f"Translated → {tgt_label} (formal)"
-                            if total_f > 1:
-                                fname = f"{fname} ({idx}/{total_f})"
-                            embed.add_field(
-                                name=fname,
-                                value=(chunk or "(empty)"),
-                                inline=False,
-                            )
-
-                    # Casual block
-                    if casual:
-                        try:
-                            casual_chunks = _chunk_text(casual, 1000)
-                        except Exception:
-                            casual_chunks = [casual[:1000]]
-                        total_c = len(casual_chunks)
-                        for idx, chunk in enumerate(casual_chunks, 1):
-                            fname = f"Translated → {tgt_label} (casual)"
-                            if total_c > 1:
-                                fname = f"{fname} ({idx}/{total_c})"
-                            embed.add_field(
-                                name=fname,
-                                value=(chunk or "(empty)"),
-                                inline=False,
-                            )
-
-                    if embed.fields:
-                        embed.set_footer(text=f"text=gemini • target={tgt} • style=formal+casual")
-                        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-                        return
-            # If dual-style fails or returns empty, fall back to single-style below.
-
-        ok, out = await _gemini_translate_text(text, tgt)
-        if not ok:
-            await interaction.followup.send(f"Gagal menerjemahkan: {out}", ephemeral=True)
-            return
-
-        out = (out or "").strip()
-        if not out:
-            await interaction.followup.send("Model tidak mengembalikan hasil terjemahan.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title=f"Translate → {tgt_label}")
-
-        # Paged translated text
-        try:
-            tr_chunks = _chunk_text(out, 1000)
-        except Exception:
-            tr_chunks = [out[:1000]]
-        total = len(tr_chunks)
-        for idx, chunk in enumerate(tr_chunks, 1):
-            fname = f"Translated → {tgt_label}"
-            if total > 1:
-                fname = f"{fname} ({idx}/{total})"
-            embed.add_field(
-                name=fname,
-                value=(chunk or "(empty)"),
-                inline=False,
-            )
-
-        embed.set_footer(text=f"text=gemini • target={tgt}")
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-    
-    @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         """Plain-text trigger: `nixe translate [text] ke <lang> <teks>`.
 
@@ -1062,48 +918,53 @@ class TranslateCommands(commands.Cog):
                 formal = (variants.get("formal") or "").strip()
                 casual = (variants.get("casual") or "").strip()
                 if formal or casual:
-                    embed = discord.Embed(title=f"Translate → {tgt_label}")
+                    embeds = []
 
-                    # Formal block
+                    # Formal embed
                     if formal:
                         try:
                             formal_chunks = _chunk_text(formal, 1000)
                         except Exception:
                             formal_chunks = [formal[:1000]]
                         total_f = len(formal_chunks)
+                        embed_f = discord.Embed(title=f"Translate → {tgt_label} (formal)")
                         for idx, chunk in enumerate(formal_chunks, 1):
                             fname = f"Translated → {tgt_label} (formal)"
                             if total_f > 1:
                                 fname = f"{fname} ({idx}/{total_f})"
-                            embed.add_field(
+                            embed_f.add_field(
                                 name=fname,
                                 value=(chunk or "(empty)"),
                                 inline=False,
                             )
+                        embed_f.set_footer(text=f"text=gemini • target={tgt} • style=formal")
+                        embeds.append(embed_f)
 
-                    # Casual block
+                    # Casual embed
                     if casual:
                         try:
                             casual_chunks = _chunk_text(casual, 1000)
                         except Exception:
                             casual_chunks = [casual[:1000]]
                         total_c = len(casual_chunks)
+                        embed_c = discord.Embed(title=f"Translate → {tgt_label} (casual)")
                         for idx, chunk in enumerate(casual_chunks, 1):
                             fname = f"Translated → {tgt_label} (casual)"
                             if total_c > 1:
                                 fname = f"{fname} ({idx}/{total_c})"
-                            embed.add_field(
+                            embed_c.add_field(
                                 name=fname,
                                 value=(chunk or "(empty)"),
                                 inline=False,
                             )
+                        embed_c.set_footer(text=f"text=gemini • target={tgt} • style=casual")
+                        embeds.append(embed_c)
 
-                    if embed.fields:
-                        embed.set_footer(text=f"text=gemini • target={tgt} • style=formal+casual")
+                    if embeds:
                         try:
-                            await message.channel.send(embed=embed, reference=message)
+                            await message.channel.send(embeds=embeds, reference=message)
                         except Exception:
-                            await message.channel.send(embed=embed)
+                            await message.channel.send(embeds=embeds)
                         return
             # If dual-style fails or returns empty, fall back to single-style below.
 
@@ -1127,21 +988,28 @@ class TranslateCommands(commands.Cog):
 
         embed = discord.Embed(title=f"Translate → {tgt_label}")
 
-        # Paged translated text
-        try:
-            tr_chunks = _chunk_text(out, 1000)
-        except Exception:
-            tr_chunks = [out[:1000]]
-        total = len(tr_chunks)
-        for idx, chunk in enumerate(tr_chunks, 1):
-            fname = f"Translated → {tgt_label}"
-            if total > 1:
-                fname = f"{fname} ({idx}/{total})"
-            embed.add_field(
-                name=fname,
-                value=(chunk or "(empty)"),
-                inline=False,
-            )
+        # Untuk hasil tidak terlalu panjang, tampilkan sebagai satu blok
+        # di description agar rapi. Jika sangat panjang, fallback ke paging.
+        out_clean = (out or "").strip()
+        if out_clean and len(out_clean) <= 3900:
+            embed.description = out_clean
+        else:
+            # Paged translated text (fallback untuk teks sangat panjang)
+            try:
+                tr_chunks = _chunk_text(out_clean or out, 1000)
+            except Exception:
+                s = out_clean or (out or "")
+                tr_chunks = [s[:1000]]
+            total = len(tr_chunks)
+            for idx, chunk in enumerate(tr_chunks, 1):
+                fname = f"Translated → {tgt_label}"
+                if total > 1:
+                    fname = f"{fname} ({idx}/{total})"
+                embed.add_field(
+                    name=fname,
+                    value=(chunk or "(empty)"),
+                    inline=False,
+                )
 
         embed.set_footer(text=f"text=gemini • target={tgt}")
         try:
@@ -1281,6 +1149,7 @@ class TranslateCommands(commands.Cog):
         # 3) Bangun embed gabungan (gambar dulu, lalu chat)
         # -------------------------
         embed = discord.Embed(title="Translation")
+        chat_embeds = []
 
         # 3a) Proses gambar-gambar (prioritas)
         image_any_ok = False
@@ -1380,23 +1249,26 @@ class TranslateCommands(commands.Cog):
 
             # Susun field chat user
             src_preview = text_for_chat[:600]
+
             if use_dual_chat and (translated_chat_formal or translated_chat_casual):
-                # Mode dual-style: dua blok, formal dan casual.
+                # Mode dual-style: dua embed, formal dan casual terpisah.
                 if translated_chat_formal:
                     try:
                         chat_chunks_f = _chunk_text(translated_chat_formal, 1000)
                     except Exception:
                         chat_chunks_f = [translated_chat_formal[:1000]]
                     total_pages_f = len(chat_chunks_f)
+                    embed_f = discord.Embed(title=f"Translation — Chat ({target} formal)")
                     for page_idx, chunk in enumerate(chat_chunks_f, 1):
                         fname = f"💬 Chat user — Translated → {target} (formal)"
                         if total_pages_f > 1:
                             fname = f"{fname} ({page_idx}/{total_pages_f})"
-                        embed.add_field(
+                        embed_f.add_field(
                             name=fname,
                             value=(chunk or "(empty)"),
                             inline=False,
                         )
+                    chat_embeds.append(embed_f)
 
                 if translated_chat_casual:
                     try:
@@ -1404,15 +1276,17 @@ class TranslateCommands(commands.Cog):
                     except Exception:
                         chat_chunks_c = [translated_chat_casual[:1000]]
                     total_pages_c = len(chat_chunks_c)
+                    embed_c = discord.Embed(title=f"Translation — Chat ({target} casual)")
                     for page_idx, chunk in enumerate(chat_chunks_c, 1):
                         fname = f"💬 Chat user — Translated → {target} (casual)"
                         if total_pages_c > 1:
                             fname = f"{fname} ({page_idx}/{total_pages_c})"
-                        embed.add_field(
+                        embed_c.add_field(
                             name=fname,
                             value=(chunk or "(empty)"),
                             inline=False,
                         )
+                    chat_embeds.append(embed_c)
             else:
                 if translated_chat and translated_chat.strip() != text_for_chat.strip():
                     # ada hasil terjemahan berbeda:
@@ -1445,16 +1319,24 @@ class TranslateCommands(commands.Cog):
                             value=(msg[:1024] or "(empty)"),
                             inline=False,
                         )
-        # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
-        if not embed.fields:
+
+        # Kalau embed masih tanpa field dan tidak ada embed chat, fallback pesan teks.
+        if not embed.fields and not chat_embeds:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
             return
 
-        # Footer info provider untuk debug ringan
-        footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
-        embed.set_footer(text=" • ".join(footer_bits))
+        # Footer info provider untuk embed utama (jika ada)
+        if embed.fields:
+            footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
+            embed.set_footer(text=" • ".join(footer_bits))
 
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        embeds_out = []
+        if embed.fields:
+            embeds_out.append(embed)
+        embeds_out.extend(chat_embeds)
+
+        await interaction.followup.send(embeds=embeds_out, ephemeral=ephemeral)
+
 
     @commands.Cog.listener()
     async def on_ready(self):

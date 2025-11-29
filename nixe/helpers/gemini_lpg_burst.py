@@ -191,64 +191,59 @@ def _negative_phrases() -> List[str]:
 # image helpers
 # ---------------------------------------------------------------------------
 
-
 def _normalize_raw_result(res):
     """
     Normalize raw classifier result into a 5-tuple:
     (lucky: bool, score: float, status: str, reason: str, flags: list[str]).
-
-    Accepted shapes:
-      - (lucky, score, status, reason, flags)
-      - (lucky, score, status, reason)
-      - shorter tuples/lists, where missing fields are filled with defaults
-      - dicts with keys like "lucky", "score", "status"/"st", "reason", "flags"
-      - any other type will be wrapped into a generic error with flags=[repr(res)]
+    Accepts 4-tuple legacy shapes and is defensive about bad types.
     """
-    lucky = False
-    score: float = 0.0
-    st = "error"
-    reason = "bad_result"
-    flags: list = []
-
+    # Tuple / list variants (primary path).
     if isinstance(res, (tuple, list)):
-        seq = list(res)
-        if len(seq) >= 1:
-            lucky = bool(seq[0])
-        if len(seq) >= 2:
-            try:
-                score = float(seq[1])
-            except Exception:
-                score = 0.0
-        if len(seq) >= 3:
-            st = str(seq[2])
-        if len(seq) >= 4:
-            reason = str(seq[3])
-        if len(seq) >= 5:
-            flags = list(seq[4:])
-    elif isinstance(res, dict):
-        lucky = bool(res.get("lucky", False))
+        n = len(res)
+        lucky = bool(res[0]) if n > 0 else False
+        score = res[1] if n > 1 else 0.0
+        st = res[2] if n > 2 else "error"
+        reason = res[3] if n > 3 else "bad_result"
+
+        # Flags: element 4 (index 4) and anything after it.
+        if n > 4:
+            base = res[4]
+            extra = list(res[5:]) if n > 5 else []
+            if isinstance(base, (list, tuple, set)):
+                flags = list(base) + extra
+            else:
+                flags = [base] + extra
+        else:
+            flags = []
+
+        # Normalize score and flags.
         try:
-            score = float(res.get("score", 0.0))
+            score = float(score)
         except Exception:
             score = 0.0
-        st = str(res.get("status", res.get("st", "ok")))
-        reason = str(res.get("reason", ""))
-        raw_flags = res.get("flags", [])
-        if isinstance(raw_flags, (list, tuple)):
-            flags = list(raw_flags)
-        elif raw_flags:
-            flags = [str(raw_flags)]
-    else:
-        # unknown type; keep defaults and expose repr in flags
-        flags = [repr(res)]
+        if not isinstance(flags, list):
+            flags = [flags]
+        flags = [str(f) for f in flags]
+        return bool(lucky), float(score), str(st), str(reason), flags
 
-    if not isinstance(flags, list):
-        flags = [repr(flags)]
-    try:
-        score = float(score)
-    except Exception:
-        score = 0.0
-    return bool(lucky), score, str(st or "ok"), str(reason or ""), flags
+    # Dict-style variants (future proofing).
+    if isinstance(res, dict):
+        lucky = bool(res.get("lucky", res.get("ok", False)))
+        score = res.get("score", res.get("prob", 0.0))
+        try:
+            score = float(score)
+        except Exception:
+            score = 0.0
+        st = res.get("status", res.get("st", "error"))
+        reason = res.get("reason", res.get("msg", "bad_result"))
+        flags = res.get("flags", res.get("tags", []))
+        if not isinstance(flags, list):
+            flags = [flags]
+        flags = [str(f) for f in flags]
+        return bool(lucky), float(score), str(st), str(reason), flags
+
+    # Fallback for completely unexpected types.
+    return False, 0.0, "error", "bad_result_type", [repr(res)]
 
 def _detect_mime(image_bytes: bytes) -> str:
     if image_bytes.startswith(b"\xff\xd8"):

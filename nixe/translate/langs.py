@@ -13,11 +13,11 @@ class LangProfile:
 
 LANG_PROFILES: Dict[str, LangProfile] = {
     # Japanese
-    "ja": LangProfile("ja", "JA", ["ja", "ja-jp", "japanese", "日本語"]),
+    "ja": LangProfile("ja", "JA", ["ja", "ja-jp", "jp", "japanese", "日本語"]),
     # Korean
-    "ko": LangProfile("ko", "KO", ["ko", "ko-kr", "korean", "hangul", "한국어"]),
+    "ko": LangProfile("ko", "KO", ["ko", "ko-kr", "kr", "korean", "hangul", "한국어"]),
     # Chinese (generic, covers simplified/traditional/mandarin)
-    "zh": LangProfile("zh", "ZH", ["zh", "zh-cn", "zh-hans", "zh-hant", "chinese", "mandarin", "中文", "汉语", "漢語"]),
+    "zh": LangProfile("zh", "ZH", ["zh", "zh-cn", "zh-hans", "zh-hant", "cn", "chinese", "mandarin", "中文", "汉语", "漢語"]),
     # Arabic
     "ar": LangProfile("ar", "AR", ["ar", "ar-sa", "arabic", "العربية"]),
     # Indonesian

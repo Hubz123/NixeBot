@@ -63,6 +63,7 @@ except Exception:  # pragma: no cover
     _apply_deck_hardening = None
 
 log = logging.getLogger("nixe.helpers.gemini_lpg_burst")
+LPG_BURST_IMPL_REV = "burst-v3-nonrec-2025-11-29"
 
 
 # ---------------------------------------------------------------------------

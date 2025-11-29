@@ -12,10 +12,22 @@ class LangProfile:
 
 
 LANG_PROFILES: Dict[str, LangProfile] = {
+    # Japanese
     "ja": LangProfile("ja", "JA", ["ja", "ja-jp", "japanese", "日本語"]),
+    # Korean
     "ko": LangProfile("ko", "KO", ["ko", "ko-kr", "korean", "hangul", "한국어"]),
-    "zh": LangProfile("zh", "ZH", ["zh", "zh-cn", "zh-hans", "zh-hant", "chinese", "中文", "mandarin"]),
+    # Chinese (generic, covers simplified/traditional/mandarin)
+    "zh": LangProfile("zh", "ZH", ["zh", "zh-cn", "zh-hans", "zh-hant", "chinese", "mandarin", "中文", "汉语", "漢語"]),
+    # Arabic
     "ar": LangProfile("ar", "AR", ["ar", "ar-sa", "arabic", "العربية"]),
+    # Indonesian
+    "id": LangProfile("id", "ID", ["id", "id-id", "indonesian", "bahasa indonesia", "indo"]),
+    # English
+    "en": LangProfile("en", "EN", ["en", "en-us", "en-gb", "english"]),
+    # Sundanese
+    "su": LangProfile("su", "SUN", ["su", "sun", "sunda", "sundanese", "bahasa sunda"]),
+    # Javanese
+    "jv": LangProfile("jv", "JAWA", ["jv", "jav", "jawa", "javanese", "bahasa jawa"]),
 }
 
 
@@ -23,10 +35,12 @@ def resolve_lang(target: str) -> Optional[LangProfile]:
     t = (target or "").strip().lower()
     if not t:
         return None
+    # match against aliases first
     for prof in LANG_PROFILES.values():
         for alias in prof.aliases:
             if t == alias.lower():
                 return prof
+    # then fall back to direct key
     prof = LANG_PROFILES.get(t)
     if prof is not None:
         return prof

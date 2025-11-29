@@ -29,12 +29,6 @@ Optional configs (runtime_env.json or env):
   TRANSLATE_ALLOW_FALLBACK=1  (allow fallback to GEMINI_API_KEY / GEMINI_API_KEY_B)
   TRANSLATE_JA_DUAL_ENABLE=1   (if target_lang is JA, output formal+casual+romaji)
   TRANSLATE_JA_ROMAJI_ENABLE=1 (enable romaji field in JA dual mode)
-  TRANSLATE_SUNDA_CTX_NAME="Translate → Sunda"
-  TRANSLATE_SUNDA_TARGET="Sundanese"
-  TRANSLATE_JAWA_CTX_NAME="Translate → Jawa"
-  TRANSLATE_JAWA_TARGET="Javanese"
-  TRANSLATE_AR_CTX_NAME="Translate → Arabic"
-  TRANSLATE_AR_TARGET="Arabic"
   REVERSE_IMAGE_ENABLE=1       (enable Reverse image context menu)
   REVERSE_IMAGE_CTX_NAME="Reverse image (Nixe)"
   REVERSE_IMAGE_MAX_IMAGES=3
@@ -50,6 +44,7 @@ from urllib import parse as urllib_parse
 
 import discord
 import aiohttp
+from nixe.translate import resolve_lang
 from discord import app_commands
 from discord.ext import commands
 
@@ -1335,6 +1330,14 @@ class TranslateCommands(commands.Cog):
         # -------------------------
         # 3) Bangun embed gabungan (gambar dulu, lalu chat)
         # -------------------------
+        # Resolve language profile for display label / multi-style heuristics.
+        prof = resolve_lang(target)
+        if prof is not None:
+            target_display = prof.display
+            target_code = prof.code.lower()
+        else:
+            target_display = str(target)
+            target_code = str(target or "").strip().lower()
         embed = discord.Embed(title="Translation")
 
         # 3a) Proses gambar-gambar (prioritas)
@@ -1357,14 +1360,14 @@ class TranslateCommands(commands.Cog):
                 value_lines.append("**Detected text:**")
                 value_lines.append((detected or "(empty)")[:600])
                 value_lines.append("")
-                value_lines.append(f"**Translated → {target}:**")
+                value_lines.append(f"**Translated → {target_display}:**")
                 value_lines.append((translated_img or "(empty)")[:600])
                 val = "\n".join(value_lines)
             else:
                 # tidak ada teks terbaca
                 if (translated_img or "").strip():
                     # kadang model hanya mengembalikan terjemahan
-                    val = f"**Translated → {target}:**\n{(translated_img or '(empty)')[:1024]}"
+                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
                 else:
                     val = "_Tidak ada teks terbaca di gambar ini._"
 
@@ -1379,10 +1382,10 @@ class TranslateCommands(commands.Cog):
         chat_val: str | None = None
 
                 # Mode khusus: target JA/KR/ZH dengan dua gaya + romaji/pinyin
-        tgt_lower = str(target).lower()
-        is_ja_target = tgt_lower in ("ja", "ja-jp", "japanese")
-        is_ko_target = tgt_lower in ("ko", "ko-kr", "korean", "hangul", "한국어")
-        is_zh_target = tgt_lower in ("zh", "zh-cn", "zh-hans", "zh-hant", "chinese", "中文", "mandarin")
+        tgt_lower = target_code
+        is_ja_target = tgt_lower.startswith("ja")
+        is_ko_target = tgt_lower.startswith("ko")
+        is_zh_target = tgt_lower.startswith("zh")
 
         ja_dual_enable = is_ja_target and _as_bool("TRANSLATE_JA_DUAL_ENABLE", True)
         ko_dual_enable = is_ko_target and _as_bool("TRANSLATE_KO_DUAL_ENABLE", True)
@@ -1511,19 +1514,19 @@ class TranslateCommands(commands.Cog):
                     value_lines.append("**Source:**")
                     value_lines.append(src_preview)
                     value_lines.append("")
-                    value_lines.append(f"**Translated → {target}:**")
+                    value_lines.append(f"**Translated → {target_display}:**")
                     value_lines.append(translated_chat)
                     chat_val = "\n".join(value_lines)
                 else:
                     # sama atau gagal terjemah; untuk kasus ini:
                     # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
                     #   menampilkan blok Chat user lagi agar embed tetap ringkas.
-                    if not (image_any_ok and str(target).lower() == "id"):
+                    if not (image_any_ok and target_code == "id"):
                         value_lines = []
                         value_lines.append("**Source:**")
                         value_lines.append(src_preview)
                         value_lines.append("")
-                        value_lines.append(f"_Teks sudah dalam bahasa target ({target}) atau tidak perlu diterjemahkan._")
+                        value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
                         chat_val = "\n".join(value_lines)
         if chat_val is not None:
             embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)

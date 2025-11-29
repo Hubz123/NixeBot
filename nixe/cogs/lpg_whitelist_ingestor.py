@@ -28,6 +28,7 @@ class LPGWhitelistIngestor(commands.Cog):
     """
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._started = False
         self.enabled = (os.getenv("LPG_WHITELIST_ENABLE") or "1") == "1"
         self.thread_id = _parse_int(os.getenv("LPG_WHITELIST_THREAD_ID"))
         # Fallback: cari via parent+name jika ID tidak ada/invalid
@@ -199,7 +200,7 @@ class LPGWhitelistIngestor(commands.Cog):
             if not self._periodic.is_running():
                 self._periodic.start()
             else:
-                log.info("[lpg-wl-ingest] periodic already running; interval=%ss kept", self.interval_sec)
+                log.debug("[lpg-wl-ingest] periodic already running; interval=%ss kept", self.interval_sec)
 
     @tasks.loop(seconds=3600.0)
     async def _periodic(self):
@@ -219,6 +220,11 @@ class LPGWhitelistIngestor(commands.Cog):
         if not self.enabled:
             log.info("[lpg-wl-ingest] disabled via LPG_WHITELIST_ENABLE")
             return
+        # simple guard so bootstrap only scheduled sekali
+        if self._started:
+            log.debug("[lpg-wl-ingest] on_ready: already started; skip")
+            return
+        self._started = True
         if not self._bootstrap.is_running():
             self._bootstrap.start()
         else:

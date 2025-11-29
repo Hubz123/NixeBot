@@ -191,6 +191,37 @@ def _negative_phrases() -> List[str]:
 # image helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_raw_result(res):
+    """
+    Normalize raw classifier result into a 5-tuple:
+    (lucky: bool, score: float, status: str, reason: str, flags: list[str]).
+    Accepts 4-tuple legacy shapes and is defensive about bad types.
+    """
+    if isinstance(res, (tuple, list)):
+        if len(res) == 5:
+            lucky, score, st, reason, flags = _normalize_raw_result(res)
+        elif len(res) == 4:
+            lucky, score, st, reason = res
+            flags = []
+        else:
+            lucky = bool(res[0]) if len(res) > 0 else False
+            try:
+                score = float(res[1]) if len(res) > 1 else 0.0
+            except Exception:
+                score = 0.0
+            st = str(res[2]) if len(res) > 2 else "error"
+            reason = str(res[3]) if len(res) > 3 else "bad_result"
+            flags = list(res[4:]) if len(res) > 4 else []
+    else:
+        lucky, score, st, reason, flags = False, 0.0, "error", "bad_result_type", [repr(res)]
+
+    if not isinstance(flags, list):
+        flags = [repr(flags)]
+    try:
+        score = float(score)
+    except Exception:
+        score = 0.0
+    return bool(lucky), score, str(st), str(reason), flags
 def _detect_mime(image_bytes: bytes) -> str:
     if image_bytes.startswith(b"\xff\xd8"):
         return "image/jpeg"
@@ -507,40 +538,6 @@ async def _call_one(session, model: str, key: str, image_bytes: bytes, per_timeo
 # burst / stagger / sequential helpers
 # ---------------------------------------------------------------------------
 
-
-def _normalize_raw_result(res):
-    """
-    Normalise low-level Gemini result tuples.
-
-    Historically _call_one() returned (lucky, score, status, reason)
-    and later gained an extra "flags" field. Some older callers or
-    warmup helpers may still produce a 4-tuple, so here we accept
-    both shapes and always return a 5-tuple:
-        (lucky, score, status, reason, flags_list)
-    """
-    # Accept tuple/list of length 4 or 5; anything else is coerced.
-    if isinstance(res, (tuple, list)):
-        if len(res) == 5:
-            lucky, score, st, reason, flags = res
-        elif len(res) == 4:
-            lucky, score, st, reason = res
-            flags = []
-        else:
-            lucky = bool(res[0]) if len(res) > 0 else False
-            score = float(res[1]) if len(res) > 1 else 0.0
-            st = str(res[2]) if len(res) > 2 else "error"
-            reason = str(res[3]) if len(res) > 3 else "bad_result"
-            flags = list(res[4:]) if len(res) > 4 else []
-    else:
-        lucky, score, st, reason, flags = False, 0.0, "error", "bad_result_type", [repr(res)]
-
-    if not isinstance(flags, list):
-        flags = [repr(flags)]
-    try:
-        score = float(score)
-    except Exception:
-        score = 0.0
-    return bool(lucky), score, str(st), str(reason), flags
 async def _do_parallel(session, model, keys, image_bytes, per_timeout, early_score, tag):
     tasks = [asyncio.create_task(_call_one(session, model, k, image_bytes, per_timeout)) for k in keys]
     neg_words = _negative_phrases()
@@ -656,7 +653,7 @@ async def _do_sequential(session, model, keys, image_bytes, per_timeout, early_s
         pass
 
     # first key
-    lucky, score, st, reason, flags = await _call_one(session, model, keys[0], image_bytes, per_timeout1)
+    lucky, score, st, reason, flags = _normalize_raw_result(await _call_one(session, model, keys[0], image_bytes, per_timeout1))
     if st == "ok" and any(w in " ".join(flags + [reason]).lower() for w in neg_words):
         lucky = False
         score = min(score, 0.50)

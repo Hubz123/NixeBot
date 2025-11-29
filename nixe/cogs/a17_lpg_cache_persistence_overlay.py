@@ -27,21 +27,14 @@ class LPGCachePersistence(commands.Cog):
         self.parent_id = int(_env("LPG_CACHE_THREAD_ID", _env("LOG_CHANNEL_ID","0")) or 0)
         self.max_entries = int(_env("LPG_CACHE_MAX_ENTRIES","1000") or "1000")
         self.max_boot_lines = int(_env("LPG_CACHE_BOOT_LINES","500") or "500")
-        # Whether to persist cache into a Discord thread (for warm bootstrap) or
-        # keep everything purely in-memory. Default is disabled to avoid noisy
-        # JSON messages in channels unless explicitly requested.
-        self.enable_thread = _env("LPG_CACHE_THREAD_ENABLE", "0") == "1"
         self.thread: Optional[discord.Thread] = None
         self.queue: asyncio.Queue = asyncio.Queue()
         self._ensure_lock = asyncio.Lock()
-        if self.enable_thread:
-            self._writer.start()
+        self._writer.start()
 
     # ---------- writer loop ----------
     @tasks.loop(seconds=1.5)
     async def _writer(self):
-        if not self.enable_thread:
-            return
         if self.thread is None:
             return
         try:
@@ -57,8 +50,6 @@ class LPGCachePersistence(commands.Cog):
 
     @_writer.before_loop
     async def _before_writer(self):
-        if not self.enable_thread:
-            return
         await self.bot.wait_until_ready()
 
     # ---------- bind/find/create thread ----------
@@ -97,8 +88,6 @@ class LPGCachePersistence(commands.Cog):
         return None
 
     async def _ensure_thread(self):
-        if not self.enable_thread:
-            return
         if self.thread is not None:
             return
         if not self.parent_id:
@@ -128,9 +117,6 @@ class LPGCachePersistence(commands.Cog):
             cache.configure(self.max_entries)
         except Exception:
             pass
-        if not self.enable_thread:
-            # Only in-memory cache; no thread persistence/logging unless explicitly enabled.
-            return
         await self._ensure_thread()
         await self._bootstrap_load()
 
@@ -141,8 +127,6 @@ class LPGCachePersistence(commands.Cog):
             self.thread = None
 
     async def _bootstrap_load(self):
-        if not self.enable_thread:
-            return
         if not self.thread:
             return
         try:
@@ -183,8 +167,6 @@ class LPGCachePersistence(commands.Cog):
 
     # public method used by hook overlay
     async def persist(self, entry: dict):
-        if not self.enable_thread:
-            return
         if self.thread is None:
             return
         await self.queue.put(entry)

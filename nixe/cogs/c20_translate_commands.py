@@ -933,6 +933,10 @@ class TranslateCommands(commands.Cog):
             su_ctx_name = _env("TRANSLATE_SUNDA_CTX_NAME", "").strip()
             jw_ctx_name = _env("TRANSLATE_JAWA_CTX_NAME", "").strip()
             ar_ctx_name = _env("TRANSLATE_AR_CTX_NAME", "").strip()
+            su_to_id_ctx_name = _env("TRANSLATE_SUNDA_TO_ID_CTX_NAME", "").strip()
+            su_to_en_ctx_name = _env("TRANSLATE_SUNDA_TO_EN_CTX_NAME", "").strip()
+            jw_to_id_ctx_name = _env("TRANSLATE_JAWA_TO_ID_CTX_NAME", "").strip()
+            jw_to_en_ctx_name = _env("TRANSLATE_JAWA_TO_EN_CTX_NAME", "").strip()
 
             # Force-remove legacy /translate slash if present (global cached).
             if _as_bool("TRANSLATE_FORCE_REMOVE_SLASH", True):
@@ -985,10 +989,58 @@ class TranslateCommands(commands.Cog):
                     except Exception:
                         pass
 
+                if su_to_id_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=su_to_id_ctx_name,
+                                callback=self.translate_message_ctx_sunda_to_id,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if su_to_en_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=su_to_en_ctx_name,
+                                callback=self.translate_message_ctx_sunda_to_en,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
                 if jw_ctx_name:
                     try:
                         self.bot.tree.add_command(
                             app_commands.ContextMenu(name=jw_ctx_name, callback=self.translate_message_ctx_jawa),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if jw_to_id_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=jw_to_id_ctx_name,
+                                callback=self.translate_message_ctx_jawa_to_id,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if jw_to_en_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=jw_to_en_ctx_name,
+                                callback=self.translate_message_ctx_jawa_to_en,
+                            ),
                             guild=gobj,
                         )
                     except Exception:
@@ -1068,6 +1120,34 @@ class TranslateCommands(commands.Cog):
             override = _env("TRANSLATE_AR_TARGET", "Arabic").strip() or "Arabic"
         except Exception:
             override = "Arabic"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_sunda_to_id(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Sundanese text to Indonesian (ID)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "Indonesian"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_sunda_to_en(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Sundanese text to English (EN)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "English"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_jawa_to_id(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Javanese text to Indonesian (ID)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "Indonesian"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_jawa_to_en(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Javanese text to English (EN)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "English"
         self._target_overrides[key] = override
         await self.translate_message_ctx(interaction, message)
 

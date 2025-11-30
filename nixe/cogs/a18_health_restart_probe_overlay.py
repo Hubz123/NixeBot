@@ -243,9 +243,8 @@ class HealthRestartProbeOverlay(commands.Cog):
             await self._update_presence_sticky()
             self._first_ready = False
 
-        # Start heartbeat loop once
-        if not self._heartbeat_started:
-            self._heartbeat_started = True
+        # Start heartbeat loop once (idempotent even if on_ready fires many times)
+        if not self.heartbeat_loop.is_running():
             self.heartbeat_loop.start()
 
     @tasks.loop(hours=1.0)

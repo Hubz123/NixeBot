@@ -24,7 +24,8 @@ class LiveBanner(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        _safe_print('==> Your service is live 🎉')  # no logger prefix to match Render banner
+        # Live banner output disabled (was: '==> Your service is live 🎉')
+        return
 
 async def setup(bot):
     if bot.get_cog('LiveBanner'): return

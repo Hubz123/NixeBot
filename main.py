@@ -206,6 +206,10 @@ async def _run_bot(token: str):
             raise
         except Exception as exc:
             log.exception("Bot crashed unexpectedly: %r — restarting in 10s", exc)
+            try:
+                bot.dispatch("nixe_bot_crash", exc)
+            except Exception:
+                log.debug("Failed to dispatch nixe_bot_crash event", exc_info=True)
             await asyncio.sleep(10)
         else:
             # bot.start() returned cleanly without an explicit shutdown request.

@@ -205,21 +205,36 @@ async def _main():
     log.info("🌐 Mode: %s", mode)
 
     web_task = asyncio.create_task(start_web(port), name="web")
-    tasks = [web_task]
+    bot_task: asyncio.Task | None = None
 
     if token:
         bot_task = asyncio.create_task(_run_bot(token), name="bot")
-        tasks.append(bot_task)
+
+        def _on_bot_done(task: asyncio.Task) -> None:
+            try:
+                exc = task.exception()
+            except asyncio.CancelledError:
+                # Normal shutdown (e.g. SIGTERM) — do not treat as error.
+                return
+            if exc:
+                log.exception("Bot task terminated with error: %r", exc)
+
+        bot_task.add_done_callback(_on_bot_done)
     else:
         log.error("DISCORD_TOKEN missing — bot will not start. Web healthz still served.")
-    
-    # Wait for tasks; do not restart automatically
+
+    # Keep lifetime driven by web_task so /healthz stays up even if bot dies.
     try:
-        await asyncio.gather(*tasks)
+        await web_task
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        log.exception("Fatal error: %r", e)
+        log.exception("Web task failed: %r", e)
+    finally:
+        if bot_task is not None and not bot_task.done():
+            bot_task.cancel()
+            with contextlib.suppress(Exception):
+                await bot_task
 
 if __name__ == "__main__":
     try:

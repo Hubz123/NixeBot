@@ -195,8 +195,22 @@ async def start_web(port: int):
 # --- glue --------------------------------------------------------------
 
 async def _run_bot(token: str):
-    # Standard start; no manual restart loop (discord.py handles reconnects)
-    await bot.start(token, reconnect=True)
+    # Guard loop: if bot.start ever returns or crashes, we log and restart.
+    while True:
+        try:
+            # discord.py already has internal reconnect logic; this is a second layer
+            # so that if it ever returns unexpectedly, we can restart the whole client.
+            await bot.start(token, reconnect=True)
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            # Propagate shutdown signals so service can stop cleanly when asked.
+            raise
+        except Exception as exc:
+            log.exception("Bot crashed unexpectedly: %r — restarting in 10s", exc)
+            await asyncio.sleep(10)
+        else:
+            # bot.start() returned cleanly without an explicit shutdown request.
+            log.warning("bot.start() returned without error — restarting in 10s")
+            await asyncio.sleep(10)
 
 async def _main():
     port = int(os.getenv("PORT") or 10000)
@@ -214,7 +228,7 @@ async def _main():
             try:
                 exc = task.exception()
             except asyncio.CancelledError:
-                # Normal shutdown (e.g. SIGTERM) — do not treat as error.
+                # Normal shutdown (SIGTERM / service stop).
                 return
             if exc:
                 log.exception("Bot task terminated with error: %r", exc)
@@ -223,7 +237,7 @@ async def _main():
     else:
         log.error("DISCORD_TOKEN missing — bot will not start. Web healthz still served.")
 
-    # Keep lifetime driven by web_task so /healthz stays up even if bot dies.
+    # Lifetime proses ditentukan oleh web_task; /healthz tetap up selama web aktif.
     try:
         await web_task
     except asyncio.CancelledError:

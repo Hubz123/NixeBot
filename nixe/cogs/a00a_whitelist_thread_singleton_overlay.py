@@ -13,6 +13,7 @@ class WhitelistThreadSingleton(commands.Cog):
         self.log_chan_id = int(_getenv("LOG_CHANNEL_ID") or _getenv("NIXE_PHISH_LOG_CHAN_ID") or "0")
         self.thread_name = _getenv("LPG_WHITELIST_THREAD_NAME", "Whitelist LPG (FP)")
         self._task = None
+        self._last_log_state = None
 
     async def _ensure_once(self):
         if not self.log_chan_id:
@@ -56,7 +57,16 @@ class WhitelistThreadSingleton(commands.Cog):
                 pass
 
         os.environ["LPG_WHITELIST_THREAD_ID"] = str(chosen.id)
-        _log.info(f"[lpg-wl-singleton] chosen={chosen.id} archived={len(duplicates)} name='{self.thread_name}'")
+
+        state = (int(chosen.id), len(duplicates), bool(getattr(chosen, "archived", False)))
+        if state != self._last_log_state:
+            self._last_log_state = state
+            _log.info(
+                "[lpg-wl-singleton] chosen=%s archived=%s name='%s'",
+                chosen.id,
+                len(duplicates),
+                self.thread_name,
+            )
 
     async def _run_periodic(self):
         await asyncio.sleep(1.5)

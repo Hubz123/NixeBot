@@ -930,6 +930,7 @@ class TranslateCommands(commands.Cog):
 
             ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
             rev_ctx_name = _env("REVERSE_IMAGE_CTX_NAME", "Reverse image (Nixe)").strip() or "Reverse image (Nixe)"
+            extra_ctx = _as_bool("TRANSLATE_EXTRA_CTX_ENABLE", False)
             su_ctx_name = _env("TRANSLATE_SUNDA_CTX_NAME", "").strip()
             jw_ctx_name = _env("TRANSLATE_JAWA_CTX_NAME", "").strip()
             ar_ctx_name = _env("TRANSLATE_AR_CTX_NAME", "").strip()
@@ -937,6 +938,15 @@ class TranslateCommands(commands.Cog):
             su_to_en_ctx_name = _env("TRANSLATE_SUNDA_TO_EN_CTX_NAME", "").strip()
             jw_to_id_ctx_name = _env("TRANSLATE_JAWA_TO_ID_CTX_NAME", "").strip()
             jw_to_en_ctx_name = _env("TRANSLATE_JAWA_TO_EN_CTX_NAME", "").strip()
+
+            if not extra_ctx:
+                su_ctx_name = ""
+                jw_ctx_name = ""
+                ar_ctx_name = ""
+                su_to_id_ctx_name = ""
+                su_to_en_ctx_name = ""
+                jw_to_id_ctx_name = ""
+                jw_to_en_ctx_name = ""
 
             # Force-remove legacy /translate slash if present (global cached).
             if _as_bool("TRANSLATE_FORCE_REMOVE_SLASH", True):
@@ -1591,7 +1601,7 @@ class TranslateCommands(commands.Cog):
                 if translated_chat and translated_chat.strip() != text_for_chat.strip():
                     # ada hasil terjemahan berbeda
                     value_lines = []
-                    value_lines.append("**Source:**")
+                    value_lines.append("")
                     value_lines.append(src_preview)
                     value_lines.append("")
                     value_lines.append(f"**Translated → {target_display}:**")
@@ -1603,7 +1613,7 @@ class TranslateCommands(commands.Cog):
                     #   menampilkan blok Chat user lagi agar embed tetap ringkas.
                     if not (image_any_ok and target_code == "id"):
                         value_lines = []
-                        value_lines.append("**Source:**")
+                        value_lines.append("")
                         value_lines.append(src_preview)
                         value_lines.append("")
                         value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")

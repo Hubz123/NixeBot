@@ -293,5 +293,6 @@
   "PHISH_CELEB_BAIT_WORDS": "(?i)(mr\\s*beast|elon\\s+musk|giveaway)",
   "PHISH_TEXT_STRONG_MIN_TOKENS": "3",
   "PHISH_TEXT_AUTO_BAN_TOKENS": "5",
-  "LPG_WHITELIST_THREAD_NAME": "Whitelist LPG (FP)"
+  "LPG_WHITELIST_THREAD_NAME": "Whitelist LPG (FP)",
+  "TRANSLATE_EXTRA_CTX_ENABLE": "0"
 }

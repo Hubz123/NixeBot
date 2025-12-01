@@ -43,8 +43,11 @@ class LPGCachePersistence(commands.Cog):
                 chunk.append(await self.queue.get())
             if not chunk:
                 return
-            payload = "```json\n" + "\n".join(json.dumps(x, ensure_ascii=False) for x in chunk) + "\n```"
-            await self.thread.send(payload)
+            # Previously this wrote JSON payloads into the cache thread:
+            # payload = "```json\n" + "\n".join(json.dumps(x, ensure_ascii=False) for x in chunk) + "\n```"
+            # await self.thread.send(payload)
+            # Now we only log a short message and drop the entries to keep Discord logs clean.
+            log.debug("[lpg-cache] writer flushed %s entries (no Discord JSON)", len(chunk))
         except Exception as e:
             log.warning("[lpg-cache] writer failed: %r", e)
 

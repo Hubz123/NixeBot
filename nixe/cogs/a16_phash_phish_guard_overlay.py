@@ -127,17 +127,44 @@ class PhashPhishGuard(commands.Cog):
         except Exception as e:
             log.warning("[phash-phish] initial load failed: %r", e)
 
+    
     async def _fetch_db_message(self) -> Tuple[Optional[discord.abc.Messageable], Optional[discord.Message]]:
-        tid, mid = get_phash_ids()
-        tid = tid or _env_int("PHASH_DB_THREAD_ID", 0)
-        mid = mid or _env_int("PHASH_DB_MESSAGE_ID", 0)
+        """
+        Resolve the pHash DB message for phishing guard.
+
+        Resolution order (additive, no breaking change):
+        1) PHISH_PHASH_DB_THREAD_ID / PHISH_PHASH_DB_MESSAGE_ID (phish-specific override)
+        2) Runtime ids published via state_runtime.get_phash_ids()
+        3) PHASH_DB_THREAD_ID / PHASH_DB_MESSAGE_ID (shared DB fallback)
+        4) PHISH_LOG_CHAN_ID / NIXE_PHISH_LOG_CHAN_ID as channel fallback when only message id is known.
+        """
+        # 1) Explicit phish-specific overrides (if provided)
+        tid = _env_int("PHISH_PHASH_DB_THREAD_ID", 0)
+        mid = _env_int("PHISH_PHASH_DB_MESSAGE_ID", 0)
+
+        # 2) Runtime ids published by other cogs (e.g. phash board / LPG DB)
+        if not tid or not mid:
+            rt_tid, rt_mid = get_phash_ids()
+            if not tid and rt_tid:
+                tid = rt_tid
+            if not mid and rt_mid:
+                mid = rt_mid
+
+        # 3) Shared DB fallback from generic PHASH_DB_* vars
+        if not tid:
+            tid = _env_int("PHASH_DB_THREAD_ID", 0)
+        if not mid:
+            mid = _env_int("PHASH_DB_MESSAGE_ID", 0)
+
         if not mid:
             return None, None
+
         channel: Optional[discord.abc.Messageable] = None
         msg: Optional[discord.Message] = None
         try:
             if tid:
                 channel = self.bot.get_channel(tid) or await self.bot.fetch_channel(tid)
+            # last resort: use phish log channel as a parent when only message id is known
             if channel is None and self.log_chan_id:
                 channel = self.bot.get_channel(self.log_chan_id) or await self.bot.fetch_channel(self.log_chan_id)
             if channel:
@@ -146,7 +173,7 @@ class PhashPhishGuard(commands.Cog):
             log.warning("[phash-phish] fetch db failed: %r", e)
         return channel, msg
 
-    async def _refresh_hashes(self) -> None:
+async def _refresh_hashes(self) -> None:
         _, msg = await self._fetch_db_message()
         if not msg:
             log.warning("[phash-phish] db message not found; skip")

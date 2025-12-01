@@ -73,7 +73,7 @@ class GroqPhishGuard(commands.Cog):
             # Run Groq vision
             url = "https://api.groq.com/openai/v1/chat/completions"
             headers = {"Authorization": f"Bearer {GROQ_KEY}","Content-Type": "application/json"}
-            prompt = "Classify if this image is a phishing/login/QR/crypto-casino bait. Reply with JSON: {\"phish\":true/false, \"reason\":\"...\"}."
+            prompt = ("Look at the image carefully and decide if it is being used as part of an online scam, phishing attempt, account takeover, fake investment or gambling promotion, or fake payout proof. Treat screenshots that show things like \"Withdrawal Success\", \"Deposit Successful\", big crypto balances, \"USDT received\", casino or broker apps, bonus banners, or payout proofs as phishing/scam content whenever they could be used to lure other people into depositing or signing up, even if no login form is shown. Also treat QR-code login, OTP/verification pages, or suspicious wallet/crypto screens as phishing. Reply ONLY with JSON: {\"phish\":true/false, \"reason\":\"short explanation\"}.")
             payload = {
                 "model": MODEL_VISION,
                 "temperature": 0.0,

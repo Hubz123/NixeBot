@@ -173,7 +173,7 @@ class PhashPhishGuard(commands.Cog):
             log.warning("[phash-phish] fetch db failed: %r", e)
         return channel, msg
 
-async def _refresh_hashes(self) -> None:
+    async def _refresh_hashes(self) -> None:
         _, msg = await self._fetch_db_message()
         if not msg:
             log.warning("[phash-phish] db message not found; skip")

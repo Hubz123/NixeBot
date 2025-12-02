@@ -34,7 +34,14 @@ class BanCommands(commands.Cog):
                 if getattr(e, "image", None) and getattr(e.image, "url", None): url = e.image.url
                 elif getattr(e, "thumbnail", None) and getattr(e.thumbnail, "url", None): url = e.thumbnail.url
                 evidence = url
-        embed = build_ban_embed(target=member, moderator=ctx.author, reason=reason, evidence_url=evidence)
+        embed = build_ban_embed(
+            target=member,
+            moderator=ctx.author,
+            reason=reason,
+            simulate=True,
+            guild=ctx.guild,
+            evidence_url=evidence,
+        )
         me = ctx.guild.me
         target_ch = None
         for cid in (TESTBAN_CHANNEL_ID, LOG_BOTPHISHING):

@@ -43,6 +43,7 @@ def _load_phash_list_from_content(content: str) -> Set[int]:
     Expected formats:
     - Pure JSON: {"phash":["809c7d...","82ca6d...", ...]}
     - JSON wrapped in ```json ... ``` code block.
+    - JSON preceded/followed by marker lines (e.g. [phash-db-board]).
     """
     if not content:
         return set()
@@ -50,7 +51,7 @@ def _load_phash_list_from_content(content: str) -> Set[int]:
     text = content.strip()
     data: Optional[object] = None
 
-    # Try raw JSON first
+    # Try raw JSON first (strict)
     try:
         data = json.loads(text)
     except Exception:
@@ -64,8 +65,21 @@ def _load_phash_list_from_content(content: str) -> Set[int]:
             try:
                 data = json.loads(inner)
             except Exception:
-                return set()
+                # fall back to loose scan below
+                data = None
         else:
+            data = None
+
+    # Loose fallback: extract first {...} block in the text (to support marker headers)
+    if data is None:
+        start_brace = text.find("{")
+        end_brace = text.rfind("}")
+        if start_brace == -1 or end_brace == -1 or end_brace <= start_brace:
+            return set()
+        inner = text[start_brace : end_brace + 1]
+        try:
+            data = json.loads(inner)
+        except Exception:
             return set()
 
     seq = None
@@ -81,11 +95,17 @@ def _load_phash_list_from_content(content: str) -> Set[int]:
         s = str(v).strip().lower()
         if not s:
             continue
-        if s.startswith("0x"):
-            s = s[2:]
         try:
-            result.add(int(s, 16))
-            continue
+            if s.startswith("0x"):
+                result.add(int(s, 16))
+                continue
+        except Exception:
+            pass
+        try:
+            # assume hex string
+            if all(c in "0123456789abcdef" for c in s) and len(s) <= 32:
+                result.add(int(s, 16))
+                continue
         except Exception:
             pass
         try:
@@ -93,6 +113,7 @@ def _load_phash_list_from_content(content: str) -> Set[int]:
         except Exception:
             continue
     return result
+
 
 class PhashPhishGuard(commands.Cog):
     """Lightweight pHash-based phishing guard.

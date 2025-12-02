@@ -87,5 +87,18 @@ class LinkPhishGuard(commands.Cog):
         except Exception as e:
             log.debug("[phish-link] err: %r", e)
 
+
+    @commands.Cog.listener("on_message_edit")
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        # Re-run link phishing checks on edited messages so users cannot
+        # bypass the guard by editing an old message into a link blast.
+        if not self.enable:
+            return
+        try:
+            await self.on_message(after)
+        except Exception as e:
+            log.debug("[phish-link] edit err: %r", e)
+
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(LinkPhishGuard(bot))

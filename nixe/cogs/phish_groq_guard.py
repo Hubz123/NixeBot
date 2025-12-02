@@ -1,6 +1,6 @@
 # nixe/cogs/phish_groq_guard.py
 from __future__ import annotations
-import os, logging, asyncio
+import os, logging, asyncio, json, re
 import aiohttp
 import discord
 from discord.ext import commands
@@ -90,14 +90,34 @@ class GroqPhishGuard(commands.Cog):
             async with aiohttp.ClientSession(timeout=timeout) as sess:
                 async with sess.post(url, headers=headers, json=payload) as resp:
                     data = await resp.json(content_type=None)
-            # naive parse
+            # parse result: prefer structured JSON, fallback to regex on text
             txt = ""
             try:
                 txt = (data["choices"][0]["message"]["content"] or "").strip()
             except Exception:
-                pass
-            is_phish = ("\"phish\":true" in txt.lower()) or ("phish: true" in txt.lower())
+                txt = ""
+            is_phish = False
             reason = txt[:180]
+
+            lower = txt.lower()
+            # 1) Try to parse JSON object from the content
+            try:
+                start_brace = txt.find("{")
+                end_brace = txt.rfind("}")
+                json_slice = txt if start_brace == -1 or end_brace == -1 or end_brace <= start_brace else txt[start_brace : end_brace + 1]
+                obj = json.loads(json_slice)
+                if isinstance(obj, dict):
+                    if "phish" in obj:
+                        is_phish = bool(obj.get("phish"))
+                    if "reason" in obj:
+                        reason = str(obj.get("reason"))[:180]
+            except Exception:
+                # 2) Fallback: look for `"phish": true` in raw text
+                try:
+                    if re.search(r'"phish"\s*:\s*true', lower):
+                        is_phish = True
+                except Exception:
+                    pass
 
             log.info("[phish-groq] result=%s reason=%s", is_phish, reason)
 
@@ -137,6 +157,17 @@ class GroqPhishGuard(commands.Cog):
                 pass
         except Exception as e:
             log.debug("[phish-groq] err: %r", e)
+
+
+    @commands.Cog.listener("on_message_edit")
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        # Re-run Groq vision phishing checks on edited messages to prevent
+        # editing a safe message into an image-based scam.
+        try:
+            await self.on_message(after)
+        except Exception as e:
+            log.debug("[phish-groq] edit err: %r", e)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(GroqPhishGuard(bot))

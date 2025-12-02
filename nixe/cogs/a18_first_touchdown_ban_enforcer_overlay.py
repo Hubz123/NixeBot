@@ -19,7 +19,7 @@ def _pick_log_channel_id() -> int:
     return int(LOG_BOTPHISHING or TESTBAN_CHANNEL_ID or 0)
 
 async def _patch_instance(bot: commands.Bot, cog: commands.Cog):
-    reason_default = os.getenv("BAN_REASON", "HACK ACCOUNT")
+    reason_default = os.getenv("BAN_REASON", "Suspicious or spam account")
     delete_days   = _env_int("PHISH_DELETE_MESSAGE_DAYS", 7)
     ttl           = _env_int("BAN_EMBED_TTL_SEC", 15)
 

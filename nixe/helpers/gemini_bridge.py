@@ -85,6 +85,7 @@ def _build_sys_prompt() -> str:
         "Strong NOT_LUCKY cues:\n"
         "- Promotional/event banners or announcements with BIG headline text,\n"
         "- Collage of multiple character arts without in-game result grid/UI,\n"
+        "- Deck-building, loadout, or skill-card management screens where you are configuring cards or skills you own rather than seeing the outcome of a pull.\n"
         "- Screens mentioning or corresponding to any of: " + neg_txt + ".\n\n"
         "Rules:\n"
         "- Be conservative: if mixed/unsure, choose not_lucky with score <= 0.4.\n"

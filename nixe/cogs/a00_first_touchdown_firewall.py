@@ -76,11 +76,32 @@ class FirstTouchdownFirewall(commands.Cog):
         return False
     @commands.Cog.listener()
     async def on_message(self, m: discord.Message):
-        if not self.enabled or m.author.bot: return
-        if not hasattr(m.channel,"id") or not self._in_scope(m.channel.id): return
-        if self._link_hit(m.content): 
-            await self._banish(m,"phishing link"); return
+        if not self.enabled or m.author.bot:
+            return
+        ch = getattr(m, "channel", None)
+        if not ch or not hasattr(ch, "id"):
+            return
+        try:
+            cid = int(getattr(ch, "id", 0) or 0)
+        except Exception:
+            return
+        try:
+            pid = int(getattr(ch, "parent_id", 0) or 0)
+        except Exception:
+            pid = 0
+        # Global rule: never apply first-touchdown firewall inside threads (forum or text).
+        if pid:
+            return
+        # Respect PHISH_SKIP_CHANNELS (mods/safe/boards/forums).
+        if cid in self.skip or (pid and pid in self.skip):
+            return
+        if not self._in_scope(cid):
+            return
+        if self._link_hit(m.content):
+            await self._banish(m, "phishing link")
+            return
         if m.attachments and await self._image_hit(m):
-            await self._banish(m,"phishing image"); return
+            await self._banish(m, "phishing image")
+            return
 async def setup(bot: commands.Bot):
     await bot.add_cog(FirstTouchdownFirewall(bot))

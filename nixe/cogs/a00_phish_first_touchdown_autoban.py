@@ -52,7 +52,23 @@ class PhishFirstTouchdownAutoban(commands.Cog):
         default_scope = "886534544688308265,1293212357362716733"
         self.scope = set(_csv(_getenv("FIRST_TOUCHDOWN_CHANNELS", default_scope)))
 
-    def _in_scope(self, ch): return True if not self.scope else str(ch.id) in self.scope
+    def _in_scope(self, ch):
+        if not ch:
+            return False
+        try:
+            cid = int(getattr(ch, "id", 0) or 0)
+        except Exception:
+            return False
+        try:
+            pid = int(getattr(ch, "parent_id", 0) or 0)
+        except Exception:
+            pid = 0
+        # Never apply first-touchdown autoban inside threads.
+        if pid:
+            return False
+        if not self.scope:
+            return True
+        return str(cid) in self.scope
 
     def _has_postimg_link(self, m: discord.Message) -> bool:
         text = m.content or ""

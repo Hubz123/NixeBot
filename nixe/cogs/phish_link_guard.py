@@ -62,6 +62,8 @@ class LinkPhishGuard(commands.Cog):
             if not ch: return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
+            if pid:
+                return
             if (cid in self.skip_ids) or (pid and pid in self.skip_ids):
                 return
             if not ((cid in self.guard_ids) or (pid and pid in self.guard_ids)):

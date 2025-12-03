@@ -56,6 +56,8 @@ class GroqPhishGuard(commands.Cog):
             if not ch: return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
+            if pid:
+                return
             if cid in SKIP_IDS or (pid and pid in SKIP_IDS): 
                 return
             if not ((cid in GUARD_IDS) or (pid and pid in GUARD_IDS)): 

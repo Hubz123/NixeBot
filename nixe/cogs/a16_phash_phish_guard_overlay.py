@@ -130,6 +130,13 @@ class PhashPhishGuard(commands.Cog):
         self._hashes: Set[int] = set()
         self.bits_max: int = _env_int("PHASH_MATCH_DELETE_MAX_BITS", 12)
         self.guard_ids: Set[int] = _env_set("LPG_GUARD_CHANNELS")
+        # Channels/threads where pHash phishing guard must NEVER act
+        # (e.g. mod rooms, phash boards, forums, or all-thread environments).
+        self.skip_ids: Set[int] = _env_set("PHISH_SKIP_CHANNELS")
+        # Also respect PHASH_MATCH_SKIP_CHANNELS for compatibility with LPG/pHash boards
+        match_skip = _env_set("PHASH_MATCH_SKIP_CHANNELS")
+        if match_skip:
+            self.skip_ids |= match_skip
         self.safe_threads: Set[int] = {
             _env_int("PHASH_IMAGEPHISH_THREAD_ID", 0),
             _env_int("PHASH_DB_THREAD_ID", 0),
@@ -139,7 +146,13 @@ class PhashPhishGuard(commands.Cog):
         self.log_chan_id: int = _env_int("PHISH_LOG_CHAN_ID", _env_int("NIXE_PHISH_LOG_CHAN_ID", 0))
         # lazy bootstrap
         self._bootstrap_task = asyncio.create_task(self._bootstrap())
-        log.info("[phash-phish] init bits_max=%s guards=%s safe=%s", self.bits_max, sorted(self.guard_ids), sorted(self.safe_threads))
+        log.info(
+            "[phash-phish] init bits_max=%s guards=%s skip=%s safe=%s",
+            self.bits_max,
+            sorted(self.guard_ids),
+            sorted(self.skip_ids),
+            sorted(self.safe_threads),
+        )
 
     async def _bootstrap(self) -> None:
         await self.bot.wait_until_ready()
@@ -211,10 +224,17 @@ class PhashPhishGuard(commands.Cog):
         pid = int(getattr(ch, "parent_id", 0) or 0)
         if not cid:
             return False
+        # Global rule: never run phishing pHash guard inside any thread (forum or text).
+        if pid:
+            return False
+        # Never guard inside the dedicated imagephish/db/source threads.
         if cid in self.safe_threads or (pid and pid in self.safe_threads):
             return False
+        # Respect PHISH_SKIP_CHANNELS / PHASH_MATCH_SKIP_CHANNELS.
+        if cid in self.skip_ids or (pid and pid in self.skip_ids):
+            return False
         if not self.guard_ids:
-            # Guard all channels (except safe ones) by default.
+            # Guard all top-level channels (except safe/skip ones) by default.
             return True
         return cid in self.guard_ids or (pid and pid in self.guard_ids)
 

@@ -1,0 +1,37 @@
+name: Render Watchdog
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"  # jalan tiap 10 menit (UTC)
+  workflow_dispatch:        # bisa dijalankan manual dari tab Actions
+
+jobs:
+  ping-and-redeploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Render healthz
+        env:
+          HEALTH_URL: https://nixeban.onrender.com/healthz
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          echo "Checking $HEALTH_URL ..."
+          ok=0
+          # Coba sampai 3x, antisipasi delay / cold start Render free
+          for i in 1 2 3; do
+            status=$(curl -s -o /tmp/healthz.out -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            echo "Attempt $i -> HTTP $status"
+            if [ "$status" = "200" ]; then
+              ok=1
+              break
+            fi
+            sleep 20
+          done
+
+          if [ "$ok" -eq 1 ]; then
+            echo "Health OK, no action."
+            exit 0
+          fi
+
+          echo "Health still BAD after retries -> trigger Render redeploy"
+          curl -s "$RENDER_DEPLOY_HOOK_URL" || exit 1

@@ -41,6 +41,9 @@ _log = logging.getLogger(__name__)
 
 _STICKY_MARKER = "nixe-health-sticky"
 
+_RESTART_FIELD_NAME = "Restart log"
+_MAX_RESTART_ENTRIES = 50
+
 
 class HealthRestartProbeOverlay(commands.Cog):
     """Send health / restart logs into a dedicated thread and sticky embed."""
@@ -184,7 +187,33 @@ class HealthRestartProbeOverlay(commands.Cog):
             _log.warning("[health-thread] failed to create sticky message: %r", exc)
             return None
 
-    def _build_presence_embed(self, now: datetime.datetime) -> discord.Embed:
+    
+    
+    def _extract_restart_lines_from_embed(self, emb: discord.Embed) -> list[str]:
+        """Extract existing restart log lines from the given embed."""
+        lines: list[str] = []
+        for field in emb.fields:
+            if field.name == _RESTART_FIELD_NAME:
+                if field.value and field.value != "\u200b":
+                    lines = field.value.split("\n")
+                break
+        return lines
+
+    def _format_restart_line(self) -> str:
+        """Format a single restart log line with UTC timestamp and reason."""
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        # Detect Render vs local/minipc based on standard Render env var.
+        if os.getenv("RENDER_SERVICE_TYPE"):
+            reason = "restarting (Render deploy/restart)"
+        else:
+            reason = "restarting (local process)"
+        return f"- {now} : {reason}"
+
+    def _build_presence_embed(
+        self,
+        now: datetime.datetime,
+        restart_lines: list[str] | None = None,
+    ) -> discord.Embed:
         """Build the presence sticky embed."""
         ts = now.isoformat(timespec="seconds")
         emb = discord.Embed(
@@ -195,6 +224,12 @@ class HealthRestartProbeOverlay(commands.Cog):
         )
         emb.add_field(name="Status", value="Online", inline=True)
         emb.add_field(name="Last update", value=ts, inline=True)
+        if restart_lines:
+            emb.add_field(
+                name=_RESTART_FIELD_NAME,
+                value="\n".join(restart_lines),
+                inline=False,
+            )
         emb.set_footer(text=_STICKY_MARKER)
         return emb
 
@@ -210,12 +245,43 @@ class HealthRestartProbeOverlay(commands.Cog):
         if msg is None:
             return
 
+        restart_lines: list[str] = []
+        if msg.embeds:
+            restart_lines = self._extract_restart_lines_from_embed(msg.embeds[0])
+
         now = datetime.datetime.now(datetime.timezone.utc)
-        emb = self._build_presence_embed(now)
+        emb = self._build_presence_embed(now, restart_lines=restart_lines)
         try:
             await msg.edit(embed=emb)
         except Exception as exc:  # pragma: no cover - defensive
             _log.warning("[health-thread] failed to edit sticky presence message: %r", exc)
+
+    async def _append_restart_log_entry(self) -> None:
+        """Append a restart log entry into the sticky embed."""
+        if not self._enabled:
+            return
+        thread = await self._ensure_thread()
+        if thread is None:
+            return
+
+        msg = await self._ensure_sticky_message()
+        if msg is None:
+            return
+
+        restart_lines: list[str] = []
+        if msg.embeds:
+            restart_lines = self._extract_restart_lines_from_embed(msg.embeds[0])
+
+        restart_lines.append(self._format_restart_line())
+        if len(restart_lines) > _MAX_RESTART_ENTRIES:
+            restart_lines = restart_lines[-_MAX_RESTART_ENTRIES:]
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        emb = self._build_presence_embed(now, restart_lines=restart_lines)
+        try:
+            await msg.edit(embed=emb)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("[health-thread] failed to append restart log entry: %r", exc)
 
     async def _send_error_line(self, content: str) -> None:
         """Send a separate error log line into the thread (for crashes)."""
@@ -229,18 +295,22 @@ class HealthRestartProbeOverlay(commands.Cog):
         except Exception as exc:  # pragma: no cover - defensive
             _log.warning("[health-thread] failed to send error message: %r", exc)
 
+    
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        """On first ready per process, update the sticky presence embed.
+        """Handle Discord ready event.
 
-        We do NOT send new messages for presence each restart. Presence information
-        is always stored in a single sticky embed, which is edited.
+        On the first ready per process, append a restart log entry to the
+        sticky presence embed and then start the heartbeat loop.
         """
         if not self._enabled:
             return
 
         if self._first_ready:
-            await self._update_presence_sticky()
+            try:
+                await self._append_restart_log_entry()
+            except Exception as exc:  # pragma: no cover - defensive
+                _log.warning("[health-thread] failed to append restart log on ready: %r", exc)
             self._first_ready = False
 
         # Start heartbeat loop once (idempotent even if on_ready fires many times)

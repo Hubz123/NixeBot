@@ -425,9 +425,16 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     ok, out = await _call(base_sys)
     if ok and _seems_untranslated(text, out, target_lang):
-        ok2, out2 = await _call(strict_sys)
-        if ok2 and out2:
-            out = out2
+        # Jika hasil base_sys masih sangat mirip dengan teks sumber, kita biasanya
+        # menganggapnya sebagai 'belum diterjemahkan' dan mencoba STRICT mode.
+        # Khusus untuk target bahasa Indonesia, kita *tidak* memaksa STRICT mode
+        # supaya teks yang memang sudah bahasa Indonesia (kasual seperti "kalo", "ngga",
+        # "yg") tidak diparafrase menjadi bentuk lain ("kalau", "tidak", "yang").
+        tl = (target_lang or "").lower()
+        if tl not in ("id", "indonesian", "id-id"):
+            ok2, out2 = await _call(strict_sys)
+            if ok2 and out2:
+                out = out2
     return ok, out
 
 
@@ -1815,7 +1822,6 @@ class TranslateCommands(commands.Cog):
                         return
                     translated = (out_single or "").strip()
                     embed = discord.Embed(title="Translation")
-                    embed.add_field(name="Source", value=(text_to_translate or "(empty)")[:1024], inline=False)
                     embed.add_field(
                         name=f"Translated → {target_display}",
                         value=(translated or "(empty)")[:1024],

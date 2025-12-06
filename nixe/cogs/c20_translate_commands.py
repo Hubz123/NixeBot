@@ -100,6 +100,34 @@ def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
     return False
 
 
+
+
+def _looks_like_indonesian(text: str) -> bool:
+    """Heuristik ringan untuk mendeteksi teks yang *kelihatannya* bahasa Indonesia.
+
+    Tujuannya bukan deteksi bahasa yang sempurna, hanya untuk kasus:
+    - target_lang == 'id'
+    - teks sumber sudah Indonesia (kasual / campur), sehingga *tidak* perlu diterjemahkan lagi.
+    """
+    s = _normalize_for_compare(text)
+    if not s:
+        return False
+    # Kata-kata fungsi yang sangat umum di bahasa Indonesia.
+    hint_words = [
+        " yang ", " dan ", " atau ", " tidak ", " nggak ", " ga ", " gak ",
+        " aja ", " saja ", " banget ", " banget ", "kalo ", "kalau ",
+        " sampai ", " udah ", " sudah ", " belum ", " bisa ", " mungkin ",
+        " ini ", " itu ", " nih ", " deh ", " kok ", " sih ", " banget ",
+        " pemain ", " akun ", " server ", " resmi ", " official ",
+    ]
+    hits = 0
+    for w in hint_words:
+        if w in f" {s} ":
+            hits += 1
+            if hits >= 2:
+                return True
+    return False
+
 def _chunk_text(text: str, max_chars: int) -> List[str]:
     if len(text) <= max_chars:
         return [text]
@@ -366,6 +394,12 @@ def _pick_groq_key() -> str:
 # -------------------------
 
 async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
+    # Short-circuit: jika target bahasa Indonesia dan teks sudah kelihatan
+    # bahasa Indonesia, jangan panggil API sama sekali; langsung kembalikan teks.
+    tl = (target_lang or "").lower()
+    if tl in ("id", "indonesian", "id-id") and _looks_like_indonesian(text):
+        return True, text
+
     key = _pick_gemini_key()
     if not key:
         return False, "missing TRANSLATE_GEMINI_API_KEY"

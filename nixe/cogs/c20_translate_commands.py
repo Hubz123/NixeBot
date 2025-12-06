@@ -1626,11 +1626,13 @@ class TranslateCommands(commands.Cog):
                     )
                 chat_val = None  # jangan buat field gabungan lagi
             else:
-                if translated_chat and translated_chat.strip() != text_for_chat.strip():
-                    # ada hasil terjemahan berbeda
+                # Gunakan _seems_untranslated untuk menentukan apakah hasil benar-benar
+                # berbeda (bahasa lain) atau hanya parafrase kecil dari teks sumber.
+                if translated_chat and not _seems_untranslated(text_for_chat, translated_chat, target_code or target_lang):
+                    # ada hasil terjemahan berbeda (lintas bahasa)
                     chat_val = f"**Translated → {target_display}:**\n{translated_chat}"
                 else:
-                    # sama atau gagal terjemah; untuk kasus ini:
+                    # sama / hampir sama / gagal terjemah; untuk kasus ini:
                     # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
                     #   menampilkan blok Chat user lagi agar embed tetap ringkas.
                     if not (image_any_ok and target_code == "id"):

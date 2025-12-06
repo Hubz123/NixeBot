@@ -853,8 +853,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     prompt = (
         "You are an OCR+translation engine.\n"
         "1) Extract all readable text from the image.\n"
-        f"2) Translate it to {target_lang}.\n"
-        f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+        f"2) Translate all text that is not already in {target_lang} into {target_lang}, "
+        f"but leave any text that is already in {target_lang} unchanged (no paraphrasing).\n"
+        f"3) Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+        "   - \"text\": the original extracted text in its original languages.\n"
+        f"   - \"translation\": the final text in {target_lang} after translation, with any existing {target_lang} text preserved as-is.\n"
+        "   - \"reason\": short status like \"ok\" or \"no_text\".\n"
         "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
     mime = _detect_image_mime(image_bytes)
@@ -1432,6 +1436,8 @@ class TranslateCommands(commands.Cog):
 
         # 3a) Proses gambar-gambar (prioritas)
         image_any_ok = False
+        
+        image_blocks: List[str] = []
         for idx, img_bytes in enumerate(image_entries, 1):
             ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, target)
             field_name = f"🖼 Gambar #{idx}"
@@ -1444,29 +1450,44 @@ class TranslateCommands(commands.Cog):
                 )
                 continue
 
-            if (detected or "").strip():
-                # tampilkan teks asli + terjemahan
-                value_lines = []
-                value_lines.append("**Detected text:**")
-                value_lines.append((detected or "(empty)")[:600])
-                value_lines.append("")
-                value_lines.append(f"**Translated → {target_display}:**")
-                value_lines.append((translated_img or "(empty)")[:600])
-                val = "\n".join(value_lines)
-            else:
-                # tidak ada teks terbaca
-                if (translated_img or "").strip():
-                    # kadang model hanya mengembalikan terjemahan
-                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
-                else:
-                    val = "_Tidak ada teks terbaca di gambar ini._"
+            translated_clean = (translated_img or "").strip()
+            if not translated_clean:
+                translated_clean = "_Tidak ada teks terbaca di gambar ini._"
 
-            embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
+            block_header = f"🖼 Gambar #{idx} — Translated → {target_display}"
+            block = f"{block_header}\n{translated_clean}"
+            image_blocks.append(block)
             image_any_ok = True
 
+        # Susun description embed dari blok-blok gambar tanpa memotong di tengah kalimat.
+        if image_blocks:
+            try:
+                max_desc = int(_as_float("TRANSLATE_IMAGE_MAX_DESC_CHARS", 4000))
+            except Exception:
+                max_desc = 4000
+            if max_desc <= 0 or max_desc > 4000:
+                max_desc = 4000
+
+            desc_parts: List[str] = []
+            existing_desc = embed.description or ""
+            if existing_desc.strip():
+                desc_parts.append(existing_desc.strip())
+
+            for block in image_blocks:
+                block = block.strip()
+                if not block:
+                    continue
+                candidate = "\n\n".join(desc_parts + [block]) if desc_parts else block
+                if len(candidate) > max_desc:
+                    # Jangan paksa; berhenti supaya blok yang sudah ada tetap utuh.
+                    break
+                desc_parts.append(block)
+
+            if desc_parts:
+                embed.description = "\n\n".join(desc_parts)
 
 
-        # 3b) Proses chat user (jika ada text_for_chat)
+# 3b) Proses chat user (jika ada text_for_chat)
         provider = _pick_provider()
         translated_chat = ""
         chat_val: str | None = None
@@ -1600,24 +1621,13 @@ class TranslateCommands(commands.Cog):
             else:
                 if translated_chat and translated_chat.strip() != text_for_chat.strip():
                     # ada hasil terjemahan berbeda
-                    value_lines = []
-                    value_lines.append("")
-                    value_lines.append(src_preview)
-                    value_lines.append("")
-                    value_lines.append(f"**Translated → {target_display}:**")
-                    value_lines.append(translated_chat)
-                    chat_val = "\n".join(value_lines)
+                    chat_val = f"**Translated → {target_display}:**\n{translated_chat}"
                 else:
                     # sama atau gagal terjemah; untuk kasus ini:
                     # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
                     #   menampilkan blok Chat user lagi agar embed tetap ringkas.
                     if not (image_any_ok and target_code == "id"):
-                        value_lines = []
-                        value_lines.append("")
-                        value_lines.append(src_preview)
-                        value_lines.append("")
-                        value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
-                        chat_val = "\n".join(value_lines)
+                        chat_val = f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._"
         if chat_val is not None:
             embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
         # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.

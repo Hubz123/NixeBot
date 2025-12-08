@@ -38,6 +38,25 @@ class LinkOnlyGuard(commands.Cog):
             return False
         return URL_RE.search(content) is not None
 
+    @staticmethod
+    def _has_image_attachment(message: discord.Message) -> bool:
+        """Return True jika ada attachment gambar (png/jpg/jpeg)."""
+        if not getattr(message, "attachments", None):
+            return False
+        for att in message.attachments:
+            try:
+                ct = (getattr(att, "content_type", "") or "").lower()
+                name = (getattr(att, "filename", "") or "").lower()
+            except Exception:
+                continue
+            if name.endswith((".png", ".jpg", ".jpeg")):
+                return True
+            if ct.startswith("image/"):
+                # Lebih longgar: kalau Discord tandai ini sebagai image/*, izinkan juga.
+                return True
+        return False
+
+
     async def _handle_message(self, message: discord.Message) -> None:
         # Hanya di guild
         if message.guild is None:
@@ -78,11 +97,14 @@ class LinkOnlyGuard(commands.Cog):
 
         content = (message.content or "").strip()
 
-        # Kalau ada minimal satu URL -> biarkan (chat + link boleh)
-        if self._has_url(content):
+        has_url = self._has_url(content)
+        has_image = self._has_image_attachment(message)
+
+        # Kalau ada minimal satu URL ATAU ada gambar (png/jpg/jpeg) -> biarkan
+        if has_url or has_image:
             return
 
-        # Tidak ada URL sama sekali -> hapus
+        # Tidak ada URL dan tidak ada gambar -> hapus (text-only)
         try:
             await message.delete()
             log.info(

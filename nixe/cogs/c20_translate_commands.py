@@ -52,8 +52,6 @@ log = logging.getLogger(__name__)
 
 # -------------------------
 # small helpers
-# -------------------------
-
 
 async def _safe_followup_send(
     interaction: discord.Interaction,
@@ -62,10 +60,10 @@ async def _safe_followup_send(
     embed: Optional[discord.Embed] = None,
     ephemeral: bool = False,
 ) -> None:
-    """Safely send an interaction followup without raising on 404 Unknown Message.
+    """Safely send a followup for an interaction without letting transport errors bubble.
 
-    Dipakai oleh context-menu translate / reverse-image supaya kalau interaction
-    sudah expired, tidak bikin CommandInvokeError + traceback di log.
+    Ini mencegah kasus 404 Unknown Message / timeout di webhook supaya tidak
+    berubah menjadi CommandInvokeError yang memenuhi log.
     """
     try:
         if embed is not None and content is not None:
@@ -75,14 +73,12 @@ async def _safe_followup_send(
         else:
             await interaction.followup.send(content or "", ephemeral=ephemeral)
     except discord.NotFound:
-        # Interaction token / message sudah tidak valid (404 Unknown Message).
-        # Bisa terjadi kalau user nunggu kelamaan atau Discord buang webhook-nya.
+        # Interaction / webhook sudah tidak valid (expired atau unknown); cukup log ringan.
         log.warning("[translate] followup.send failed: interaction expired or unknown (404)")
     except Exception:
-        # Jangan biarkan error jaringan/transport naik jadi CommandInvokeError.
+        # Jangan biarkan error lain (400, 5xx, koneksi) meledak ke global handler.
         log.exception("[translate] unexpected error while sending interaction followup")
-
-
+# -------------------------
 
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
@@ -907,6 +903,7 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": raw,
         }
 
+
 async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
     """
     OCR+translate an image using Gemini Vision REST API.
@@ -915,6 +912,8 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     (including yours) ship with an httpx version that is incompatible with recent SDK
     releases, causing noisy follow_redirects / destructor errors. REST is stable.
     """
+
+    # Base configuration
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
@@ -926,14 +925,25 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         f"2) Translate all text that is not already in {target_lang} into {target_lang}, "
         f"but leave any text that is already in {target_lang} unchanged (no paraphrasing).\n"
         f"3) Return ONLY compact JSON matching schema: {schema}. No prose.\n"
-        "   - \"text\": the original extracted text in its original languages.\n"
-        f"   - \"translation\": the final text in {target_lang} after translation, with any existing {target_lang} text preserved as-is.\n"
-        "   - \"reason\": short status like \"ok\" or \"no_text\".\n"
-        "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
+        '   - "text": the original extracted text in its original languages.\n'
+        f"   - \"translation\": the final text in {target_lang} with all content in other languages translated into {target_lang}, "
+        f"and any existing {target_lang} text preserved as-is.\n"
+        '   - "reason": short status like "ok" or "no_text".\n'
+        'If no text, return {"text":"","translation":"","reason":"no_text"}.'
     )
     mime = _detect_image_mime(image_bytes)
 
+    # Normalise timeout and allow override via env; we also support a single retry on timeout.
     try:
+        base_timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "30"))
+    except Exception:
+        base_timeout_s = 30.0
+    if base_timeout_s <= 0:
+        base_timeout_s = 30.0
+    # Keep within reasonable bounds so we do not hang forever even if misconfigured.
+    base_timeout_s = max(5.0, min(base_timeout_s, 60.0))
+
+    async def _do_request(timeout_s: float) -> Tuple[bool, str, str, str]:
         import aiohttp
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
@@ -949,7 +959,6 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             }],
             "generationConfig": {"temperature": 0.2},
         }
-        timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
             async with session.post(url, json=payload) as resp:
                 data = await resp.json(content_type=None)
@@ -971,8 +980,27 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         translated = str(j.get("translation", "") or "")
         reason = str(j.get("reason", "") or "ok")
         return True, detected, translated, reason
+
+    try:
+        # First attempt with the base timeout.
+        return await _do_request(base_timeout_s)
+    except asyncio.TimeoutError as e:
+        # Gemini Vision sometimes takes longer on very text-heavy images (forum screenshots, etc.).
+        # Retry once with an extended timeout instead of failing immediately.
+        try:
+            extended = min(base_timeout_s * 2.0, 90.0)
+            log.warning("[translate] vision image timeout after %.1fs; retrying once with %.1fs", base_timeout_s, extended)
+            return await _do_request(extended)
+        except asyncio.TimeoutError:
+            # Give up after a second timeout but make the reason explicit.
+            log.warning("[translate] vision image second timeout after %.1fs", extended)
+            return False, "", "", "vision_failed:TimeoutError()"
+        except Exception as e2:
+            log.exception("[translate] vision image second attempt failed")
+            return False, "", "", f"vision_failed:{e2!r}"
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"
+
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot

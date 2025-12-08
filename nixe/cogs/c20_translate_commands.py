@@ -54,6 +54,36 @@ log = logging.getLogger(__name__)
 # small helpers
 # -------------------------
 
+
+async def _safe_followup_send(
+    interaction: discord.Interaction,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    ephemeral: bool = False,
+) -> None:
+    """Safely send an interaction followup without raising on 404 Unknown Message.
+
+    Dipakai oleh context-menu translate / reverse-image supaya kalau interaction
+    sudah expired, tidak bikin CommandInvokeError + traceback di log.
+    """
+    try:
+        if embed is not None and content is not None:
+            await interaction.followup.send(content, embed=embed, ephemeral=ephemeral)
+        elif embed is not None:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(content or "", ephemeral=ephemeral)
+    except discord.NotFound:
+        # Interaction token / message sudah tidak valid (404 Unknown Message).
+        # Bisa terjadi kalau user nunggu kelamaan atau Discord buang webhook-nya.
+        log.warning("[translate] followup.send failed: interaction expired or unknown (404)")
+    except Exception:
+        # Jangan biarkan error jaringan/transport naik jadi CommandInvokeError.
+        log.exception("[translate] unexpected error while sending interaction followup")
+
+
+
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
@@ -1289,8 +1319,9 @@ class TranslateCommands(commands.Cog):
             uniq_urls.append(u)
 
         if not uniq_urls:
-            await interaction.followup.send(
-                "Tidak ada gambar pada pesan ini untuk reverse image search.",
+            await _safe_followup_send(
+                interaction,
+                content="Tidak ada gambar pada pesan ini untuk reverse image search.",
                 ephemeral=ephemeral,
             )
             return
@@ -1326,7 +1357,7 @@ class TranslateCommands(commands.Cog):
 
         embed.set_footer(text="Reverse image search helper: Google Lens • Bing • Yandex • SauceNAO • IQDB")
 
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        await _safe_followup_send(interaction, embed=embed, ephemeral=ephemeral)
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
         if not _as_bool("TRANSLATE_ENABLE", True):
@@ -1575,7 +1606,11 @@ class TranslateCommands(commands.Cog):
                             # fallback: single-mode translate seluruh teks supaya hasil tetap ada
                             ok_single, out_single = await _gemini_translate_text(text_for_chat, target)
                             if not ok_single:
-                                await interaction.followup.send(out_single, ephemeral=ephemeral)
+                                await _safe_followup_send(
+                                    interaction,
+                                    content=out_single,
+                                    ephemeral=ephemeral,
+                                )
                                 return
                             translated_chat = out_single.strip()
                             ja_dual_enable = ko_dual_enable = zh_dual_enable = False
@@ -1608,7 +1643,11 @@ class TranslateCommands(commands.Cog):
                         # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
                         ok, out = await _gemini_translate_text(ch, target)
                         if not ok:
-                            await interaction.followup.send(out, ephemeral=ephemeral)
+                            await _safe_followup_send(
+                                interaction,
+                                content=out,
+                                ephemeral=ephemeral,
+                            )
                             return
                         out_parts.append(out)
                     translated_chat = "\n".join(out_parts).strip()
@@ -1669,14 +1708,18 @@ class TranslateCommands(commands.Cog):
             embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
         # Kalau embed benar-benar kosong (tanpa description dan tanpa field), fallback pesan teks.
         if not embed.fields and not (embed.description and embed.description.strip()):
-            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
+            await _safe_followup_send(
+                interaction,
+                content="Tidak ada teks yang bisa diterjemahkan dari pesan ini.",
+                ephemeral=ephemeral,
+            )
             return
 
         # Footer info provider untuk debug ringan
         footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
         embed.set_footer(text=" • ".join(footer_bits))
 
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        await _safe_followup_send(interaction, embed=embed, ephemeral=ephemeral)
 
 
     @commands.Cog.listener()

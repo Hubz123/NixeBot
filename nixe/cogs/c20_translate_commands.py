@@ -399,12 +399,11 @@ def _pick_provider() -> str:
     """
     return "gemini"
 def _pick_gemini_key() -> str:
-    key = _env("TRANSLATE_GEMINI_API_KEY", "")
-    if key:
-        return key
-    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        return _env("GEMINI_API_KEY", _env("GEMINI_API_KEY_B", _env("GEMINI_BACKUP_API_KEY", "")))
-    return ""
+    # Strict: translate SELALU pakai key khusus TRANSLATE_GEMINI_API_KEY.
+    # Tidak pernah fallback ke GEMINI_API_KEY / GEMINI_API_KEY_B agar LPG dan translate
+    # benar-benar terpisah secara quota.
+    return _env("TRANSLATE_GEMINI_API_KEY", "")
+
 
 def _pick_groq_key() -> str:
     key = _env("TRANSLATE_GROQ_API_KEY", "")

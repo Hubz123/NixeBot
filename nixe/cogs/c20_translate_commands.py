@@ -904,6 +904,7 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
         }
 
 
+
 async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
     """
     OCR+translate an image using Gemini Vision REST API.
@@ -935,13 +936,13 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
 
     # Normalise timeout and allow override via env; we also support a single retry on timeout.
     try:
-        base_timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "30"))
+        base_timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "45"))
     except Exception:
-        base_timeout_s = 30.0
+        base_timeout_s = 45.0
     if base_timeout_s <= 0:
-        base_timeout_s = 30.0
+        base_timeout_s = 45.0
     # Keep within reasonable bounds so we do not hang forever even if misconfigured.
-    base_timeout_s = max(5.0, min(base_timeout_s, 60.0))
+    base_timeout_s = max(5.0, min(base_timeout_s, 90.0))
 
     async def _do_request(timeout_s: float) -> Tuple[bool, str, str, str]:
         import aiohttp
@@ -957,11 +958,23 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                     }},
                 ],
             }],
-            "generationConfig": {"temperature": 0.2},
+            # Tambah batas token output agar respon tidak terlalu panjang dan berat.
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
         }
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-            async with session.post(url, json=payload) as resp:
-                data = await resp.json(content_type=None)
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                async with session.post(url, json=payload) as resp:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception as e:
+                        text = await resp.text()
+                        return False, "", "", f"vision_invalid_json:{str(e)!r} body={text[:200]}"
+        except asyncio.TimeoutError:
+            # Biarkan timeout menggelembung ke pemanggil supaya bisa di-retry.
+            raise
+        except Exception as e:
+            log.exception("[translate] vision HTTP error")
+            return False, "", "", f"vision_http_failed:{e!r}"
 
         candidates = data.get("candidates") or []
         parts = []
@@ -972,9 +985,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             if isinstance(p, dict) and "text" in p:
                 out += str(p["text"])
         out = _clean_output(out)
+        if not out:
+            return False, "", "", "empty_response"
         try:
             j = json.loads(out)
         except Exception:
+            # Model tidak patuh schema -> jadikan seluruh output sebagai hasil translate.
             return True, out, out, "non_json_output"
         detected = str(j.get("text", "") or "")
         translated = str(j.get("translation", "") or "")
@@ -984,12 +1000,16 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     try:
         # First attempt with the base timeout.
         return await _do_request(base_timeout_s)
-    except asyncio.TimeoutError as e:
-        # Gemini Vision sometimes takes longer on very text-heavy images (forum screenshots, etc.).
-        # Retry once with an extended timeout instead of failing immediately.
+    except asyncio.TimeoutError:
+        # Gemini Vision kadang butuh waktu lebih lama untuk gambar yang sangat padat teks.
+        # Retry sekali dengan timeout lebih panjang.
         try:
             extended = min(base_timeout_s * 2.0, 90.0)
-            log.warning("[translate] vision image timeout after %.1fs; retrying once with %.1fs", base_timeout_s, extended)
+            log.warning(
+                "[translate] vision image timeout after %.1fs; retrying once with %.1fs",
+                base_timeout_s,
+                extended,
+            )
             return await _do_request(extended)
         except asyncio.TimeoutError:
             # Give up after a second timeout but make the reason explicit.
@@ -1000,7 +1020,6 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             return False, "", "", f"vision_failed:{e2!r}"
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"
-
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot

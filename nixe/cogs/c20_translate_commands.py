@@ -52,32 +52,6 @@ log = logging.getLogger(__name__)
 
 # -------------------------
 # small helpers
-
-async def _safe_followup_send(
-    interaction: discord.Interaction,
-    *,
-    content: Optional[str] = None,
-    embed: Optional[discord.Embed] = None,
-    ephemeral: bool = False,
-) -> None:
-    """Safely send a followup for an interaction without letting transport errors bubble.
-
-    Ini mencegah kasus 404 Unknown Message / timeout di webhook supaya tidak
-    berubah menjadi CommandInvokeError yang memenuhi log.
-    """
-    try:
-        if embed is not None and content is not None:
-            await interaction.followup.send(content, embed=embed, ephemeral=ephemeral)
-        elif embed is not None:
-            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-        else:
-            await interaction.followup.send(content or "", ephemeral=ephemeral)
-    except discord.NotFound:
-        # Interaction / webhook sudah tidak valid (expired atau unknown); cukup log ringan.
-        log.warning("[translate] followup.send failed: interaction expired or unknown (404)")
-    except Exception:
-        # Jangan biarkan error lain (400, 5xx, koneksi) meledak ke global handler.
-        log.exception("[translate] unexpected error while sending interaction followup")
 # -------------------------
 
 def _env(key: str, default: str = "") -> str:
@@ -101,6 +75,21 @@ def _clean_output(s: str) -> str:
         s = re.sub(r"\n?```$", "", s)
     return s.strip()
 
+
+def _squash_blank_lines(s: str, max_consecutive: int = 2) -> str:
+    """Normalize newlines and collapse long runs of blank lines.
+
+    This keeps model outputs readable (especially for image translation) without
+    changing the actual content too much.
+    """
+    s = s.replace("\r\n", "\n")
+    # collapse runs of 3+ newlines down to `max_consecutive`
+    pattern = r"\n{%d,}" % (max_consecutive + 1)
+    replacement = "\n" * max_consecutive
+    s = re.sub(pattern, replacement, s)
+    return s.strip()
+
+
 def _normalize_for_compare(s: str) -> str:
     s = re.sub(r"https?://\S+", " ", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -123,33 +112,6 @@ def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
         nonlatin = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", out))
         if nonlatin > 8 and nonlatin / max(1, len(out)) > 0.20:
             return True
-    return False
-
-
-
-def _looks_like_indonesian(text: str) -> bool:
-    """Heuristik ringan untuk mendeteksi teks yang *kelihatannya* bahasa Indonesia.
-
-    Ini tidak perlu akurat 100%%; cukup untuk menghindari menerjemahkan ulang teks
-    yang jelas-jelas sudah bahasa Indonesia saat target_lang = 'id'.
-    """
-    s = _normalize_for_compare(text)
-    if not s:
-        return False
-    # Kata-kata fungsi yang sangat umum di bahasa Indonesia.
-    hint_words = [
-        " yang ", " dan ", " atau ", " tidak ", " nggak ", " ga ", " gak ",
-        " aja ", " saja ", " banget ", "kalo ", "kalau ",
-        " sampai ", " sampe ", " udah ", " sudah ", " belum ", " bisa ", " mungkin ",
-        " ini ", " itu ", " nih ", " deh ", " kok ", " sih ",
-        " pemain ", " akun ", " server ", " resmi ", " official ",
-    ]
-    hits = 0
-    for w in hint_words:
-        if w in f" {s} ":
-            hits += 1
-            if hits >= 2:
-                return True
     return False
 
 
@@ -399,11 +361,12 @@ def _pick_provider() -> str:
     """
     return "gemini"
 def _pick_gemini_key() -> str:
-    # Strict: translate SELALU pakai key khusus TRANSLATE_GEMINI_API_KEY.
-    # Tidak pernah fallback ke GEMINI_API_KEY / GEMINI_API_KEY_B agar LPG dan translate
-    # benar-benar terpisah secara quota.
-    return _env("TRANSLATE_GEMINI_API_KEY", "")
-
+    key = _env("TRANSLATE_GEMINI_API_KEY", "")
+    if key:
+        return key
+    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
+        return _env("GEMINI_API_KEY", _env("GEMINI_API_KEY_B", _env("GEMINI_BACKUP_API_KEY", "")))
+    return ""
 
 def _pick_groq_key() -> str:
     key = _env("TRANSLATE_GROQ_API_KEY", "")
@@ -418,12 +381,6 @@ def _pick_groq_key() -> str:
 # -------------------------
 
 async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
-    # Short-circuit: jika target bahasa Indonesia dan teks sudah kelihatan
-    # bahasa Indonesia, jangan panggil API sama sekali; langsung kembalikan teks.
-    tl = (target_lang or "").lower()
-    if tl in ("id", "indonesian", "id-id") and _looks_like_indonesian(text):
-        return True, text
-
     key = _pick_gemini_key()
     if not key:
         return False, "missing TRANSLATE_GEMINI_API_KEY"
@@ -483,16 +440,9 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     ok, out = await _call(base_sys)
     if ok and _seems_untranslated(text, out, target_lang):
-        # Jika hasil base_sys masih sangat mirip dengan teks sumber, kita biasanya
-        # menganggapnya sebagai 'belum diterjemahkan' dan mencoba STRICT mode.
-        # Khusus untuk target bahasa Indonesia, kita *tidak* memaksa STRICT mode
-        # supaya teks yang memang sudah bahasa Indonesia (kasual seperti "kalo", "ngga",
-        # "yg") tidak diparafrase menjadi bentuk lain ("kalau", "tidak", "yang").
-        tl = (target_lang or "").lower()
-        if tl not in ("id", "indonesian", "id-id"):
-            ok2, out2 = await _call(strict_sys)
-            if ok2 and out2:
-                out = out2
+        ok2, out2 = await _call(strict_sys)
+        if ok2 and out2:
+            out = out2
     return ok, out
 
 
@@ -903,7 +853,6 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
         }
 
 
-
 async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
     """
     OCR+translate an image using Gemini Vision REST API.
@@ -912,8 +861,6 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     (including yours) ship with an httpx version that is incompatible with recent SDK
     releases, causing noisy follow_redirects / destructor errors. REST is stable.
     """
-
-    # Base configuration
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
@@ -922,28 +869,13 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     prompt = (
         "You are an OCR+translation engine.\n"
         "1) Extract all readable text from the image.\n"
-        f"2) Translate all text that is not already in {target_lang} into {target_lang}, "
-        f"but leave any text that is already in {target_lang} unchanged (no paraphrasing).\n"
-        f"3) Return ONLY compact JSON matching schema: {schema}. No prose.\n"
-        '   - "text": the original extracted text in its original languages.\n'
-        f"   - \"translation\": the final text in {target_lang} with all content in other languages translated into {target_lang}, "
-        f"and any existing {target_lang} text preserved as-is.\n"
-        '   - "reason": short status like "ok" or "no_text".\n'
-        'If no text, return {"text":"","translation":"","reason":"no_text"}.'
+        f"2) Translate it to {target_lang}.\n"
+        f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+        "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
     mime = _detect_image_mime(image_bytes)
 
-    # Normalise timeout and allow override via env; we also support a single retry on timeout.
     try:
-        base_timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "45"))
-    except Exception:
-        base_timeout_s = 45.0
-    if base_timeout_s <= 0:
-        base_timeout_s = 45.0
-    # Keep within reasonable bounds so we do not hang forever even if misconfigured.
-    base_timeout_s = max(5.0, min(base_timeout_s, 90.0))
-
-    async def _do_request(timeout_s: float) -> Tuple[bool, str, str, str]:
         import aiohttp
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
@@ -957,69 +889,60 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                     }},
                 ],
             }],
-            # Tambah batas token output agar respon tidak terlalu panjang dan berat.
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
+            "generationConfig": {"temperature": 0.2},
         }
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-                async with session.post(url, json=payload) as resp:
-                    try:
-                        data = await resp.json(content_type=None)
-                    except Exception as e:
-                        text = await resp.text()
-                        return False, "", "", f"vision_invalid_json:{str(e)!r} body={text[:200]}"
-        except asyncio.TimeoutError:
-            # Biarkan timeout menggelembung ke pemanggil supaya bisa di-retry.
-            raise
-        except Exception as e:
-            log.exception("[translate] vision HTTP error")
-            return False, "", "", f"vision_http_failed:{e!r}"
+        timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json(content_type=None)
 
         candidates = data.get("candidates") or []
-        parts = []
+        parts: List[Dict[str, Any]] = []
         if candidates:
             parts = (candidates[0].get("content") or {}).get("parts") or []
+
         out = ""
         for p in parts:
             if isinstance(p, dict) and "text" in p:
                 out += str(p["text"])
-        out = _clean_output(out)
-        if not out:
-            return False, "", "", "empty_response"
+
+        # Cleanup + squash insane blank lines before parsing
+        out = _squash_blank_lines(_clean_output(out))
+
+        j: Dict[str, Any] | None = None
+
+        # 1) direct JSON parse
         try:
             j = json.loads(out)
         except Exception:
-            # Model tidak patuh schema -> jadikan seluruh output sebagai hasil translate.
-            return True, out, out, "non_json_output"
-        detected = str(j.get("text", "") or "")
-        translated = str(j.get("translation", "") or "")
+            j = None
+
+        # 2) if model wrapped JSON in extra text, try to extract the first {...}
+        if j is None:
+            m2 = re.search(r"\{.*\}", out, flags=re.DOTALL)
+            if m2:
+                try:
+                    j = json.loads(m2.group(0))
+                except Exception:
+                    j = None
+
+        # 3) If still not JSON, best-effort regex extraction of "text" / "translation"
+        if not isinstance(j, dict):
+            text_match = re.search(r'"text"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
+            trans_match = re.search(r'"translation"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
+            detected = _squash_blank_lines(text_match.group(1)) if text_match else out
+            translated = _squash_blank_lines(trans_match.group(1)) if trans_match else detected
+            return True, detected, translated, "non_json_output"
+
+        detected = _squash_blank_lines(str(j.get("text", "") or ""))
+        translated = _squash_blank_lines(str(j.get("translation", "") or ""))
         reason = str(j.get("reason", "") or "ok")
         return True, detected, translated, reason
-
-    try:
-        # First attempt with the base timeout.
-        return await _do_request(base_timeout_s)
-    except asyncio.TimeoutError:
-        # Gemini Vision kadang butuh waktu lebih lama untuk gambar yang sangat padat teks.
-        # Retry sekali dengan timeout lebih panjang.
-        try:
-            extended = min(base_timeout_s * 2.0, 90.0)
-            log.warning(
-                "[translate] vision image timeout after %.1fs; retrying once with %.1fs",
-                base_timeout_s,
-                extended,
-            )
-            return await _do_request(extended)
-        except asyncio.TimeoutError:
-            # Give up after a second timeout but make the reason explicit.
-            log.warning("[translate] vision image second timeout after %.1fs", extended)
-            return False, "", "", "vision_failed:TimeoutError()"
-        except Exception as e2:
-            log.exception("[translate] vision image second attempt failed")
-            return False, "", "", f"vision_failed:{e2!r}"
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"
+
 class TranslateCommands(commands.Cog):
+(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_call: Dict[int, float] = {}
@@ -1365,9 +1288,8 @@ class TranslateCommands(commands.Cog):
             uniq_urls.append(u)
 
         if not uniq_urls:
-            await _safe_followup_send(
-                interaction,
-                content="Tidak ada gambar pada pesan ini untuk reverse image search.",
+            await interaction.followup.send(
+                "Tidak ada gambar pada pesan ini untuk reverse image search.",
                 ephemeral=ephemeral,
             )
             return
@@ -1403,7 +1325,7 @@ class TranslateCommands(commands.Cog):
 
         embed.set_footer(text="Reverse image search helper: Google Lens • Bing • Yandex • SauceNAO • IQDB")
 
-        await _safe_followup_send(interaction, embed=embed, ephemeral=ephemeral)
+        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
         if not _as_bool("TRANSLATE_ENABLE", True):
@@ -1533,6 +1455,11 @@ class TranslateCommands(commands.Cog):
                 if debug:
                     log.exception("[translate] error while scanning embeds for images")
 
+        # Jika tidak ada teks chat/embed dan tidak ada gambar sama sekali -> langsung beri pesan kosong.
+        if not text_for_chat and not image_entries:
+            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
+            return
+
         # -------------------------
         # 3) Bangun embed gabungan (gambar dulu, lalu chat)
         # -------------------------
@@ -1548,8 +1475,6 @@ class TranslateCommands(commands.Cog):
 
         # 3a) Proses gambar-gambar (prioritas)
         image_any_ok = False
-        
-        image_blocks: List[str] = []
         for idx, img_bytes in enumerate(image_entries, 1):
             ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, target)
             field_name = f"🖼 Gambar #{idx}"
@@ -1562,44 +1487,29 @@ class TranslateCommands(commands.Cog):
                 )
                 continue
 
-            translated_clean = (translated_img or "").strip()
-            if not translated_clean:
-                translated_clean = "_Tidak ada teks terbaca di gambar ini._"
+            if (detected or "").strip():
+                # tampilkan teks asli + terjemahan
+                value_lines = []
+                value_lines.append("**Detected text:**")
+                value_lines.append((detected or "(empty)")[:600])
+                value_lines.append("")
+                value_lines.append(f"**Translated → {target_display}:**")
+                value_lines.append((translated_img or "(empty)")[:600])
+                val = "\n".join(value_lines)
+            else:
+                # tidak ada teks terbaca
+                if (translated_img or "").strip():
+                    # kadang model hanya mengembalikan terjemahan
+                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
+                else:
+                    val = "_Tidak ada teks terbaca di gambar ini._"
 
-            block_header = f"🖼 Gambar #{idx} — Translated → {target_display}"
-            block = f"{block_header}\n{translated_clean}"
-            image_blocks.append(block)
+            embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
             image_any_ok = True
 
-        # Susun description embed dari blok-blok gambar tanpa memotong di tengah kalimat.
-        if image_blocks:
-            try:
-                max_desc = int(_as_float("TRANSLATE_IMAGE_MAX_DESC_CHARS", 4000))
-            except Exception:
-                max_desc = 4000
-            if max_desc <= 0 or max_desc > 4000:
-                max_desc = 4000
-
-            desc_parts: List[str] = []
-            existing_desc = embed.description or ""
-            if existing_desc.strip():
-                desc_parts.append(existing_desc.strip())
-
-            for block in image_blocks:
-                block = block.strip()
-                if not block:
-                    continue
-                candidate = "\n\n".join(desc_parts + [block]) if desc_parts else block
-                if len(candidate) > max_desc:
-                    # Jangan paksa; berhenti supaya blok yang sudah ada tetap utuh.
-                    break
-                desc_parts.append(block)
-
-            if desc_parts:
-                embed.description = "\n\n".join(desc_parts)
 
 
-# 3b) Proses chat user (jika ada text_for_chat)
+        # 3b) Proses chat user (jika ada text_for_chat)
         provider = _pick_provider()
         translated_chat = ""
         chat_val: str | None = None
@@ -1652,11 +1562,7 @@ class TranslateCommands(commands.Cog):
                             # fallback: single-mode translate seluruh teks supaya hasil tetap ada
                             ok_single, out_single = await _gemini_translate_text(text_for_chat, target)
                             if not ok_single:
-                                await _safe_followup_send(
-                                    interaction,
-                                    content=out_single,
-                                    ephemeral=ephemeral,
-                                )
+                                await interaction.followup.send(out_single, ephemeral=ephemeral)
                                 return
                             translated_chat = out_single.strip()
                             ja_dual_enable = ko_dual_enable = zh_dual_enable = False
@@ -1689,11 +1595,7 @@ class TranslateCommands(commands.Cog):
                         # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
                         ok, out = await _gemini_translate_text(ch, target)
                         if not ok:
-                            await _safe_followup_send(
-                                interaction,
-                                content=out,
-                                ephemeral=ephemeral,
-                            )
+                            await interaction.followup.send(out, ephemeral=ephemeral)
                             return
                         out_parts.append(out)
                     translated_chat = "\n".join(out_parts).strip()
@@ -1739,33 +1641,38 @@ class TranslateCommands(commands.Cog):
                     )
                 chat_val = None  # jangan buat field gabungan lagi
             else:
-                # Gunakan _seems_untranslated untuk menentukan apakah hasil benar-benar
-                # berbeda (bahasa lain) atau hanya parafrase kecil dari teks sumber.
-                if translated_chat and not _seems_untranslated(text_for_chat, translated_chat, target_code or target_lang):
-                    # ada hasil terjemahan berbeda (lintas bahasa)
-                    chat_val = f"**Translated → {target_display}:**\n{translated_chat}"
+                if translated_chat and translated_chat.strip() != text_for_chat.strip():
+                    # ada hasil terjemahan berbeda
+                    value_lines = []
+                    value_lines.append("")
+                    value_lines.append(src_preview)
+                    value_lines.append("")
+                    value_lines.append(f"**Translated → {target_display}:**")
+                    value_lines.append(translated_chat)
+                    chat_val = "\n".join(value_lines)
                 else:
-                    # sama / hampir sama / gagal terjemah; untuk kasus ini:
+                    # sama atau gagal terjemah; untuk kasus ini:
                     # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
                     #   menampilkan blok Chat user lagi agar embed tetap ringkas.
                     if not (image_any_ok and target_code == "id"):
-                        chat_val = f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._"
+                        value_lines = []
+                        value_lines.append("")
+                        value_lines.append(src_preview)
+                        value_lines.append("")
+                        value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
+                        chat_val = "\n".join(value_lines)
         if chat_val is not None:
             embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
-        # Kalau embed benar-benar kosong (tanpa description dan tanpa field), fallback pesan teks.
-        if not embed.fields and not (embed.description and embed.description.strip()):
-            await _safe_followup_send(
-                interaction,
-                content="Tidak ada teks yang bisa diterjemahkan dari pesan ini.",
-                ephemeral=ephemeral,
-            )
+        # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
+        if not embed.fields:
+            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
             return
 
         # Footer info provider untuk debug ringan
         footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
         embed.set_footer(text=" • ".join(footer_bits))
 
-        await _safe_followup_send(interaction, embed=embed, ephemeral=ephemeral)
+        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
 
 
     @commands.Cog.listener()
@@ -1941,6 +1848,7 @@ class TranslateCommands(commands.Cog):
                         return
                     translated = (out_single or "").strip()
                     embed = discord.Embed(title="Translation")
+                    embed.add_field(name="Source", value=(text_to_translate or "(empty)")[:1024], inline=False)
                     embed.add_field(
                         name=f"Translated → {target_display}",
                         value=(translated or "(empty)")[:1024],

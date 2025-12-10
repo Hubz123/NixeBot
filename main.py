@@ -158,7 +158,10 @@ class NixeBot(commands.Bot):
             return
         await self.process_commands(message)
 
-bot = NixeBot(command_prefix="!", intents=INTENTS)
+def create_bot() -> NixeBot:
+    # Factory to ensure a fresh discord.Client / aiohttp session for each run.
+    return NixeBot(command_prefix="!", intents=INTENTS)
+
 
 # --- tiny HTTP server for Render healthcheck ---------------------------------
 from aiohttp import web
@@ -197,12 +200,15 @@ async def start_web(port: int):
 async def _run_bot(token: str):
     # Guard loop: if bot.start ever returns or crashes, we log and restart.
     while True:
+        bot = create_bot()
         try:
             # discord.py already has internal reconnect logic; this is a second layer
             # so that if it ever returns unexpectedly, we can restart the whole client.
             await bot.start(token, reconnect=True)
         except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
             # Propagate shutdown signals so service can stop cleanly when asked.
+            with contextlib.suppress(Exception):
+                await bot.close()
             raise
         except Exception as exc:
             log.exception("Bot crashed unexpectedly: %r — restarting in 10s", exc)
@@ -210,10 +216,14 @@ async def _run_bot(token: str):
                 bot.dispatch("nixe_bot_crash", exc)
             except Exception:
                 log.debug("Failed to dispatch nixe_bot_crash event", exc_info=True)
+            with contextlib.suppress(Exception):
+                await bot.close()
             await asyncio.sleep(10)
         else:
             # bot.start() returned cleanly without an explicit shutdown request.
             log.warning("bot.start() returned without error — restarting in 10s")
+            with contextlib.suppress(Exception):
+                await bot.close()
             await asyncio.sleep(10)
 
 async def _main():

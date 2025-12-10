@@ -27,6 +27,8 @@ def validate_env() -> List[str]:
     for k, v in env.items():
         if _is_section_key(k):
             continue
+        if k.upper().startswith("RENDER_"):
+            continue
         if _ID_RE.match(k):
             sv = str(v).strip()
             if not sv.isdigit() or int(sv) <= 0:

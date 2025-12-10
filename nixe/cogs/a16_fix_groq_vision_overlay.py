@@ -1,7 +1,10 @@
 # nixe/cogs/a16_fix_groq_vision_overlay.py
 import os, logging, inspect
 from discord.ext import commands
-PREFS = ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]
+PREFS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+]
 def _clean_csv(v: str):
     parts = [(p or "").strip() for p in (v or "").split(",")]
     return [p for p in parts if p]
@@ -9,7 +12,7 @@ def _filter_bad(models):
     out = []
     for m in models:
         ml = m.lower()
-        if ("scout" in ml) or ("maverick" in ml):
+        if "llama-3.2-11b-vision-preview" in ml or "llama-3.2-90b-vision-preview" in ml:
             continue
         out.append(m)
     return out

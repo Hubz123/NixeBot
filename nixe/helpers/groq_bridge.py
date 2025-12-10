@@ -22,7 +22,10 @@ except Exception:
     Image = None
     BytesIO = None
 
-GROQ_VISION_DEFAULT = os.getenv("GROQ_MODEL_VISION", "llama-3.2-11b-vision-preview")
+GROQ_VISION_DEFAULT = os.getenv(
+    "GROQ_MODEL_VISION",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+)
 GROQ_TEXT_DEFAULT   = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY") or ""
 
@@ -160,7 +163,7 @@ def classify_phish_image(*, image_url: Optional[str] = None, image_bytes: Option
     if image_url and not force_embed:
         for cand in _proxy_candidates(image_url):
             try:
-                content = [base_text, {"type": "input_image", "image_url": {"url": cand}}]
+                content = [base_text, {"type": "image_url", "image_url": {"url": cand}}]
                 resp = client.chat.completions.create(model=(model or GROQ_VISION_DEFAULT),
                                                       messages=[{"role":"user","content":content}], temperature=0)
                 data = _extract_json(resp.choices[0].message.content or "")
@@ -184,7 +187,7 @@ def classify_phish_image(*, image_url: Optional[str] = None, image_bytes: Option
 
     if data_url:
         try:
-            content = [base_text, {"type": "input_image", "image_url": {"url": data_url}}]
+            content = [base_text, {"type": "image_url", "image_url": {"url": data_url}}]
             resp = client.chat.completions.create(model=(model or GROQ_VISION_DEFAULT),
                                                   messages=[{"role":"user","content":content}], temperature=0)
             data = _extract_json(resp.choices[0].message.content or "")

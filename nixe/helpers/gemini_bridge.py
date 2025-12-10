@@ -259,7 +259,7 @@ async def _call_groq_lpg_once(
     content = [
         {"type": "text", "text": sys_prompt},
         {
-            "type": "input_image",
+            "type": "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         },
     ]

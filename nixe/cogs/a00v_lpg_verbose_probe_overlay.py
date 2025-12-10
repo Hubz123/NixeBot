@@ -72,8 +72,8 @@ class LPGVerboseProbe(commands.Cog):
             or "1"
         ) == "1"
         self.thr = float(
-            os.getenv("LPG_GEMINI_THRESHOLD")
-            or os.getenv("GEMINI_LUCKY_THRESHOLD", "0.85")
+            os.getenv("LPG_GROQ_THRESHOLD")
+            or os.getenv("GROQ_LUCKY_THRESHOLD", "0.85")
         )
         self.persona_enable = (
             os.getenv("LPG_PERSONA_ENABLE") or os.getenv("PERSONA_ENABLE") or "1"

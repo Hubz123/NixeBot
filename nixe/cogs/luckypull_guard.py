@@ -13,7 +13,7 @@ class LuckyPullGuard(commands.Cog):
         self.guard=_csv_ids(get("LUCKYPULL_GUARD_CHANNELS",""))
         self.allow=_csv_ids(get("LUCKYPULL_ALLOW_CHANNELS",""))
         self.redirect=get_int("LUCKYPULL_REDIRECT_CHANNEL_ID",0)
-        self.th=float(get("GEMINI_LUCKY_THRESHOLD","0.65"))
+        self.th=float(get("GROQ_LUCKY_THRESHOLD","0.65"))
         self.use_gem=is_gemini_enabled()
     def _in_scope(self,ch:int)->bool:
         if self.allow and ch in self.allow: return False

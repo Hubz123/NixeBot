@@ -2,7 +2,7 @@ import os, asyncio, logging, base64, io, inspect, hashlib, time
 logger = logging.getLogger(__name__)
 
 # Global concurrency + cache (friendly for free plan)
-_GEM_RATE = int(os.getenv("LPG_GEM_MAX_CONCURRENCY", "1"))  # serialize by default
+_GEM_RATE = int(os.getenv("LPG_GROQ_MAX_CONCURRENCY", "1"))  # serialize by default
 _GEM_SEM = asyncio.Semaphore(max(1, _GEM_RATE))
 _CACHE_TTL = int(os.getenv("LPG_CLASSIFY_CACHE_TTL_SEC", "30"))
 _cache = {}  # key sha256 -> (ts, (ok, score, via, reason))
@@ -18,7 +18,7 @@ def set_default_envs():
         "LPG_GUARD_LASTCHANCE_MS": "1800",
         "LPG_PROVIDER_PARALLEL": "0",
         "LPG_BURST_MODE": "stagger",
-        "LPG_GEM_MAX_CONCURRENCY": "1",
+        "LPG_GROQ_MAX_CONCURRENCY": "1",
         "LPG_GEM_MAX_RPM": "4",
         "LPG_CLASSIFY_SOFT_TIMEOUT_MS": "6000",
         "LPG_TIMEOUT_SEC": "12",
@@ -178,7 +178,7 @@ def apply_all_patches():
     try:
         patch_gemini_bridge()
     except Exception as e:
-        logger.warning("[nixe-patch] gemini bridge patch skipped: %s", e)
+        logger.warning("[nixe-patch] lpg bridge patch skipped: %s", e)
     try:
         patch_guard_defer()
     except Exception as e:

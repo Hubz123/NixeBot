@@ -19,7 +19,7 @@ def should_run_persona(ctx: dict) -> tuple[bool, str]:
     allowed_kinds = _split_set(os.getenv("LPG_PERSONA_ONLY_FOR"), "lucky")
     allowed_providers = _split_set(os.getenv("LPG_PERSONA_ALLOWED_PROVIDERS"), "gemini")
     strict = os.getenv("LPG_PERSONA_STRICT", "1") == "1"
-    min_score = _get_float("LPG_PERSONA_MIN_SCORE", "GEMINI_LUCKY_THRESHOLD", default=0.85)
+    min_score = _get_float("LPG_PERSONA_MIN_SCORE", "GROQ_LUCKY_THRESHOLD", default=0.85)
 
     kind = str(ctx.get("kind", "") or ctx.get("lpg_kind", "") or "").lower()
     provider = str(ctx.get("provider", "")).lower()

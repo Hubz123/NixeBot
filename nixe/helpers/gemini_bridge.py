@@ -1,4 +1,9 @@
 import os, aiohttp, json, base64, asyncio, re, time, io
+
+try:
+    from groq import Groq  # type: ignore
+except Exception:  # pragma: no cover
+    Groq = None
 def _sniff_mime(image_bytes: bytes) -> str:
     """Best-effort mime sniff by magic bytes."""
     if not image_bytes:
@@ -112,11 +117,34 @@ def _env_keys_list() -> list[str]:
             dedup.append(k); seen.add(k)
     return dedup
 
+
 def _env_models_list() -> list[str]:
     """
     Primary model + optional fallbacks.
+
+    NOTE:
+    - If GROQ_MODEL_VISION / GROQ_MODEL_VISION_CANDIDATES is set, prefer those.
+    - This lets us route via Groq models while still using GEMINI_* env names
+      for API keys / legacy config, without touching other config files.
     """
     models: list[str] = []
+
+    # Prefer Groq vision models if configured
+    g_primary = _env("GROQ_MODEL_VISION", "").strip()
+    if g_primary:
+        models.append(g_primary)
+
+    g_raw = _env("GROQ_MODEL_VISION_CANDIDATES", "").strip()
+    if g_raw:
+        for part in g_raw.split(","):
+            p = part.strip()
+            if p and p not in models:
+                models.append(p)
+
+    if models:
+        return models
+
+    # Fallback to legacy Gemini model config
     primary = _env("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
     if primary:
         models.append(primary)
@@ -155,13 +183,13 @@ def _parse_candidate_text(data: dict) -> str:
 
 def _pick_timeout_sec() -> float:
     try:
-        v = float(_env("LUCKYPULL_GEMINI_TIMEOUT", "0") or 0)
+        v = float(_env("LUCKYPULL_GROQ_TIMEOUT", "0") or 0)
         if v > 0:
             return v
     except Exception:
         pass
     try:
-        ms = float(_env("GEMINI_TIMEOUT_MS", "0") or 0)
+        ms = float(_env("GROQ_TIMEOUT_MS", "0") or 0)
         if ms > 0:
             return ms / 1000.0
     except Exception:
@@ -170,7 +198,7 @@ def _pick_timeout_sec() -> float:
 
 def _pick_total_budget_sec(per_timeout: float) -> float:
     try:
-        v = float(_env("LUCKYPULL_GEMINI_TOTAL_TIMEOUT_SEC", "0") or 0)
+        v = float(_env("LUCKYPULL_GROQ_TOTAL_TIMEOUT_SEC", "0") or 0)
         if v > 0:
             return max(per_timeout, v)
     except Exception:
@@ -199,50 +227,140 @@ async def _call_gemini_once(session: aiohttp.ClientSession, key: str, model: str
     except Exception:
         return False, 0.0, f"gemini:{model}", "parse_error"
 
+
+async def _call_groq_lpg_once(
+    key: str,
+    model: str,
+    sys_prompt: str,
+    img_bytes: bytes,
+    mime: str,
+    timeout_sec: float,
+) -> tuple[bool, float, str, str]:
+    """
+    Call Groq for Lucky Pull Guard, using GEMINI_* keys as API keys.
+
+    This keeps GROQ_API_KEY reserved for the phishing module, while LPG
+    reuses the existing GEMINI_API_KEY / GEMINI_API_KEY_B env vars.
+
+    Returns:
+        (ok, score, via, reason) with `via` shaped as "gemini:<model>"
+        so that existing overlays that check provider strings remain valid.
+    """
+    if not key or Groq is None:
+        return False, 0.0, f"gemini:{model}", "no_groq_client"
+
+    try:
+        client = Groq(api_key=key)
+    except Exception:
+        return False, 0.0, f"gemini:{model}", "no_groq_client"
+
+    # Inline image as data URL; prompt is shared with the old Gemini path
+    b64 = base64.b64encode(img_bytes).decode("ascii")
+    content = [
+        {"type": "text", "text": sys_prompt},
+        {
+            "type": "input_image",
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+        },
+    ]
+
+    loop = asyncio.get_running_loop()
+
+    def _run_sync() -> str:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": content}],
+            temperature=0,
+        )
+        msg = resp.choices[0].message
+        c = getattr(msg, "content", "")
+        if isinstance(c, list):
+            txt = ""
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    txt += str(part.get("text") or "")
+            return txt
+        return c or ""
+
+    try:
+        txt = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_sync),
+            timeout=timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        return False, 0.0, f"gemini:{model}", "timeout"
+    except Exception as e:
+        return False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}"
+
+    js = _extract_json_obj(txt)
+    if not js:
+        return False, 0.0, f"gemini:{model}", "parse_error"
+    try:
+        obj = json.loads(js)
+    except Exception:
+        return False, 0.0, f"gemini:{model}", "parse_error"
+
+    lucky = bool(obj.get("lucky", obj.get("is_lucky", False)))
+    score = float(obj.get("score", obj.get("confidence", 0.0)) or 0.0)
+    reason = str(obj.get("reason", "") or "")
+
+    return lucky, score, f"gemini:{model}", reason or "early(ok)"
+
+
+
 async def classify_lucky_pull_bytes(image_bytes: bytes):
+    """
+    Lucky Pull Guard classifier.
+
+    This implementation routes requests through Groq using the GEMINI_* API
+    key env vars (GEMINI_API_KEYS / GEMINI_API_KEY / GEMINI_API_KEY_B).
+    We deliberately do NOT touch GROQ_API_KEY so that the phishing module
+    can keep using it separately.
+
+    Return format remains unchanged:
+        (ok: bool, score: float, via: str, reason: str)
+    """
     keys = _env_keys_list()
     if not keys:
         return False, 0.0, "none", "no_api_key"
 
     models = _env_models_list()
-    sys_prompt = _build_sys_prompt()
+    if not models:
+        models = ["llama-3.2-11b-vision-preview"]
 
+    sys_prompt = _build_sys_prompt()
     img_bytes, mime = _prepare_inline_image(image_bytes)
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"text": sys_prompt},
-                {"inline_data": {"mime_type": mime, "data": b64}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.0, "topP": 0.0, "topK": 1, "candidateCount": 1, "maxOutputTokens": 128, "responseMimeType": "application/json"},
-    }
 
     per_timeout = _pick_timeout_sec()
     total_budget = _pick_total_budget_sec(per_timeout)
-    timeout_cfg = aiohttp.ClientTimeout(total=per_timeout)
 
     t0 = time.monotonic()
-    last_reason = "parse_error"
-    last_via = f"gemini:{models[0]}"
+    last_via = "gemini:unknown"
+    last_reason = "no_result"
 
-    async with aiohttp.ClientSession(timeout=timeout_cfg) as s:
-        for model in models:
-            for key in keys:
-                if (time.monotonic() - t0) > total_budget:
-                    return False, 0.0, last_via, "timeout_budget"
-                ok, score, via, reason = await _call_gemini_once(s, key, model, payload)
-                last_reason, last_via = reason, via
+    for model in models:
+        for key in keys:
+            if (time.monotonic() - t0) > total_budget:
+                return False, 0.0, last_via, "timeout_budget"
 
-                if bool(ok) and float(score or 0.0) >= 0.9:
-                    return True, float(score or 0.0), via, reason or "early(ok)"
+            ok, score, via, reason = await _call_groq_lpg_once(
+                key=key,
+                model=model,
+                sys_prompt=sys_prompt,
+                img_bytes=img_bytes,
+                mime=mime,
+                timeout_sec=per_timeout,
+            )
+            last_via, last_reason = via, reason
+            score = float(score or 0.0)
 
-                rlow = (reason or "").lower()
-                if ("http_429" in rlow) or ("http_5" in rlow) or ("timeout" in rlow) or ("parse_error" in rlow):
-                    continue
+            if bool(ok) and score >= 0.9:
+                return True, score, via, reason or "early(ok)"
 
-                return bool(ok), float(score or 0.0), via, reason or "early(ok)"
+            rlow = (reason or "").lower()
+            if ("timeout" in rlow) or ("error" in rlow) or ("parse_error" in rlow):
+                continue
+
+            return bool(ok), score, via, reason or "early(ok)"
 
     return False, 0.0, last_via, last_reason or "parse_error"

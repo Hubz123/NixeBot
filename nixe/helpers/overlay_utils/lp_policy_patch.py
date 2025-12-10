@@ -4,7 +4,7 @@ logger = logging.getLogger(__name__)
 THR_DEFAULT = 0.92
 def _thr():
     try:
-        return float(os.getenv("GEMINI_LUCKY_THRESHOLD", str(THR_DEFAULT)))
+        return float(os.getenv("GROQ_LUCKY_THRESHOLD", str(THR_DEFAULT)))
     except Exception:
         return THR_DEFAULT
 
@@ -63,4 +63,4 @@ def apply_policy_patch():
                         logger.warning("[nixe-policy] wrapper error: %s", e)
                     return res
                 setattr(mod, fn_name, wrapped)
-                logger.info("[nixe-policy] wrapped %s.%s for LP policy", mod.__name__, fn_name)
+                logger.info("[nixe-policy] wrapped (lpg/groq) %s.%s for LP policy", mod.__name__, fn_name)

@@ -326,7 +326,7 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
 
     models = _env_models_list()
     if not models:
-        models = ["llama-3.2-11b-vision-preview"]
+        models = ["meta-llama/llama-4-scout-17b-16e-instruct"]
 
     sys_prompt = _build_sys_prompt()
     img_bytes, mime = _prepare_inline_image(image_bytes)

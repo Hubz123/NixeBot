@@ -23,7 +23,7 @@ try:
 except Exception:
     pass
 GROQ_KEY = os.getenv("GROQ_API_KEY","")
-MODEL_VISION = os.getenv("GROQ_MODEL_VISION") or "llama-3.2-11b-vision-preview"
+MODEL_VISION = os.getenv("GROQ_MODEL_VISION") or "meta-llama/llama-4-scout-17b-16e-instruct"
 LOG_CHAN_ID = int(os.getenv("PHISH_LOG_CHAN_ID") or os.getenv("NIXE_PHISH_LOG_CHAN_ID") or "0")
 TIMEOUT_MS = int(os.getenv("PHISH_GEMINI_MAX_LATENCY_MS","12000"))
 ENABLE = (os.getenv("PHISH_GROQ_ENABLE","1") == "1")

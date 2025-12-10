@@ -470,14 +470,21 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env(
         "TRANSLATE_JA_SCHEMA",
-        '{"formal": "...", "casual": "...", "romaji": "...", "reason": "..."}',
+        '{"formal": "...", "casual": "...", "romaji": "...", "wuwa": "...", "wuwa_romaji": "...", "reason": "..."}',
     )
     sys_msg = _env(
         "TRANSLATE_JA_SYS_MSG",
-        "You are a Japanese translation engine. Given the user's text, produce THREE outputs:\n"
-        "1) Formal polite Japanese (keigo but natural for chat).\n"
-        "2) Casual everyday Japanese.\n"
-        "3) Romaji (Latin transcription) of the Japanese text (NO English translation).\n"
+        "You are a Japanese translation engine for both general text and game chat. "
+        "Assume the user is often talking about the game \"Wuthering Waves\" (WuWa), streaming, or chatting with Japanese VTubers. "
+        "Given the user's text, produce FIVE outputs:\n"
+        "1) Formal polite Japanese that is suitable for Discord or stream chat (use standard keigo like 〜してください, avoid very stiff business keigo such as 〜していただけますでしょうか).\n"
+        "2) Casual Japanese that sounds like friendly conversation between gamers.\n"
+        "3) Romaji (Latin transcription) of the formal/casual Japanese (NO English translation).\n"
+        "4) WuWa gamer-style Japanese that would sound natural when a viewer talks about Wuthering Waves with a Japanese VTuber. "
+        "Use friendly, respectful gamer chat tone (no rude slang, no extreme roleplay), and keep key game system terms like \"Echo\", \"Resonator\", "
+        "\"Tacet Discord\", \"Sonata Effect\", \"Data Bank\", \"Tacet Field\", \"Waveplate\", etc. in katakana or English as appropriate so they match the official game terminology. "
+        "Do NOT mistranslate these systems; prefer to keep official names as-is.\n"
+        "5) Romaji for the WuWa gamer-style line.\n"
         f"Return ONLY compact JSON matching this schema: {schema}. No prose. Do not wrap in code fences."
     )
 
@@ -553,12 +560,25 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
             or jj.get("romanization")
             or ""
         )
+        wuwa = str(
+            jj.get("wuwa")
+            or jj.get("wuwa_gamer")
+            or jj.get("gamer")
+            or ""
+        )
+        wuwa_romaji = str(
+            jj.get("wuwa_romaji")
+            or jj.get("wuwa_romaji_line")
+            or ""
+        )
         reason = str(jj.get("reason") or "")
 
         return True, {
             "formal": formal.strip(),
             "casual": casual.strip(),
             "romaji": romaji.strip(),
+            "wuwa": wuwa.strip(),
+            "wuwa_romaji": wuwa_romaji.strip(),
             "reason": reason.strip(),
             "raw": out,
         }
@@ -942,7 +962,6 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         return False, "", "", f"vision_failed:{e!r}"
 
 class TranslateCommands(commands.Cog):
-(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_call: Dict[int, float] = {}
@@ -1816,11 +1835,17 @@ class TranslateCommands(commands.Cog):
                     formal = (data.get("formal") or "").strip()
                     casual = (data.get("casual") or "").strip()
                     romaji = (data.get("romaji") or "").strip() if _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True) else ""
+                    wuwa = (data.get("wuwa") or "").strip()
+                    wuwa_romaji = (data.get("wuwa_romaji") or "").strip() if _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True) else ""
                     embed = discord.Embed(title=f"Translation → {target_display}")
-                    embed.add_field(name="Formal", value=(formal or "(empty)")[:1024], inline=False)
-                    embed.add_field(name="Casual", value=(casual or "(empty)")[:1024], inline=False)
+                    embed.add_field(name="Formal (Global)", value=(formal or "(empty)")[:1024], inline=False)
+                    embed.add_field(name="Casual (Global)", value=(casual or "(empty)")[:1024], inline=False)
                     if romaji:
-                        embed.add_field(name="Romaji", value=romaji[:1024], inline=False)
+                        embed.add_field(name="Romaji (Global)", value=romaji[:1024], inline=False)
+                    if wuwa:
+                        embed.add_field(name="WuWa Gamer", value=wuwa[:1024], inline=False)
+                    if wuwa_romaji:
+                        embed.add_field(name="WuWa Romaji", value=wuwa_romaji[:1024], inline=False)
                 elif target_code.startswith("ko") and _as_bool("TRANSLATE_KO_DUAL_ENABLE", True):
                     ok_multi, data = await _gemini_translate_text_ko_multi(text_to_translate)
                     if not ok_multi:

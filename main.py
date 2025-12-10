@@ -220,11 +220,12 @@ async def _run_bot(token: str):
                 await bot.close()
             await asyncio.sleep(10)
         else:
-            # bot.start() returned cleanly without an explicit shutdown request.
-            log.warning("bot.start() returned without error — restarting in 10s")
+            # bot.start() returned cleanly (e.g. graceful shutdown via cog or signal).
+            # In this case we just close and exit the guard loop without restarting.
+            log.info("bot.start() returned cleanly — exiting run loop")
             with contextlib.suppress(Exception):
                 await bot.close()
-            await asyncio.sleep(10)
+            break
 
 async def _main():
     port = int(os.getenv("PORT") or 10000)

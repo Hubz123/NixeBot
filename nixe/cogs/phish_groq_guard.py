@@ -146,7 +146,7 @@ class GroqPhishGuard(commands.Cog):
                 except Exception:
                     pass
 
-            log.info("[phish-groq] result=%s reason=%s", is_phish, reason)
+            log.info("[phish-groq] result=%s reason=%s channel=%s", is_phish, reason, getattr(getattr(message, "channel", None), "name", None) or "?")
 
             try:
                 if is_phish:

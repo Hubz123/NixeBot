@@ -146,38 +146,22 @@ class GroqPhishGuard(commands.Cog):
                 except Exception:
                     pass
 
-            log.info("[phish-groq] result=%s reason=%s channel=%s", is_phish, reason, getattr(getattr(message, "channel", None), "name", None) or "?")
+            # [phish-groq] result log suppressed to avoid Discord channel spam
 
             try:
                 if is_phish:
-                    target_id = _safe_tid or LOG_CHAN_ID
-                    if target_id:
-                        logch = None
-                        try:
-                            logch = self.bot.get_channel(target_id) or await self.bot.fetch_channel(target_id)
-                        except Exception:
-                            logch = None
-                        if logch:
-                            msg_link = None
-                            try:
-                                gid = getattr(message.guild, "id", None)
-                                cid = getattr(message.channel, "id", None)
-                                mid = getattr(message, "id", None)
-                                if gid and cid and mid:
-                                    msg_link = f"https://discord.com/channels/{gid}/{cid}/{mid}"
-                            except Exception:
-                                msg_link = None
-                            text = f"[phish-groq] sus image from <@{message.author.id}> → phish=True reason={reason}"
-                            if msg_link:
-                                text += f"\n{msg_link}"
-                            await logch.send(text)
-
-                    ev_urls = [getattr(att, 'url', None)] if getattr(att, 'url', None) else []
+                    # Do not send any Discord log message; logging is done via Python logs only.
+                    ev_urls = []
+                    try:
+                        ev_urls = [getattr(att, "url", None) for att in getattr(message, "attachments", []) or []]
+                        ev_urls = [x for x in ev_urls if x]
+                    except Exception:
+                        ev_urls = []
                     details = {
-                        'score': 1.0,
-                        'provider': 'groq',
-                        'reason': reason,
-                        'kind': 'image',
+                        "score": 1.0,
+                        "provider": "groq",
+                        "reason": reason,
+                        "kind": "image",
                     }
                     emit_phish_detected(self.bot, message, details, ev_urls)
             except Exception:

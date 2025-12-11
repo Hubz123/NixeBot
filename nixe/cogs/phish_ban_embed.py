@@ -17,10 +17,8 @@ DELETE_MESSAGE = (os.getenv("PHISH_DELETE_MESSAGE", "1") == "1")
 # When BAN_UNIFIER_ENABLE=1 we normally let BanTemplateUnifier handle the
 # pretty external-style embed and suppress this technical embed to avoid
 # duplicate messages. PHISH_EMBED_FORCE=1 can override this behaviour.
-DISABLE_SELF_EMBED = (
-    os.getenv("BAN_UNIFIER_ENABLE", "0") == "1"
-    and os.getenv("PHISH_EMBED_FORCE", "0") != "1"
-)
+DISABLE_SELF_EMBED = False
+
 
 
 class PhishBanEmbed(commands.Cog):
@@ -108,15 +106,13 @@ class PhishBanEmbed(commands.Cog):
                         inline=False,
                     )
 
-                # Send embed to ban-log channel, or fall back to original channel
-                target = None
-                try:
-                    if guild:
+                # Send embed to the original channel first; if unavailable, fall back to ban-log channel
+                target = channel
+                if not target and guild:
+                    try:
                         target = await banlog.get_ban_log_channel(guild)
-                except Exception:
-                    target = None
-                if not target:
-                    target = channel
+                    except Exception:
+                        target = None
 
                 if target:
                     try:

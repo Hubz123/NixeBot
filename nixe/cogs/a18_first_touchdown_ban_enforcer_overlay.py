@@ -65,4 +65,6 @@ class FirstTouchdownBanEnforcer(commands.Cog):
                 log.warning("[ban-enforcer] patched _ban_and_embed on cog '%s'", name)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(FirstTouchdownBanEnforcer(bot))
+    # Disabled: rely on original _ban_and_embed implementations (no extra ban-enforcer overlay)
+    log.info("[ban-enforcer] disabled; using original _ban_and_embed behavior")
+    return

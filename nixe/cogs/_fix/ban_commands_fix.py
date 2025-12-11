@@ -21,17 +21,18 @@ class BanCommandsFix(commands.Cog):
     @commands.command(name="unbanfix")
     @commands.has_permissions(ban_members=True)
     async def unbanfix(self, ctx: commands.Context, user_id: int):
+        """Unban by raw user ID (fallback)."""
         try:
             await ctx.guild.unban(discord.Object(id=user_id))
             await ctx.reply(f"✅ Unbanned {user_id} (fallback).")
         except Exception as e:
             await ctx.reply(f"❌ Unban failed: {e}")
 
-    # Standard !unban command that shares the same logic (to avoid CommandNotFound errors)
+    # Standard !unban command that reuses unbanfix logic
     @commands.command(name="unban")
     @commands.has_permissions(ban_members=True)
     async def unban(self, ctx: commands.Context, user_id: int):
-        # Delegate to unbanfix for actual logic
+        """Main !unban command (alias to unbanfix)."""
         await self.unbanfix(ctx, user_id=user_id)
 
     # Special &unban command usable only by moderators (ban_members permission)
@@ -41,38 +42,56 @@ class BanCommandsFix(commands.Cog):
         if message.author.bot or message.guild is None:
             return
 
-        content = message.content.strip()
+        content = (message.content or "").strip()
         if not content.startswith("&"):
             return
 
-        # Only handle &unban ... pattern
+        # Only handle &unban ... pattern (case-insensitive)
         if not content.lower().startswith("&unban"):
             return
 
-        # Check permission: only members with ban_members can use this
-        perms = message.channel.permissions_for(message.author)
+        # Check guild-level permission: only members with ban_members can use this
+        perms = message.author.guild_permissions
         if not perms.ban_members:
-            # Silently ignore for non-mods
+            try:
+                await message.channel.send(
+                    "❌ Kamu tidak punya izin `Ban Members`, tidak bisa pakai `&unban`.",
+                    reference=message,
+                    mention_author=False,
+                    delete_after=15,
+                )
+            except Exception:
+                pass
             return
 
         parts = content.split(maxsplit=1)
         if len(parts) < 2:
-            await message.channel.send(
-                "Usage: `&unban <user_id>`",
-                delete_after=15,
-            )
+            try:
+                await message.channel.send(
+                    "Usage: `&unban <user_id>`",
+                    reference=message,
+                    mention_author=False,
+                    delete_after=15,
+                )
+            except Exception:
+                pass
             return
 
         raw_id = parts[1].strip()
-        # Allow plain ID or mention
+        # Allow plain ID or mention; strip all non-digits
         cleaned = re.sub(r"[^0-9]", "", raw_id)
         try:
             user_id = int(cleaned)
         except Exception:
-            await message.channel.send(
-                "User ID tidak valid. Contoh: `&unban 123456789012345678`",
-                delete_after=15,
-            )
+            try:
+                await message.channel.send(
+                    "User ID tidak valid. Contoh: `&unban 123456789012345678`",
+                    reference=message,
+                    mention_author=False,
+                    delete_after=15,
+                )
+            except Exception:
+                pass
             return
 
         try:

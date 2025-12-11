@@ -27,6 +27,13 @@ class BanCommandsFix(commands.Cog):
         except Exception as e:
             await ctx.reply(f"❌ Unban failed: {e}")
 
+    # Standard !unban command that shares the same logic (to avoid CommandNotFound errors)
+    @commands.command(name="unban")
+    @commands.has_permissions(ban_members=True)
+    async def unban(self, ctx: commands.Context, user_id: int):
+        # Delegate to unbanfix for actual logic
+        await self.unbanfix(ctx, user_id=user_id)
+
     # Special &unban command usable only by moderators (ban_members permission)
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):

@@ -41,6 +41,10 @@ from discord import app_commands
 from discord.ext import commands
 
 
+import logging
+
+log = logging.getLogger('nixe.cogs.reverse_image')
+
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
@@ -228,7 +232,22 @@ class ReverseImageCog(commands.Cog):
             return
 
         ephemeral = _as_bool("REVERSE_IMAGE_EPHEMERAL", True)
-        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        try:
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        except discord.HTTPException as exc:
+            # Handle global Discord rate limit defensively: avoid crashing the command.
+            if getattr(exc, "status", None) == 429:
+                log.warning("[reverse-image] rate limited on interaction.defer(): %r", exc)
+                try:
+                    await interaction.response.send_message(
+                        "Discord sedang membatasi permintaan (rate limit). Coba lagi beberapa detik lagi.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    # Best-effort only; avoid raising further.
+                    pass
+                return
+            raise
 
         # Context menu may pass a partial Message; refetch for full attachments/embeds when possible.
         full_msg = message
@@ -264,7 +283,13 @@ class ReverseImageCog(commands.Cog):
 
         embed.set_footer(text="source=image • mode=reverse-search")
 
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                log.warning("[reverse-image] rate limited on followup.send(): %r", exc)
+                return
+            raise
 
     @commands.Cog.listener()
     async def on_ready(self):

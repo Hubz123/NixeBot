@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 import discord
 from discord.ext import commands
@@ -29,6 +30,8 @@ class LinkOnlyGuard(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        # Simple in-memory cooldown to avoid hammering Discord when global rate limit (429) occurs.
+        self._delete_cooldown_until: float = 0.0
         ids_str = ", ".join(str(cid) for cid in sorted(LINK_ONLY_CHANNEL_IDS))
         log.info("[link-only-guard] enabled for channel_ids={%s}", ids_str)
 
@@ -65,6 +68,11 @@ class LinkOnlyGuard(commands.Cog):
         if message.channel.id not in LINK_ONLY_CHANNEL_IDS:
             return
 
+        # If we recently hit a global 429, back off for a short cooldown window.
+        now = time.monotonic()
+        if self._delete_cooldown_until and now < self._delete_cooldown_until:
+            return
+
         # Hapus semua pesan yang dikirim oleh bot sendiri di channel link-only
         if self.bot.user is not None and message.author.id == self.bot.user.id:
             try:
@@ -82,13 +90,24 @@ class LinkOnlyGuard(commands.Cog):
                     message.channel.id,
                 )
             except discord.HTTPException as exc:
-                log.error(
-                    "[link-only-guard] failed to delete bot message id=%s in channel=%s (%s): %r",
-                    message.id,
-                    message.channel,
-                    message.channel.id,
-                    exc,
-                )
+                if getattr(exc, "status", None) == 429:
+                    # Global rate limit; set a short cooldown and avoid spamming logs.
+                    self._delete_cooldown_until = time.monotonic() + 5.0
+                    log.warning(
+                        "[link-only-guard] rate limited (429) while deleting bot message id=%s in channel=%s (%s): %r",
+                        message.id,
+                        message.channel,
+                        message.channel.id,
+                        exc,
+                    )
+                else:
+                    log.error(
+                        "[link-only-guard] failed to delete bot message id=%s in channel=%s (%s): %r",
+                        message.id,
+                        message.channel,
+                        message.channel.id,
+                        exc,
+                    )
             return
 
         # Abaikan bot lain
@@ -123,13 +142,24 @@ class LinkOnlyGuard(commands.Cog):
                 message.channel.id,
             )
         except discord.HTTPException as exc:
-            log.error(
-                "[link-only-guard] failed to delete message id=%s in channel=%s (%s): %r",
-                message.id,
-                message.channel,
-                message.channel.id,
-                exc,
-            )
+            if getattr(exc, "status", None) == 429:
+                # Global rate limit; back off and avoid noisy errors.
+                self._delete_cooldown_until = time.monotonic() + 5.0
+                log.warning(
+                    "[link-only-guard] rate limited (429) while deleting message id=%s in channel=%s (%s): %r",
+                    message.id,
+                    message.channel,
+                    message.channel.id,
+                    exc,
+                )
+            else:
+                log.error(
+                    "[link-only-guard] failed to delete message id=%s in channel=%s (%s): %r",
+                    message.id,
+                    message.channel,
+                    message.channel.id,
+                    exc,
+                )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:

@@ -40,12 +40,19 @@ class WhitelistThreadManager(commands.Cog):
             os.getenv("LPG_PARENT_CHANNEL_ID"),
             self.cfg.get("LPG_PARENT_CHANNEL_ID"),
         )
-        self.thread_id = int(self.cfg.get("LPG_WHITELIST_THREAD_ID") or 0)
+        # Seed thread_id from config, but allow runtime overlays to override via environment.
+        env_tid = os.getenv("LPG_WHITELIST_THREAD_ID") or ""
+        if env_tid.isdigit():
+            self.thread_id = int(env_tid)
+        else:
+            self.thread_id = int(self.cfg.get("LPG_WHITELIST_THREAD_ID") or 0)
 
     async def _ensure_thread(self):
         if not self.parent_chan_id:
             log.warning("[lpg-wl] parent channel id missing")
             return
+        # Respect explicit NO_NEW_THREADS flag to avoid creating extra threads if admin wants a fixed one.
+        no_new = (os.getenv("LPG_WHITELIST_NO_NEW_THREADS") or "0").strip().lower() in ("1", "true", "yes", "on")
         try:
             parent = self.bot.get_channel(self.parent_chan_id) or await self.bot.fetch_channel(self.parent_chan_id)
         except Exception as e:
@@ -59,7 +66,18 @@ class WhitelistThreadManager(commands.Cog):
                     return
             except Exception:
                 pass
-        # Otherwise create or locate by name
+        # Allow runtime override from environment (e.g. singleton overlay) if it changed after init.
+        env_tid = os.getenv("LPG_WHITELIST_THREAD_ID") or ""
+        if env_tid.isdigit():
+            try:
+                env_tid_int = int(env_tid)
+                th = await self.bot.fetch_channel(env_tid_int)
+                if isinstance(th, discord.Thread):
+                    self.thread_id = env_tid_int
+                    return
+            except Exception:
+                pass
+        # Otherwise locate by name under the parent channel.
         try:
             # search existing
             for th in parent.threads if hasattr(parent, "threads") else []:
@@ -67,13 +85,19 @@ class WhitelistThreadManager(commands.Cog):
                     self.thread_id = th.id
                     log.info("[lpg-wl] found existing thread id=%s name=%s", th.id, th.name)
                     return
-            # create new
+            # create new if allowed
+            if no_new:
+                log.warning(
+                    "[lpg-wl] whitelist thread with name=%r not found under parent=%s and NO_NEW_THREADS=1; not creating a new one",
+                    self.thread_name,
+                    parent.id,
+                )
+                return
             th = await parent.create_thread(name=self.thread_name, auto_archive_duration=10080)
             self.thread_id = th.id
             log.warning("[lpg-wl] created whitelist thread id=%s name=%s under parent=%s", th.id, th.name, parent.id)
         except Exception as e:
             log.exception("[lpg-wl] failed to create thread: %r", e)
-
     @commands.Cog.listener("on_ready")
     async def on_ready(self):
         try:

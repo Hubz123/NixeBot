@@ -1235,7 +1235,22 @@ class TranslateCommands(commands.Cog):
             return
 
         ephemeral = _as_bool("REVERSE_IMAGE_EPHEMERAL", True)
-        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        try:
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        except discord.HTTPException as exc:
+            # Handle global Discord rate limit defensively to avoid noisy tracebacks.
+            if getattr(exc, "status", None) == 429:
+                log.warning("[revimg] rate limited on interaction.defer(): %r", exc)
+                try:
+                    await interaction.response.send_message(
+                        "Discord sedang membatasi permintaan (rate limit). Coba lagi beberapa detik lagi.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    # Best-effort only; avoid raising further.
+                    pass
+                return
+            raise
 
         # Refetch full message so embeds/attachments lengkap
         try:
@@ -1344,7 +1359,13 @@ class TranslateCommands(commands.Cog):
 
         embed.set_footer(text="Reverse image search helper: Google Lens • Bing • Yandex • SauceNAO • IQDB")
 
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        try:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 429:
+                log.warning("[revimg] rate limited on interaction.followup.send(): %r", exc)
+                return
+            raise
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
         if not _as_bool("TRANSLATE_ENABLE", True):

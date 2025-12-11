@@ -23,6 +23,8 @@ URL_RE = re.compile(r'https?://[^\s<>()]+' , re.I)
 DEFAULT_HOSTS = {"i.ibb.co", "ibb.co", "postimg.cc", "postimg.cc", "imgbb.com", "tinypic.com", "imgur.com", "pinimg.com"}
 # Filenames that are commonly abused
 SUS_FILENAMES = {"image.png", "img.png", "photo.png", "image.jpg", "img.jpg"}
+GUARD_ALL = (os.getenv("PHISH_GUARD_ALL_CHANNELS","1").strip().lower() in ("1","true","yes","on"))
+
 
 def _host(url: str) -> str:
     try:
@@ -62,11 +64,11 @@ class LinkPhishGuard(commands.Cog):
             if not ch: return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
-            if pid:
+            if pid and not GUARD_ALL:
                 return
             if (cid in self.skip_ids) or (pid and pid in self.skip_ids):
                 return
-            if not ((cid in self.guard_ids) or (pid and pid in self.guard_ids)):
+            if (not GUARD_ALL) and not ((cid in self.guard_ids) or (pid and pid in self.guard_ids)):
                 return
 
             text = (message.content or "") + " " + " ".join(a.url for a in getattr(message,"attachments",[]) or [])

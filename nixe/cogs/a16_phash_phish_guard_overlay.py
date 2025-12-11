@@ -8,6 +8,8 @@ import discord
 from discord.ext import commands
 
 from nixe.helpers.img_hashing import phash_list_from_bytes
+GUARD_ALL = (os.getenv("PHISH_GUARD_ALL_CHANNELS","1").strip().lower() in ("1","true","yes","on"))
+
 from nixe.helpers.phash_tools import hamming
 from nixe.state_runtime import get_phash_ids
 from nixe.helpers.ban_utils import emit_phish_detected
@@ -224,18 +226,18 @@ class PhashPhishGuard(commands.Cog):
         pid = int(getattr(ch, "parent_id", 0) or 0)
         if not cid:
             return False
-        # Global rule: never run phishing pHash guard inside any thread (forum or text).
-        if pid:
-            return False
         # Never guard inside the dedicated imagephish/db/source threads.
         if cid in self.safe_threads or (pid and pid in self.safe_threads):
             return False
         # Respect PHISH_SKIP_CHANNELS / PHASH_MATCH_SKIP_CHANNELS.
         if cid in self.skip_ids or (pid and pid in self.skip_ids):
             return False
+        if GUARD_ALL:
+            # Guard all channels/threads except safe/skip ones.
+            return True
         if not self.guard_ids:
             # Guard all top-level channels (except safe/skip ones) by default.
-            return True
+            return pid == 0
         return cid in self.guard_ids or (pid and pid in self.guard_ids)
 
     async def _scan_message(self, m: discord.Message) -> None:

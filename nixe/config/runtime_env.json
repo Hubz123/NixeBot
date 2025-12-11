@@ -277,6 +277,7 @@
     "LPG_WHITELIST_SINGLETON": "1",
     "LPG_STRICT_EDIT": "1",
     "PHISH_TEXT_ONLY_ENABLE": "1",
+    "PHISH_GUARD_ALL_CHANNELS": "1",
     "PHISH_MIN_IMAGE_BYTES": "8192",
     "PHISH_IMAGE_DOWNLOAD_TIMEOUT_MS": "12000",
     "PHISH_TEXT_STRONG_PATTERNS": "(?i)(withdraw(al)?\\s+success(ful)?!|successful\\s+withdrawal|your\\s+withdrawal\\s+of\\s*\\$?\\s*\\d{3,6}(?:\\.00)?\\s+was\\s+successful|the\\s+money\\s+will\\s+be\\s+transferred\\s+to\\s+your\\s+specified\\s+wallet|activate\\s+code\\s+for\\s+bonus|promo\\s*code\\s*(BONUS|GIFT)\\b|i'?m\\s+giving\\s+away\\s*\\$?\\d{3,6}\\s+to\\s+everyone\\s+who\\s+registers|crypto\\s+casino|rakeback|vip-?club|register\\b.*bonus|this\\s+post\\s+will\\s+be\\s+deleted\\s+one\\s+hour\\s+after\\s+publication)",

@@ -206,9 +206,12 @@ class SuspiciousAttachmentGuard(commands.Cog):
 
         total_score = 0
         reasons = []
+        content_score = 0
+        has_archive = False
         if self.content_scan:
             sc, rs = _content_signals(message)
             total_score += sc
+            content_score = sc
             if sc: reasons.append(rs)
             if self.verbose:
                 log.info("[sus-attach] content-score=%s reasons=%s", sc, rs)
@@ -220,6 +223,13 @@ class SuspiciousAttachmentGuard(commands.Cog):
                 b = await att.read()
                 sc, rs, mime = _score_attachment(name, b or b"")
                 total_score += sc
+                # track archive attachments for potential ban logic
+                try:
+                    ext = _ext(name)
+                    if ext in _ARCHIVE_EXT:
+                        has_archive = True
+                except Exception:
+                    pass
                 if sc: reasons.append(f"{name}:{rs}")
                 if self.verbose:
                     log.info("[sus-attach] score=%s mime=%s name=%s", sc, mime, name)
@@ -250,12 +260,26 @@ class SuspiciousAttachmentGuard(commands.Cog):
             else:
                 log.info("[sus-attach] gem skip: no images collected")
 
+        # If there is an archive attachment (.zip/.rar/...) plus suspicious content,
+        # treat this as definitely malicious so we at least delete (and optionally ban).
+        if has_archive and content_score > 0 and total_score < self.delete_threshold:
+            total_score = self.delete_threshold
+            reasons.append("archive+sus-content")
+
         if total_score >= self.delete_threshold:
             try:
                 await message.delete()
                 log.warning("[sus-attach] deleted in %s (score=%s reasons=%s)", message.channel.id, total_score, ";".join(reasons))
             except Exception as e:
                 log.warning("[sus-attach] delete failed: %r", e)
+            # Optional: if a suspicious archive (.zip/.rar/...) is present, escalate to ban
+            if has_archive:
+                try:
+                    if bool(int(os.getenv("BAN_ON_FIRST_PHISH","0"))) and isinstance(message.author, discord.Member):
+                        await message.author.ban(reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
+                        log.warning("[sus-attach] banned user %s for suspicious archive attachment (score=%s)", message.author, total_score)
+                except Exception as e:
+                    log.warning("[sus-attach] archive-ban failed: %r", e)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(SuspiciousAttachmentGuard(bot))

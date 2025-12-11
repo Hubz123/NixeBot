@@ -10,6 +10,7 @@ from nixe.helpers.ban_utils import emit_phish_detected
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES","8192"))
 GUARD_IDS = set(int(x) for x in (os.getenv("LPG_GUARD_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
 SKIP_IDS = set(int(x) for x in (os.getenv("PHISH_SKIP_CHANNELS","") or "").replace(";",",").split(",") if x.strip().isdigit())
+GUARD_ALL = (os.getenv("PHISH_GUARD_ALL_CHANNELS","1").strip().lower() in ("1","true","yes","on"))
 if not SKIP_IDS:
     # Default: mod channels to exclude from phishing guards
     SKIP_IDS = {1400375184048787566, 936690788946030613}
@@ -36,16 +37,42 @@ def _ext(name: str) -> str:
 def _sus(att: discord.Attachment) -> bool:
     ct = (getattr(att,"content_type","") or "").lower()
     size = int(getattr(att,"size",0) or 0)
-    if size < PHISH_MIN_BYTES: return False
-    if ct in ("image/webp","image/tiff","image/bmp"): return True
-    if _ext(getattr(att,"filename","")) in {".webp",".tiff",".bmp"}: return True
-    # high-res images often used for QR/login — heuristic: extremely tall or wide not known here (no dims); rely on size≥min
+    if size < PHISH_MIN_BYTES:
+        return False
+
+    # For WEBP we rely fully on pHash DB (a16_phash_phish_guard_overlay)
+    # to avoid false positives from Groq. Do not send WEBP to Groq at all.
+    ext = _ext(getattr(att, "filename", ""))
+    if ct == "image/webp" or ext == ".webp":
+        return False
+
+    # Always treat heavy TIFF/BMP payloads as suspicious (classic QR/login bait)
+    if ct in ("image/tiff","image/bmp"):
+        return True
+    if ext in {".tiff",".bmp"}:
+        return True
+
+    # For common formats (JPEG/PNG/etc), use a simple resolution heuristic so we do not
+    # send every tiny emoji/sticker to Groq. Large, non-square images are typically
+    # screenshots or phone photos of login / giveaway pages.
+    w = int(getattr(att,"width",0) or 0)
+    h = int(getattr(att,"height",0) or 0)
+    if w and h:
+        long_side = max(w, h)
+        short_side = min(w, h)
+        if long_side >= 900 and (short_side == 0 or (long_side / max(short_side,1)) >= 1.25):
+            return True
+
+    # Fallback: still allow scanning generic large images when guard-all is enabled.
+    if GUARD_ALL and size >= PHISH_MIN_BYTES * 4:
+        return True
+
     return False
 
 class GroqPhishGuard(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        log.info("[phish-groq] enable=%s model=%s guards=%s skip=%s", ENABLE, MODEL_VISION, sorted(GUARD_IDS), sorted(SKIP_IDS))
+        log.info("[phish-groq] enable=%s model=%s guard_all=%s guards=%s skip...=%s", ENABLE, MODEL_VISION, GUARD_ALL, sorted(GUARD_IDS), sorted(SKIP_IDS))
 
     @commands.Cog.listener("on_message")
     async def on_message(self, message: discord.Message):
@@ -56,11 +83,9 @@ class GroqPhishGuard(commands.Cog):
             if not ch: return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
-            if pid:
-                return
             if cid in SKIP_IDS or (pid and pid in SKIP_IDS): 
                 return
-            if not ((cid in GUARD_IDS) or (pid and pid in GUARD_IDS)): 
+            if (not GUARD_ALL) and not ((cid in GUARD_IDS) or (pid and pid in GUARD_IDS)): 
                 return
 
             # find one image

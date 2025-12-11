@@ -147,7 +147,8 @@ class PhishFirstTouchdownAutoban(commands.Cog):
             if m.attachments:
                 names = ", ".join(a.filename for a in m.attachments[:6])
                 em.add_field(name="Attachments", value=names, inline=False)
-            await m.channel.send(embed=em)
+            ttl = int(os.getenv('BAN_EMBED_TTL_SEC', '10'))
+            await m.channel.send(embed=em, delete_after=ttl)
         except Exception:
             pass
 

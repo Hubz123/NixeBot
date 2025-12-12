@@ -85,6 +85,17 @@ class GroqPhishGuard(commands.Cog):
             if message.author.bot: return
             ch = getattr(message,"channel",None)
             if not ch: return
+            parent = getattr(ch,"parent",None)
+            try:
+                from discord import ForumChannel
+            except Exception:
+                ForumChannel = None
+            if ForumChannel and (isinstance(ch, ForumChannel) or isinstance(parent, ForumChannel)):
+                return
+            ctype = getattr(ch,"type",None)
+            ptype = getattr(parent,"type",None)
+            if any("forum" in str(t).lower() for t in (ctype, ptype)):
+                return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)
             if cid in SKIP_IDS or (pid and pid in SKIP_IDS): 

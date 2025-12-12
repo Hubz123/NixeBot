@@ -224,6 +224,17 @@ class PhashPhishGuard(commands.Cog):
     def _should_guard_channel(self, ch: discord.abc.GuildChannel | discord.Thread) -> bool:
         cid = int(getattr(ch, "id", 0) or 0)
         pid = int(getattr(ch, "parent_id", 0) or 0)
+        parent = getattr(ch, "parent", None)
+        try:
+            from discord import ForumChannel
+        except Exception:
+            ForumChannel = None
+        if ForumChannel and (isinstance(ch, ForumChannel) or isinstance(parent, ForumChannel)):
+            return False
+        ctype = getattr(ch, "type", None)
+        ptype = getattr(parent, "type", None)
+        if any("forum" in str(t).lower() for t in (ctype, ptype)):
+            return False
         if not cid:
             return False
         # Never guard inside the dedicated imagephish/db/source threads.

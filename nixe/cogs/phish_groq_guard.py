@@ -35,32 +35,35 @@ def _ext(name: str) -> str:
     return ""
 
 def _sus(att: discord.Attachment) -> bool:
-    ct = (getattr(att,"content_type","") or "").lower()
-    size = int(getattr(att,"size",0) or 0)
-    if size < PHISH_MIN_BYTES:
-        return False
+    """
+    Decide whether an attachment is suspicious enough to send to Groq.
+    We bias heavily toward large, screen-like images (login pages, giveaway posts,
+    payout proofs, etc.) even if the underlying file size is small.
+    """
+    ct = (getattr(att, "content_type", "") or "").lower()
+    size = int(getattr(att, "size", 0) or 0)
+    ext = _ext(getattr(att, "filename", "") or "")
 
     # For WEBP we rely fully on pHash DB (a16_phash_phish_guard_overlay)
     # to avoid false positives from Groq. Do not send WEBP to Groq at all.
-    ext = _ext(getattr(att, "filename", ""))
     if ct == "image/webp" or ext == ".webp":
         return False
 
     # Always treat heavy TIFF/BMP payloads as suspicious (classic QR/login bait)
-    if ct in ("image/tiff","image/bmp"):
+    if ct in ("image/tiff", "image/bmp"):
         return True
-    if ext in {".tiff",".bmp"}:
+    if ext in {".tiff", ".bmp"}:
         return True
 
-    # For common formats (JPEG/PNG/etc), use a simple resolution heuristic so we do not
-    # send every tiny emoji/sticker to Groq. Large, non-square images are typically
-    # screenshots or phone photos of login / giveaway pages.
-    w = int(getattr(att,"width",0) or 0)
-    h = int(getattr(att,"height",0) or 0)
+    # For common formats (JPEG/PNG/etc), large screen-like images are very often
+    # screenshots or phone photos of login / giveaway / payout pages.
+    w = int(getattr(att, "width", 0) or 0)
+    h = int(getattr(att, "height", 0) or 0)
     if w and h:
         long_side = max(w, h)
         short_side = min(w, h)
-        if long_side >= 900 and (short_side == 0 or (long_side / max(short_side,1)) >= 1.25):
+        # If it looks like a full-screen / phone-screen capture, treat as suspicious
+        if long_side >= 900 and (short_side == 0 or (long_side / max(short_side, 1)) >= 1.25):
             return True
 
     # Fallback: still allow scanning generic large images when guard-all is enabled.
@@ -68,6 +71,7 @@ def _sus(att: discord.Attachment) -> bool:
         return True
 
     return False
+
 
 class GroqPhishGuard(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -88,13 +92,17 @@ class GroqPhishGuard(commands.Cog):
             if (not GUARD_ALL) and not ((cid in GUARD_IDS) or (pid and pid in GUARD_IDS)): 
                 return
 
-            # find one image
+            # find one image attachment (by content_type OR file extension)
             att = None
             for a in message.attachments or []:
-                if (getattr(a,"content_type","") or "").lower().startswith("image/"):
-                    att = a; break
-            if not att: return
-            if not _sus(att): 
+                ct = (getattr(a, "content_type", "") or "").lower()
+                name = (getattr(a, "filename", "") or "").lower()
+                if ct.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp")):
+                    att = a
+                    break
+            if not att:
+                return
+            if not _sus(att):
                 return
 
             # Run Groq vision

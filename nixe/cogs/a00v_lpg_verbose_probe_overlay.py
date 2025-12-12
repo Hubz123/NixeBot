@@ -7,6 +7,35 @@ log = logging.getLogger("nixe.cogs.a00v_lpg_verbose_probe_overlay")
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
 
 
+def _fmt_channel(ch) -> str:
+    """Best-effort channel label for logs.
+
+    Keeps a stable identifier by including the numeric ID, while also showing a
+    human-friendly name when available.
+    """
+    if not ch:
+        return "unknown-channel"
+
+    try:
+        guild = getattr(ch, "guild", None)
+        guild_name = getattr(guild, "name", None)
+        guild_part = f"{guild_name}:" if guild_name else ""
+    except Exception:
+        guild_part = ""
+
+    try:
+        name_part = getattr(ch, "name", None) or str(ch)
+    except Exception:
+        name_part = "unknown"
+
+    try:
+        cid = int(getattr(ch, "id", 0) or 0)
+    except Exception:
+        cid = 0
+
+    return f"{guild_part}#{name_part}({cid})"
+
+
 def _cid(ch):
     try:
         return int(getattr(ch, "id", 0) or 0)
@@ -113,11 +142,21 @@ class LPGVerboseProbe(commands.Cog):
             if img_count == 0:
                 # chat-only / no image -> do not log to avoid spam
                 return
+
+            # Human-friendly labels (still include IDs for traceability)
+            cid_label = _fmt_channel(ch)
+            parent = getattr(ch, "parent", None)
+            if (not parent) and pid and getattr(message, "guild", None):
+                try:
+                    parent = message.guild.get_channel(pid)
+                except Exception:
+                    parent = None
+            pid_label = _fmt_channel(parent) if pid else "0"
             log.info(
                 "[lpg-probe] pass: in_guard image_ok require_classify=%s cid=%s pid=%s imgs=%s",
                 self.require_classify,
-                cid,
-                pid,
+                cid_label,
+                pid_label,
                 img_count,
             )
         except Exception as e:

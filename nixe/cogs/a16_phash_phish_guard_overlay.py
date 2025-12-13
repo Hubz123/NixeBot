@@ -131,6 +131,7 @@ class PhashPhishGuard(commands.Cog):
         self.bot = bot
         self._hashes: Set[int] = set()
         self.bits_max: int = _env_int("PHASH_MATCH_DELETE_MAX_BITS", 12)
+        self.bits_max_webp: int = _env_int("PHISH_PHASH_WEBP_MAX_BITS", min(self.bits_max, 10))
         self.guard_ids: Set[int] = _env_set("LPG_GUARD_CHANNELS")
         # Channels/threads where pHash phishing guard must NEVER act
         # (e.g. mod rooms, phash boards, forums, or all-thread environments).
@@ -263,23 +264,35 @@ class PhashPhishGuard(commands.Cog):
             return
 
         # Collect candidate image attachments (PNG/JPEG/WEBP/GIF).
-        images: List[bytes] = []
+        images: List[Tuple[bytes, bool]] = []  # (raw_bytes, is_webp)
+        allowed_exts = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+        allowed_cts = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif")
         for a in getattr(m, "attachments", []) or []:
             name = (getattr(a, "filename", "") or "").lower()
-            if not any(name.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            ct = (getattr(a, "content_type", "") or "").lower()
+            looks_image = (ct in allowed_cts) or any(name.endswith(ext) for ext in allowed_exts)
+            if not looks_image:
                 continue
             try:
                 b = await a.read()
-                if b:
-                    images.append(b)
+                if not b:
+                    continue
+                # Robust WEBP detection even when the filename is misleading.
+                is_webp = (ct == "image/webp") or name.endswith(".webp") or (len(b) > 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP")
+                images.append((b, is_webp))
             except Exception:
                 continue
 
         if not images:
             return
 
+
+        if not images:
+            return
+
         # Compare each local phash to blacklist.
-        for raw in images:
+        for raw, is_webp in images:
+            bits_max_eff = min(self.bits_max, self.bits_max_webp) if is_webp else self.bits_max
             hashes = phash_list_from_bytes(raw, max_frames=4)
             for s in hashes:
                 try:
@@ -287,8 +300,8 @@ class PhashPhishGuard(commands.Cog):
                 except Exception:
                     continue
                 for ref in self._hashes:
-                    if hamming(hv, ref) <= self.bits_max:
-                        reason = f"phash-match≤{self.bits_max} hv={hv:x}"
+                    if hamming(hv, ref) <= bits_max_eff:
+                        reason = f"phash-match≤{bits_max_eff} hv={hv:x}"
                         ev_urls: List[str] = []
                         for att in getattr(m, "attachments", []) or []:
                             url = getattr(att, "url", None)

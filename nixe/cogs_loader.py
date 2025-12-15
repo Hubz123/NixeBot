@@ -19,6 +19,13 @@ DEFAULT_REQUIRED_COGS = (
     "nixe.cogs.phish_groq_guard",
 )
 
+# Modules to skip during autoload to avoid duplicates / legacy stubs.
+SKIP_EXTENSIONS = {
+    # Legacy stub that defines the same Cog name (LinkPhishGuard) and can break autoload.
+    "nixe.cogs.link_phish_guard",
+}
+
+
 def _parse_required_from_env() -> Tuple[str, ...]:
     raw = (os.getenv("NIXE_REQUIRED_COGS") or "").strip()
     if not raw:
@@ -39,6 +46,8 @@ def _iter_cog_names(package_root: str) -> List[str]:
         name = getattr(mod, "name", "")
         leaf = name.rsplit(".", 1)[-1]
         if not name or leaf.startswith("_"):
+            continue
+        if name in SKIP_EXTENSIONS:
             continue
         names.append(name)
     names.sort()  # deterministic load order
@@ -77,7 +86,16 @@ async def _load_all_impl(bot, package_root: str = "nixe.cogs") -> List[str]:
             loaded.append(name)
         except Exception as e:
             # Don't silently skip: log as ERROR so you can see failures in INFO-level deployments.
-            LOGGER.error("❌ Failed to load %s: %r", name, e, exc_info=True)
+            msg = str(e)
+            # Common benign case: duplicate Cog name from legacy stub modules.
+            if ("already loaded" in msg) and ("Cog named" in msg or "LinkPhishGuard" in msg):
+                LOGGER.warning("⚠️ Duplicate cog ignored for %s (%s)", name, msg)
+                continue
+            # Only print tracebacks for required cogs; otherwise keep logs clean.
+            if name in required:
+                LOGGER.error("❌ Failed to load %s: %r", name, e, exc_info=True)
+            else:
+                LOGGER.error("❌ Failed to load %s: %r", name, e)
             errors.append((name, repr(e)))
 
     # Fail-closed safety: required cogs must be loaded.

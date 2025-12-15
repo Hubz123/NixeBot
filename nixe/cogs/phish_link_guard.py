@@ -116,4 +116,7 @@ class LinkPhishGuard(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
+    # Idempotent setup: avoid duplicate cog load if another module already added it.
+    if bot.get_cog("LinkPhishGuard") is not None:
+        return
     await bot.add_cog(LinkPhishGuard(bot))

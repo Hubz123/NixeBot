@@ -23,6 +23,8 @@ DEFAULT_REQUIRED_COGS = (
 SKIP_EXTENSIONS = {
     # Legacy stub that defines the same Cog name (LinkPhishGuard) and can break autoload.
     "nixe.cogs.link_phish_guard",
+    # Legacy duplicate of LuckyPullGuard (newer module is lucky_pull_guard).
+    "nixe.cogs.luckypull_guard",
 }
 
 

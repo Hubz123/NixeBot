@@ -240,15 +240,8 @@ class SusAttachHardener(commands.Cog):
 
 
 async def setup(bot: commands.Bot):
-    """discord.py extension entrypoint.
-
-    This cog is loaded via bot.load_extension(...). Provide an idempotent setup
-    so repeated loads (or partial reloads) cannot crash startup.
-    """
-    try:
-        if bot.get_cog("SusAttachHardener") is not None:
-            return
-    except Exception:
-        # If bot implementation differs, fall back to add_cog and let discord.py validate.
-        pass
+    """discord.py extension entrypoint."""
+    # idempotent: avoid duplicate add_cog
+    if bot.get_cog("SusAttachHardener") is not None:
+        return
     await bot.add_cog(SusAttachHardener(bot))

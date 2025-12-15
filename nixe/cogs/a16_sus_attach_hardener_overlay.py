@@ -147,7 +147,9 @@ class SusAttachHardener(commands.Cog):
         self.enable = bool(int(os.getenv("SUS_ATTACH_HARDENER_ENABLE", os.getenv("SUS_ATTACH_ENABLE", "1"))))
         self.delete_threshold = int(os.getenv("SUS_ATTACH_DELETE_THRESHOLD", "3"))
         self.max_bytes = int(os.getenv("SUS_ATTACH_MAX_BYTES", "5000000"))
-        self.verbose = bool(int(os.getenv("SUS_ATTACH_LOG_VERBOSE", "1")))
+        # Verbose logging is intentionally OFF by default to avoid log spam.
+        # Enable explicitly via SUS_ATTACH_LOG_VERBOSE=1 if you want per-event logs.
+        self.verbose = bool(int(os.getenv("SUS_ATTACH_LOG_VERBOSE", "0")))
         # Gemini assist
         self.gem_enable = bool(int(os.getenv("SUS_ATTACH_GEMINI_ENABLE", "1")))
         self.gem_thr = float(os.getenv("SUS_ATTACH_GEMINI_THRESHOLD", "0.85"))  # tightened default
@@ -196,8 +198,11 @@ class SusAttachHardener(commands.Cog):
             sc, rs = _content_signals(message)
             total_score += sc
             if sc: reasons.append(rs)
-            if self.verbose:
-                log.info("[sus-hard] content-score=%s reasons=%s", sc, rs)
+            # Only emit warnings when something is suspicious.
+            if sc:
+                log.warning("[sus-hard] content-score=%s reasons=%s", sc, rs)
+            elif self.verbose:
+                log.debug("[sus-hard] content-score=%s reasons=%s", sc, rs)
 
         # 2) Attachment scan
         for att in getattr(message, "attachments", []) or []:
@@ -208,8 +213,11 @@ class SusAttachHardener(commands.Cog):
                 sc, rs, mime = _score_attachment(name, b or b"")
                 total_score += sc
                 if sc: reasons.append(f"{name}:{rs}")
-                if self.verbose:
-                    log.info("[sus-hard] score=%s mime=%s name=%s", sc, mime, name)
+                # Only warn on suspicious attachments (score>0). Otherwise keep quiet.
+                if sc:
+                    log.warning("[sus-hard] att-score=%s mime=%s name=%s reasons=%s", sc, mime, name, rs)
+                elif self.verbose:
+                    log.debug("[sus-hard] att-score=%s mime=%s name=%s", sc, mime, name)
             except Exception as e:
                 log.debug("[sus-hard] att err: %r", e)
 
@@ -219,17 +227,21 @@ class SusAttachHardener(commands.Cog):
         if try_gem:
             imgs = await self._collect_images(message)
             if imgs:
-                log.info("[sus-hard] gem try: imgs=%d thr=%.2f timeout=%dms", len(imgs), self.gem_thr, self.gem_timeout)
+                if self.verbose:
+                    log.debug("[sus-hard] gem try: imgs=%d thr=%.2f timeout=%dms", len(imgs), self.gem_thr, self.gem_timeout)
                 try:
                     label, conf = await classify_phish_image(imgs, hints=self.gem_hints, timeout_ms=self.gem_timeout)
-                    log.info("[sus-hard] gem classify: (%s, %.3f) thr=%.2f", label, conf, self.gem_thr)
                     if label == "phish" and conf >= self.gem_thr:
                         total_score = max(total_score, self.delete_threshold)
                         reasons.append(f"gemini-phish@{conf:.2f}")
+                        log.warning("[sus-hard] gemini-phish detected: conf=%.3f thr=%.2f", conf, self.gem_thr)
+                    elif self.verbose:
+                        log.debug("[sus-hard] gem classify: (%s, %.3f) thr=%.2f", label, conf, self.gem_thr)
                 except Exception as e:
                     log.warning("[sus-hard] gem error: %r", e)
             else:
-                log.info("[sus-hard] gem skip: no images collected")
+                if self.verbose:
+                    log.debug("[sus-hard] gem skip: no images collected")
 
         if total_score >= self.delete_threshold:
             try:
@@ -237,11 +249,3 @@ class SusAttachHardener(commands.Cog):
                 log.warning("[sus-hard] deleted in %s (score=%s reasons=%s)", message.channel.id, total_score, ";".join(reasons))
             except Exception as e:
                 log.warning("[sus-hard] delete failed: %r", e)
-
-
-async def setup(bot: commands.Bot):
-    """discord.py extension entrypoint."""
-    # idempotent: avoid duplicate add_cog
-    if bot.get_cog("SusAttachHardener") is not None:
-        return
-    await bot.add_cog(SusAttachHardener(bot))

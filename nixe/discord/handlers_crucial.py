@@ -8,6 +8,25 @@ from nixe.helpers.bootstate import wait_cogs_loaded
 
 log = logging.getLogger("nixe.discord.handlers_crucial")
 
+
+async def wire_handlers(bot: commands.Bot) -> None:
+    """Load core extensions and autodiscovered cogs.
+
+    This is invoked early by nixe.discord.shim_runner. If it is missing, the bot
+    will start without any of the security cogs, causing attachments to "tembus".
+    """
+    # 1) Ensure this extension's Cog is loaded (safe if already loaded)
+    try:
+        await setup(bot)
+    except Exception:
+        pass
+
+    # 2) Load the cog autodiscovery extension
+    try:
+        await bot.load_extension("nixe.cogs_loader")
+    except Exception as e:
+        log.error("wire_handlers: failed to load nixe.cogs_loader: %r", e)
+
 def _user_tag(u: discord.ClientUser | discord.User | None) -> str:
     if not u:
         return "Nixe#0000"

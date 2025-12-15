@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, logging, json, asyncio
+import os, logging, json, asyncio, io
 from typing import Set, List, Tuple, Optional
 
 import discord
@@ -15,6 +15,35 @@ from nixe.state_runtime import get_phash_ids
 from nixe.helpers.ban_utils import emit_phish_detected
 
 log = logging.getLogger("nixe.cogs.phash_phish_guard")
+
+try:
+    from PIL import Image as _PIL_Image
+except Exception:
+    _PIL_Image = None
+
+
+def _transcode_to_png_bytes(raw: bytes) -> bytes:
+    """Best-effort decode+re-encode to PNG.
+
+    Rationale: some WEBP payloads (esp. animated / metadata-heavy) can produce
+    unstable perceptual hashes. Transcoding helps confirm true matches and
+    reduce false positives.
+    """
+    if not raw or _PIL_Image is None:
+        return b""
+    try:
+        im = _PIL_Image.open(io.BytesIO(raw))
+        # Pick first frame if animated
+        try:
+            im.seek(0)
+        except Exception:
+            pass
+        im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        return buf.getvalue() or b""
+    except Exception:
+        return b""
 
 def _env_int(name: str, default: int = 0) -> int:
     try:
@@ -301,6 +330,28 @@ class PhashPhishGuard(commands.Cog):
                     continue
                 for ref in self._hashes:
                     if hamming(hv, ref) <= bits_max_eff:
+                        # Extra verification for WEBP to reduce false positives.
+                        # We only confirm a hit if the match also holds after a
+                        # decode+re-encode to PNG.
+                        if is_webp:
+                            png = _transcode_to_png_bytes(raw)
+                            if png:
+                                confirmed = False
+                                for s2 in phash_list_from_bytes(png, max_frames=1):
+                                    try:
+                                        hv2 = int(str(s2), 16)
+                                    except Exception:
+                                        continue
+                                    if hamming(hv2, ref) <= bits_max_eff:
+                                        confirmed = True
+                                        break
+                                if not confirmed:
+                                    continue
+                            else:
+                                # If we cannot transcode, be stricter rather than
+                                # nuking normal WEBP images.
+                                if hamming(hv, ref) > max(0, bits_max_eff - 2):
+                                    continue
                         reason = f"phash-match≤{bits_max_eff} hv={hv:x}"
                         ev_urls: List[str] = []
                         for att in getattr(m, "attachments", []) or []:

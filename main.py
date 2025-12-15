@@ -115,33 +115,26 @@ class NixeBot(commands.Bot):
     async def setup_hook(self):
         """Load cogs before the bot connects."""
         global _loaded_cogs
-        # Prefer project-provided loader if available
+
+        # Extra safety: apply runtime_env.json -> os.environ *before* loading any cog
+        # so modules that read env at import-time see the correct values.
         try:
-            from nixe import cogs_loader as _loader
-            _loaded = await _loader.autoload_all(self) if hasattr(_loader, "autoload_all") else _loader.load_all(self)  # type: ignore
-            _loaded_cogs = getattr(_loader, "LOADED_COUNT", 0) or (len(_loaded) if isinstance(_loaded, (list, tuple, set)) else _loaded_cogs)
-            log.info("✅ Cogs loaded via project loader.")
-            return
+            from nixe.cogs.a00_env_hybrid_overlay import _merge_env_from_json  # type: ignore
+            _merge_env_from_json(os.getenv("ENV_HYBRID_JSON_PATH", "nixe/config/runtime_env.json"),
+                                 prefer_env=(os.getenv("ENV_HYBRID_PREFER_ENV", "1") == "1"))
         except Exception as e:
-            log.warning("Project loader unavailable or failed (%r). Falling back to autodiscover.", e)
-        # Fallback: autodiscover nixe/cogs/*.py
+            log.warning("[env-hybrid] pre-merge failed: %r", e)
+
+        # Fail-closed loader (deterministic order + required-cog enforcement)
+        from nixe import cogs_loader as _loader
         try:
-            from importlib import import_module
-            from pkgutil import iter_modules
-            import nixe.cogs as pkg
-            base = pkg.__name__ + "."
-            for m in iter_modules(pkg.__path__):
-                if m.ispkg: 
-                    continue
-                modname = base + m.name
-                try:
-                    await self.load_extension(modname)
-                    _loaded_cogs += 1
-                except Exception as e:
-                    log.error("Failed to load %s: %r", modname, e)
-            log.info("✅ Autoloaded %d cogs (fallback).", _loaded_cogs)
+            loaded = await _loader.autoload_all(self)  # type: ignore[attr-defined]
+            _loaded_cogs = len(loaded) if isinstance(loaded, (list, tuple, set)) else int(loaded or 0)
+            log.info("✅ Cogs loaded via project loader (fail-closed).")
         except Exception as e:
-            log.exception("Autodiscover failed: %r", e)
+            log.critical("❌ Unsafe startup: cogs failed to load: %r", e, exc_info=True)
+            raise
+
 
     async def on_ready(self):
         global _last_ready

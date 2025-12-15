@@ -51,7 +51,24 @@ try:
 except Exception:
     pass
 
-GROQ_KEY = os.getenv("GROQ_API_KEY", "")
+def _resolve_groq_key() -> str:
+    # Prefer canonical single key
+    key = (os.getenv("GROQ_API_KEY") or "").strip()
+    if key:
+        return key
+    # Support comma-separated pool
+    pooled = (os.getenv("GROQ_API_KEYS") or os.getenv("GROQ_KEYS") or "").strip()
+    if pooled:
+        for part in pooled.split(","):
+            k = part.strip()
+            if k:
+                return k
+    # Support numbered keys (GROQ_API_KEY_1..n)
+    for i in range(1, 21):
+        k = (os.getenv(f"GROQ_API_KEY_{i}") or "").strip()
+        if k:
+            return k
+    return ""
 MODEL_VISION = os.getenv("GROQ_MODEL_VISION") or "meta-llama/llama-4-scout-17b-16e-instruct"
 LOG_CHAN_ID = int(os.getenv("PHISH_LOG_CHAN_ID") or os.getenv("NIXE_PHISH_LOG_CHAN_ID") or "0")
 TIMEOUT_MS = int(os.getenv("PHISH_GEMINI_MAX_LATENCY_MS", "12000"))
@@ -178,7 +195,8 @@ class GroqPhishGuard(commands.Cog):
 
     @commands.Cog.listener("on_message")
     async def on_message(self, message: discord.Message):
-        if not ENABLE or not GROQ_KEY:
+        groq_key = _resolve_groq_key()
+        if not ENABLE or not groq_key:
             return
         try:
             if message.author.bot:
@@ -220,7 +238,7 @@ class GroqPhishGuard(commands.Cog):
             candidates = candidates[: max(1, min(SCAN_MAX_IMAGES, 8))]
 
             url = "https://api.groq.com/openai/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+            headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
 
             prompt = (
                 "You are a high-precision phishing/scam detector for Discord images.\n"

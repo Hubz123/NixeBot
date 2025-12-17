@@ -28,18 +28,56 @@ def _to_int(v: str, default: int = 0) -> int:
         return int(default)
 
 # Primary log channel config
-LOG_CH_ID = _to_int(os.getenv("LOG_CHANNEL_ID", "0"), 0)
-BAN_LOG_CH_ID = _to_int(os.getenv("NIXE_BAN_LOG_CHANNEL_ID", str(LOG_CH_ID)), 0)
+# NOTE: resolve environment at call-time to avoid import-order issues.
+def _env_first(*names: str, default: str = "") -> str:
+    for n in names:
+        try:
+            v = os.getenv(n)
+        except Exception:
+            v = None
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return default
 
-# Optional block (never use this channel as a target)
-BLOCKED_ID = _to_int(os.getenv("LOG_CHANNEL_BLOCKED_ID", "0"), 0)
+def _cfg():
+    # Primary log channel id: accept legacy and newer env names.
+    log_id = _to_int(_env_first(
+        "PHISH_LOG_CHAN_ID",
+        "NIXE_PHISH_LOG_CHAN_ID",
+        "LOG_CHANNEL_ID",
+        "NIXE_LOG_CHANNEL_ID",
+        default="0",
+    ), 0)
 
-PREF_NAME = (os.getenv("MOD_LOG_CHANNEL_NAME", "nixe-only") or "nixe-only").strip().lower()
+    # Ban/mod log channel id: prefer explicit ban-log id, otherwise fall back to log_id.
+    ban_log_id = _to_int(_env_first(
+        "NIXE_BAN_LOG_CHANNEL_ID",
+        "BAN_LOG_CHANNEL_ID",
+        default=str(log_id or 0),
+    ), 0)
 
-def _ok(ch: Optional[discord.abc.GuildChannel]) -> Optional[discord.TextChannel]:
+    blocked_id = _to_int(_env_first(
+        "LOG_CHANNEL_BLOCKED_ID",
+        "PHISH_LOG_BLOCKED_ID",
+        "NIXE_LOG_CHANNEL_BLOCKED_ID",
+        default="0",
+    ), 0)
+
+    pref_name = (_env_first(
+        "MOD_LOG_CHANNEL_NAME",
+        "NIXE_LOG_CHANNEL_NAME",
+        default="nixe-only",
+    ) or "nixe-only").strip().lower()
+
+    return log_id, ban_log_id, blocked_id, pref_name
+
+def _ok(ch: Optional[discord.abc.GuildChannel], blocked_id: int) -> Optional[discord.TextChannel]:
     if not ch:
         return None
-    if getattr(ch, "id", 0) and int(getattr(ch, "id", 0)) == int(BLOCKED_ID):
+    if getattr(ch, "id", 0) and int(getattr(ch, "id", 0)) == int(blocked_id):
         return None
     if isinstance(ch, discord.TextChannel):
         return ch
@@ -50,22 +88,24 @@ async def get_log_channel(guild: discord.Guild) -> Optional[discord.TextChannel]
     if not guild:
         return None
 
+    log_id, ban_log_id, blocked_id, pref_name = _cfg()
+
     # 1) Explicit ban-log channel id
-    if BAN_LOG_CH_ID:
-        ch = _ok(guild.get_channel(BAN_LOG_CH_ID))
+    if ban_log_id:
+        ch = _ok(guild.get_channel(ban_log_id), blocked_id)
         if ch:
             return ch
 
-    # 2) Explicit LOG_CHANNEL_ID
-    if LOG_CH_ID:
-        ch = _ok(guild.get_channel(LOG_CH_ID))
+    # 2) Explicit LOG/PHISH log channel id
+    if log_id:
+        ch = _ok(guild.get_channel(log_id), blocked_id)
         if ch:
             return ch
 
-    # 3) Name-based fallback (nixe-only)
+    # 3) Name-based fallback
     try:
         for c in guild.text_channels:
-            if (c.name or "").strip().lower() == PREF_NAME and int(c.id) != int(BLOCKED_ID):
+            if (c.name or "").strip().lower() == pref_name and int(c.id) != int(blocked_id):
                 return c
     except Exception:
         pass

@@ -13,6 +13,37 @@ from nixe.helpers.ban_utils import emit_phish_detected
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES", "8192"))
 PHISH_WEBP_MAX_BYTES = int(os.getenv("PHISH_WEBP_MAX_BYTES", "1048576"))  # 1MB default
 PHISH_SNIFF_FAKE_WEBP = (os.getenv("PHISH_SNIFF_FAKE_WEBP", "1") == "1")
+PHISH_GROQ_SEEN_TTL_SEC = int(os.getenv("PHISH_GROQ_SEEN_TTL_SEC", "300"))
+
+# URL dedupe across messages (avoid rescanning the same CDN URL repeatedly)
+_SEEN_URL_EXP: dict[str, float] = {}
+
+def _seen_recent(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        now = asyncio.get_running_loop().time()
+    except RuntimeError:
+        now = __import__("time").monotonic()
+    exp = _SEEN_URL_EXP.get(url)
+    if exp and exp > now:
+        return True
+    if exp:
+        _SEEN_URL_EXP.pop(url, None)
+    return False
+
+def _mark_seen(url: str):
+    if not url:
+        return
+    ttl = max(0, int(PHISH_GROQ_SEEN_TTL_SEC))
+    if ttl <= 0:
+        return
+    try:
+        now = asyncio.get_running_loop().time()
+    except RuntimeError:
+        now = __import__("time").monotonic()
+    _SEEN_URL_EXP[url] = now + float(ttl)
+
 
 def _env_set(*names: str) -> set[int]:
     out: set[int] = set()
@@ -262,6 +293,8 @@ class GroqPhishGuard(commands.Cog):
                     u = getattr(a, 'url', None)
                     if not u or u in seen_urls:
                         continue
+                    if _seen_recent(u):
+                        continue
                     seen_urls.add(u)
                     # size gate for WEBP pipeline
                     try:
@@ -276,6 +309,7 @@ class GroqPhishGuard(commands.Cog):
                         is_webp = (mt == 'image/webp')
                     if is_webp:
                         candidates.append(a)
+                        _mark_seen(u)
             if not candidates:
                 return
             candidates.sort(key=_sort_key, reverse=True)

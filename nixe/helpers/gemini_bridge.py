@@ -334,6 +334,55 @@ async def _call_groq_lpg_once(
 
 
 
+
+async def _classify_one(
+    img_bytes: bytes,
+    mime: str,
+    sys_prompt: str,
+    model: str,
+    api_key: str,
+    timeout_sec: float,
+) -> tuple[bool, float, str, str]:
+    """Single classify attempt.
+
+    Returns (lucky_bool, score, via, reason). On transport/model errors, returns
+    (False, 0.0, via, error_reason) without raising.
+    """
+    # Prefer Groq vision path for LPG when available; keep Gemini REST as fallback.
+    use_groq = (_env("LPG_USE_GROQ", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    if use_groq and Groq is not None:
+        return await _call_groq_lpg_once(
+            key=api_key,
+            model=model,
+            sys_prompt=sys_prompt,
+            img_bytes=img_bytes,
+            mime=mime,
+            timeout_sec=timeout_sec,
+        )
+
+    # Gemini REST fallback
+    try:
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": sys_prompt},
+                        {"inline_data": {"mime_type": mime, "data": b64}},
+                    ],
+                }
+            ]
+        }
+        timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_sec)))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            lucky, score, via, reason = await _call_gemini_once(session, api_key, model, payload)
+            return bool(lucky), float(score or 0.0), via, reason
+    except Exception as e:
+        return False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}"
+
+
+
 async def classify_lucky_pull_bytes(image_bytes: bytes):
     """
     Lucky Pull Guard classifier.

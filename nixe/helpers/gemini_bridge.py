@@ -196,14 +196,40 @@ def _pick_timeout_sec() -> float:
         pass
     return 6.0
 
-def _pick_total_budget_sec(per_timeout: float) -> float:
+def _pick_total_budget_sec(per_timeout: float, n_models: int | None = None, n_keys: int | None = None) -> float:
+    """Pick a safe *total* timeout budget for a multi-try classify run.
+
+    - `per_timeout` is the per-request timeout (seconds).
+    - `n_models`/`n_keys` are used only to scale the total budget conservatively.
+    - Environment override: LUCKYPULL_GROQ_TOTAL_TIMEOUT_SEC (seconds).
+    """
     try:
         v = float(_env("LUCKYPULL_GROQ_TOTAL_TIMEOUT_SEC", "0") or 0)
         if v > 0:
             return max(per_timeout, v)
     except Exception:
         pass
-    return per_timeout * 1.6
+
+    # Default: modest multiplier over per-request timeout.
+    base = per_timeout * 1.6
+
+    # If we are going to iterate across multiple models/keys, add a bounded cushion.
+    try:
+        nm = int(n_models or 0)
+    except Exception:
+        nm = 0
+    try:
+        nk = int(n_keys or 0)
+    except Exception:
+        nk = 0
+
+    scale = 1.0
+    if nm > 1:
+        scale *= min(1.0 + 0.15 * (nm - 1), 1.6)  # cap model scaling
+    if nk > 1:
+        scale *= min(1.0 + 0.05 * (nk - 1), 1.3)  # cap key scaling
+
+    return max(per_timeout, base * scale)
 
 async def _call_gemini_once(session: aiohttp.ClientSession, key: str, model: str, payload: dict) -> tuple[bool, float, str, str]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"

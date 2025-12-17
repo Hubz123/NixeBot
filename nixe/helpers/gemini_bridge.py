@@ -197,11 +197,10 @@ def _pick_timeout_sec() -> float:
     return 6.0
 
 def _pick_total_budget_sec(per_timeout: float, n_models: int | None = None, n_keys: int | None = None) -> float:
-    """Pick a safe *total* timeout budget for a multi-try classify run.
-
-    - `per_timeout` is the per-request timeout (seconds).
-    - `n_models`/`n_keys` are used only to scale the total budget conservatively.
-    - Environment override: LUCKYPULL_GROQ_TOTAL_TIMEOUT_SEC (seconds).
+    """Pick an overall wall-clock budget for LPG classify.
+    Caller may pass n_models/n_keys; older versions ignored them.
+    Default remains close to prior behavior (1.6x per_timeout),
+    with a modest bump when multiple model/key combinations exist.
     """
     try:
         v = float(_env("LUCKYPULL_GROQ_TOTAL_TIMEOUT_SEC", "0") or 0)
@@ -209,27 +208,17 @@ def _pick_total_budget_sec(per_timeout: float, n_models: int | None = None, n_ke
             return max(per_timeout, v)
     except Exception:
         pass
-
-    # Default: modest multiplier over per-request timeout.
     base = per_timeout * 1.6
-
-    # If we are going to iterate across multiple models/keys, add a bounded cushion.
     try:
-        nm = int(n_models or 0)
+        nm = int(n_models) if n_models is not None else 1
+        nk = int(n_keys) if n_keys is not None else 1
+        combos = max(1, nm * nk)
+        if combos > 1:
+            bump = min(per_timeout * 0.25 * float(combos - 1), per_timeout * 2.0)
+            base += bump
     except Exception:
-        nm = 0
-    try:
-        nk = int(n_keys or 0)
-    except Exception:
-        nk = 0
-
-    scale = 1.0
-    if nm > 1:
-        scale *= min(1.0 + 0.15 * (nm - 1), 1.6)  # cap model scaling
-    if nk > 1:
-        scale *= min(1.0 + 0.05 * (nk - 1), 1.3)  # cap key scaling
-
-    return max(per_timeout, base * scale)
+        pass
+    return base
 
 async def _call_gemini_once(session: aiohttp.ClientSession, key: str, model: str, payload: dict) -> tuple[bool, float, str, str]:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
@@ -334,7 +323,6 @@ async def _call_groq_lpg_once(
 
 
 
-
 async def _classify_one(
     img_bytes: bytes,
     mime: str,
@@ -343,25 +331,14 @@ async def _classify_one(
     api_key: str,
     timeout_sec: float,
 ) -> tuple[bool, float, str, str]:
-    """Single classify attempt.
-
-    Returns (lucky_bool, score, via, reason). On transport/model errors, returns
-    (False, 0.0, via, error_reason) without raising.
+    """One LPG classify attempt.
+    Routes to Groq (OpenAI-compatible via `groq` SDK) when using non-Gemini models,
+    and to the Gemini REST API when the model name indicates Gemini.
     """
-    # Prefer Groq vision path for LPG when available; keep Gemini REST as fallback.
-    use_groq = (_env("LPG_USE_GROQ", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
-    if use_groq and Groq is not None:
-        return await _call_groq_lpg_once(
-            key=api_key,
-            model=model,
-            sys_prompt=sys_prompt,
-            img_bytes=img_bytes,
-            mime=mime,
-            timeout_sec=timeout_sec,
-        )
-
-    # Gemini REST fallback
-    try:
+    m = (model or "").strip().lower()
+    use_gemini = m.startswith("gemini") or m.startswith("models/")
+    if use_gemini:
+        # Gemini expects inline_data parts.
         b64 = base64.b64encode(img_bytes).decode("ascii")
         payload = {
             "contents": [
@@ -374,13 +351,24 @@ async def _classify_one(
                 }
             ]
         }
-        timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_sec)))
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            lucky, score, via, reason = await _call_gemini_once(session, api_key, model, payload)
-            return bool(lucky), float(score or 0.0), via, reason
-    except Exception as e:
-        return False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}"
+        try:
+            timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_sec)))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                return await _call_gemini_once(session, api_key, model, payload)
+        except asyncio.TimeoutError:
+            return False, 0.0, f"gemini:{model}", "timeout"
+        except Exception as e:
+            return False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}"
 
+    # Default: Groq path (keeps legacy `via` prefix in _call_groq_lpg_once)
+    return await _call_groq_lpg_once(
+        key=api_key,
+        model=model,
+        sys_prompt=sys_prompt,
+        img_bytes=img_bytes,
+        mime=mime,
+        timeout_sec=timeout_sec,
+    )
 
 
 async def classify_lucky_pull_bytes(image_bytes: bytes):

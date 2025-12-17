@@ -11,6 +11,8 @@ log = logging.getLogger("nixe.cogs.phish_groq_guard")
 from nixe.helpers.ban_utils import emit_phish_detected
 
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES", "8192"))
+PHISH_WEBP_MAX_BYTES = int(os.getenv("PHISH_WEBP_MAX_BYTES", "1048576"))  # 1MB default
+PHISH_SNIFF_FAKE_WEBP = (os.getenv("PHISH_SNIFF_FAKE_WEBP", "1") == "1")
 
 def _env_set(*names: str) -> set[int]:
     out: set[int] = set()
@@ -92,6 +94,26 @@ def _is_webp_attachment(att: discord.Attachment) -> bool:
     ct = (getattr(att, "content_type", "") or "").lower()
     name = (getattr(att, "filename", "") or "").lower()
     return ct == "image/webp" or name.endswith(".webp")
+
+async def _sniff_mime_from_url(sess: aiohttp.ClientSession, url: str) -> str:
+    """Best-effort magic-bytes sniff using a tiny Range request."""
+    if not url:
+        return ""
+    try:
+        headers = {"Range": "bytes=0-63"}
+        async with sess.get(url, headers=headers) as r:
+            b = await r.content.read(64)
+    except Exception:
+        return ""
+    if b.startswith(b"RIFF") and len(b) >= 12 and b[8:12] == b"WEBP":
+        return "image/webp"
+    if b.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if b.startswith(b"GIF87a") or b.startswith(b"GIF89a"):
+        return "image/gif"
+    return ""
 
 
 _WEBP_ACTION_KWS = (
@@ -230,10 +252,32 @@ class GroqPhishGuard(commands.Cog):
             if not imgs:
                 return
 
-            candidates = [a for a in imgs if _sus(a)]
+                        # Only WEBP should go through Groq phishing (precision).
+            # We sniff magic-bytes to catch fake extensions (e.g. image.png that is actually WEBP).
+            candidates = []
+            timeout = aiohttp.ClientTimeout(total=TIMEOUT_MS / 1000.0)
+            async with aiohttp.ClientSession(timeout=timeout) as _sniff_sess:
+                seen_urls = set()
+                for a in imgs:
+                    u = getattr(a, 'url', None)
+                    if not u or u in seen_urls:
+                        continue
+                    seen_urls.add(u)
+                    # size gate for WEBP pipeline
+                    try:
+                        sz = int(getattr(a, 'size', 0) or 0)
+                    except Exception:
+                        sz = 0
+                    if sz and sz > PHISH_WEBP_MAX_BYTES:
+                        continue
+                    is_webp = _is_webp_attachment(a)
+                    if (not is_webp) and PHISH_SNIFF_FAKE_WEBP:
+                        mt = await _sniff_mime_from_url(_sniff_sess, u)
+                        is_webp = (mt == 'image/webp')
+                    if is_webp:
+                        candidates.append(a)
             if not candidates:
                 return
-
             candidates.sort(key=_sort_key, reverse=True)
             candidates = candidates[: max(1, min(SCAN_MAX_IMAGES, 8))]
 
@@ -328,7 +372,7 @@ class GroqPhishGuard(commands.Cog):
             required_conf = VISION_MIN_CONF
 
             # WEBP is scanned, but we apply stricter action criteria to avoid false positives.
-            if hit_att is not None and _is_webp_attachment(hit_att):
+            if hit_att is not None:  # candidates are WEBP by sniff/metadata
                 required_conf = max(VISION_MIN_CONF, WEBP_MIN_CONF)
                 if float(best["confidence"]) < required_conf:
                     return
@@ -351,13 +395,13 @@ class GroqPhishGuard(commands.Cog):
                 "score": float(best["confidence"]),
                 "provider": "groq",
                 "reason": best["reason"],
-                "kind": "image",
+                "kind": "groq",
                 "signals": best.get("signals") or [],
                 "image_url": hit_url,
-                "evidence_urls": ev_urls,
+                
             }
 
-            emit_phish_detected(self.bot, message, details)
+            emit_phish_detected(self.bot, message, details, evidence_urls=ev_urls)
 
         except Exception as e:
             log.debug("[phish-groq] err: %r", e)

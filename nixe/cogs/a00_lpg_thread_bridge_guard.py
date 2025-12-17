@@ -13,6 +13,58 @@ except Exception:
 log = logging.getLogger("nixe.cogs.a00_lpg_thread_bridge_guard")
 
 
+from nixe.helpers.once import once_sync as _once
+
+def _sniff_fmt(image_bytes: bytes) -> str:
+    """Return: jpeg|png|webp|gif|other by magic bytes."""
+    if not image_bytes:
+        return "other"
+    b = image_bytes
+    if b.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if b.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if b.startswith(b"GIF87a") or b.startswith(b"GIF89a"):
+        return "gif"
+    # WEBP: RIFF .... WEBP
+    if len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "webp"
+    return "other"
+
+
+def _compress_to_under(raw: bytes, max_bytes: int) -> bytes:
+    """Best-effort compress/resize into JPEG under max_bytes (for LPG payload)."""
+    try:
+        if len(raw) <= max_bytes:
+            return raw
+        import io
+        from PIL import Image  # type: ignore
+
+        im = Image.open(io.BytesIO(raw))
+        # Normalize to RGB to avoid alpha issues
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        # Downscale gently
+        im.thumbnail((900, 900))
+
+        # Try qualities from 80 down to 40
+        for q in (80, 75, 70, 65, 60, 55, 50, 45, 40):
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", optimize=True, quality=q, subsampling=1)
+            data = buf.getvalue()
+            if len(data) <= max_bytes:
+                return data
+
+        # As a last resort, shrink more
+        im.thumbnail((640, 640))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", optimize=True, quality=45, subsampling=1)
+        data = buf.getvalue()
+        return data if data else raw
+    except Exception:
+        return raw
+
+
 # -- simple pHash + helpers (minimal) --
 from io import BytesIO
 import json
@@ -744,17 +796,42 @@ class LPGThreadBridgeGuard(commands.Cog):
         # Prepare raw bytes & pHash for logging/caching (local only, robust for discord.py slots)
         raw_bytes = None
         ph_val: Optional[int] = None
+        # Select a true JPG/PNG/JPEG attachment for LPG.
+        # - If the filename/content-type lies (e.g. .png but actually WEBP), we skip LPG for it.
+        # - Payload sent to classifier is best-effort compressed under ~0.5MB.
+        LPG_MAX_SEND = _env_int("LPG_MAX_SEND_BYTES", 512000)  # <= 0.5MB
+        LPG_MAX_FETCH = _env_int("LPG_MAX_FETCH_BYTES", 8000000)
+        LPG_SEEN_TTL = _env_int("LPG_SEEN_TTL_SEC", 600)
+
+        selected = None
         try:
             for a in (message.attachments or []):
+                if not self._is_image(a):
+                    continue
                 ct = (getattr(a, "content_type", None) or "").lower()
                 fn = (getattr(a, "filename", "") or "").lower()
-                if (ct.startswith("image/") if ct else False) or fn.endswith(
-                    (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
-                ):
-                    raw_bytes = await a.read()
-                    break
+                # Only JPG/PNG/JPEG go through LPG (per policy)
+                if not (ct in ("image/jpeg", "image/jpg", "image/png") or fn.endswith((".jpg", ".jpeg", ".png"))):
+                    continue
+                url = (getattr(a, "url", "") or "")
+                if url and not _once(f"lpg:att:{url}", ttl=LPG_SEEN_TTL):
+                    continue
+                size = int(getattr(a, "size", 0) or 0)
+                if size and size > LPG_MAX_FETCH:
+                    continue
+                selected = a
+                break
+
+            if selected is not None:
+                raw_bytes = await selected.read()
+                fmt = _sniff_fmt(raw_bytes if isinstance(raw_bytes, (bytes, bytearray)) else b"")
+                # If it's actually WEBP, do not send to LPG (handled by phishing WEBP pipeline)
+                if fmt == "webp" or fmt not in ("jpeg", "png"):
+                    raw_bytes = None
+                elif isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) > LPG_MAX_SEND:
+                    raw_bytes = _compress_to_under(bytes(raw_bytes), LPG_MAX_SEND)
         except Exception as e:
-            log.debug("[lpg-thread-bridge] failed to read bytes for pHash: %r", e)
+            log.debug("[lpg-thread-bridge] failed to read bytes for LPG: %r", e)
             raw_bytes = None
 
         if isinstance(raw_bytes, (bytes, bytearray)):

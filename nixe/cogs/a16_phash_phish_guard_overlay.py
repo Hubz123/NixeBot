@@ -13,6 +13,7 @@ GUARD_ALL = (os.getenv("PHISH_GUARD_ALL_CHANNELS","1").strip().lower() in ("1","
 from nixe.helpers.phash_tools import hamming
 from nixe.state_runtime import get_phash_ids
 from nixe.helpers.ban_utils import emit_phish_detected
+from nixe.helpers.once import once_sync as _once
 
 log = logging.getLogger("nixe.cogs.phash_phish_guard")
 
@@ -160,7 +161,11 @@ class PhashPhishGuard(commands.Cog):
         self.bot = bot
         self._hashes: Set[int] = set()
         self.bits_max: int = _env_int("PHASH_MATCH_DELETE_MAX_BITS", 12)
-        self.bits_max_webp: int = _env_int("PHISH_PHASH_WEBP_MAX_BITS", min(self.bits_max, 10))
+        # WEBP pHash matching must be strict to avoid false positives.
+        self.bits_max_webp: int = _env_int("PHISH_PHASH_WEBP_MAX_BITS", min(self.bits_max, 6))
+        # Only enforce pHash-ban for WEBP under this size.
+        self.webp_max_bytes: int = _env_int("PHISH_WEBP_PHASH_MAX_BYTES", 1000000)
+        self.seen_ttl_sec: int = _env_int("PHISH_PHASH_SEEN_TTL_SEC", 900)
         self.guard_ids: Set[int] = _env_set("LPG_GUARD_CHANNELS")
         # Channels/threads where pHash phishing guard must NEVER act
         # (e.g. mod rooms, phash boards, forums, or all-thread environments).
@@ -216,13 +221,24 @@ class PhashPhishGuard(commands.Cog):
             if not mid and rt_mid:
                 mid = rt_mid
 
-        # 3) Shared DB fallback from generic PHASH_DB_* vars
+                # 2.5) If only the imagephish DB thread id is provided, treat it as the DB thread.
+        if not tid:
+            tid = _env_int("PHASH_IMAGEPHISH_THREAD_ID", 0)
+
+# 3) Shared DB fallback from generic PHASH_DB_* vars
         if not tid:
             tid = _env_int("PHASH_DB_THREAD_ID", 0)
         if not mid:
             mid = _env_int("PHASH_DB_MESSAGE_ID", 0)
 
         if not mid:
+            # Thread-only mode: allow _refresh_hashes() to scan pins/history in the thread.
+            if tid:
+                try:
+                    channel = self.bot.get_channel(tid) or await self.bot.fetch_channel(tid)
+                    return channel, None
+                except Exception:
+                    return None, None
             return None, None
 
         channel: Optional[discord.abc.Messageable] = None
@@ -240,16 +256,53 @@ class PhashPhishGuard(commands.Cog):
         return channel, msg
 
     async def _refresh_hashes(self) -> None:
-        _, msg = await self._fetch_db_message()
-        if not msg:
-            log.warning("[phash-phish] db message not found; skip")
+        ch, msg = await self._fetch_db_message()
+        msgs: list[discord.Message] = []
+
+        if msg is not None:
+            msgs.append(msg)
+
+        # If a thread/channel is available, also parse pinned messages (preferred for DB boards)
+        if ch is not None:
+            try:
+                pins = await ch.pins()  # type: ignore[attr-defined]
+                if isinstance(pins, list) and pins:
+                    msgs.extend([m for m in pins if m is not None])
+            except Exception:
+                pass
+
+            # As a fallback, scan recent messages in the thread/channel for DB JSON.
+            # (Keep this bounded to avoid rate limits.)
+            try:
+                async for m2 in ch.history(limit=80):  # type: ignore[attr-defined]
+                    c = getattr(m2, "content", "") or ""
+                    if not c:
+                        continue
+                    if ("\"phash\"" in c) or ("NIXE_PHASH_DB" in c) or ("[\"phash\"" in c):
+                        msgs.append(m2)
+            except Exception:
+                pass
+
+        merged: Set[int] = set()
+        for m2 in msgs:
+            try:
+                merged |= _load_phash_list_from_content(getattr(m2, "content", "") or "")
+            except Exception:
+                continue
+
+        if not merged:
+            log.warning(
+                "[phash-phish] db parse yields 0 hashes (thread=%s)",
+                getattr(ch, "id", 0) if ch else 0,
+            )
             return
-        hashes = _load_phash_list_from_content(msg.content or "")
-        if not hashes:
-            log.warning("[phash-phish] db parse yields 0 hashes; len=%s", len(msg.content or ""))
-            return
-        self._hashes = hashes
-        log.warning("[phash-phish] loaded %d hashes from db msg %s", len(hashes), getattr(msg, "id", "?"))
+
+        self._hashes = merged
+        log.warning(
+            "[phash-phish] loaded %d hashes (thread=%s)",
+            len(merged),
+            getattr(ch, "id", 0) if ch else 0,
+        )
 
     def _should_guard_channel(self, ch: discord.abc.GuildChannel | discord.Thread) -> bool:
         cid = int(getattr(ch, "id", 0) or 0)
@@ -302,13 +355,24 @@ class PhashPhishGuard(commands.Cog):
             looks_image = (ct in allowed_cts) or any(name.endswith(ext) for ext in allowed_exts)
             if not looks_image:
                 continue
+            # Only WEBP goes through phishing pHash-ban pipeline (per policy).
+            url = getattr(a, "url", None) or ""
+            if url and not _once(f"phash:webp:{url}", ttl=self.seen_ttl_sec):
+                continue
+            size = int(getattr(a, "size", 0) or 0)
+            if size and size > self.webp_max_bytes:
+                continue
             try:
                 b = await a.read()
                 if not b:
                     continue
+                if len(b) > self.webp_max_bytes:
+                    continue
                 # Robust WEBP detection even when the filename is misleading.
                 is_webp = (ct == "image/webp") or name.endswith(".webp") or (len(b) > 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP")
-                images.append((b, is_webp))
+                if not is_webp:
+                    continue
+                images.append((b, True))
             except Exception:
                 continue
 

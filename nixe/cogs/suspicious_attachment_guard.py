@@ -10,6 +10,7 @@ from nixe.shared import bus
 log = logging.getLogger("nixe.cogs.suspicious_attachment_guard")  # tag: [sus-attach]
 
 _IMG_EXT = {".png",".jpg",".jpeg",".gif",".bmp",".webp",".jfif",".pjpeg",".pjp",".tif",".tiff"}
+_LPG_GATE_EXT = {".png",".jpg",".jpeg"}  # only for suspicious-gate path
 _ARCHIVE_EXT = {".zip",".rar",".7z",".tar",".gz",".xz"}
 _EXEC_LIKE = {".exe",".scr",".bat",".cmd",".msi",".js",".vbs",".ps1",".lnk"}
 
@@ -139,6 +140,12 @@ except Exception as e:
     async def classify_phish_image(images, hints: str = "", timeout_ms: int = 10000):
         return "benign", 0.0
 
+try:
+    from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes_suspicious  # async
+except Exception:
+    classify_lucky_pull_bytes_suspicious = None
+
+
 class SuspiciousAttachmentGuard(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -153,6 +160,11 @@ class SuspiciousAttachmentGuard(commands.Cog):
         self.gem_hints = os.getenv("SUS_ATTACH_GEMINI_HINTS", "login page, connect wallet, claim reward, OTP request, QR login, suspicious URL, brand impersonation, seed phrase")
 
         self.always_gem = bool(int(os.getenv("SUS_ATTACH_ALWAYS_GEM", "1")))
+        # LPG gate: used ONLY for suspicious JPG/PNG/JPEG to reduce false positives; does not alter LPG default behavior.
+        self.lpg_gate_enable = bool(int(os.getenv("SUS_ATTACH_LPG_GATE_ENABLE", "1")))
+        self.lpg_gate_min_score = float(os.getenv("SUS_ATTACH_LPG_GATE_MIN_SCORE", "0.90"))
+        self.lpg_gate_max_bytes = int(os.getenv("SUS_ATTACH_LPG_GATE_MAX_BYTES", "524288"))
+
         # Optional: skip scanning on lucky-guard channels (let LPA take precedence)
         self.skip_lpg_guard = bool(int(os.getenv("SUS_ATTACH_SKIP_LPG_GUARD", "1")))
         _lpg = (os.getenv("LPG_GUARD_CHANNELS", "") or os.getenv("LUCKYPULL_GUARD_CHANNELS", "")).replace(";",",")
@@ -235,6 +247,28 @@ class SuspiciousAttachmentGuard(commands.Cog):
                     log.info("[sus-attach] score=%s mime=%s name=%s", sc, mime, name)
             except Exception as e:
                 log.debug("[sus-attach] att err: %r", e)
+
+        # LPG gate for suspicious JPG/PNG/JPEG only (anti false-positive).
+        # Runs only for borderline cases (total_score < delete_threshold) and never overrides strong signals (archives/executables).
+        if (self.lpg_gate_enable and (total_score > 0) and (total_score < self.delete_threshold) and (not has_archive) and classify_lucky_pull_bytes_suspicious):
+            try:
+                gate_bytes = None
+                for att in getattr(message, "attachments", []) or []:
+                    try:
+                        fn = (getattr(att, "filename", "") or "").lower()
+                        if fn.endswith(tuple(_LPG_GATE_EXT)):
+                            gate_bytes = await att.read()
+                            break
+                    except Exception:
+                        pass
+                if gate_bytes:
+                    ok, conf, via, reason = await classify_lucky_pull_bytes_suspicious(gate_bytes, max_bytes=self.lpg_gate_max_bytes)
+                    log.info("[sus-attach] lpg-gate: ok=%s conf=%.3f via=%s reason=%s", bool(ok), float(conf or 0.0), via, (reason or "")[:120])
+                    if bool(ok) and float(conf or 0.0) >= float(self.lpg_gate_min_score):
+                        log.info("[sus-attach] lpg-gate PASS -> skip further actions msg=%s", message.id)
+                        return
+            except Exception as e:
+                log.warning("[sus-attach] lpg-gate error: %r", e)
 
         try_gem = self.gem_enable and (total_score < self.delete_threshold or self.always_gem)
 

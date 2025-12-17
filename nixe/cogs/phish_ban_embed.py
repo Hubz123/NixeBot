@@ -53,6 +53,14 @@ class PhishBanEmbed(commands.Cog):
             reason = str(payload.get("reason") or "")
             evidence = payload.get("evidence") or []
 
+            kind = str(payload.get("kind") or "").strip().lower()
+            # IMPORTANT POLICY:
+            # - Groq vision results are log-only (to avoid false positives).
+            # - Delete/Ban actions are allowed ONLY for pHash matches.
+            is_phash = (provider.lower() == "phash") or kind.startswith("phash")
+            allow_action = bool(is_phash)
+
+
             guild = self.bot.get_guild(int(gid)) if gid else None
             channel = self.bot.get_channel(int(cid)) if cid else None
 
@@ -106,13 +114,16 @@ class PhishBanEmbed(commands.Cog):
                         inline=False,
                     )
 
-                # Send embed to the original channel first; if unavailable, fall back to ban-log channel
-                target = channel
-                if not target and guild:
+                # Send embed to ban-log channel by default (avoid spam in user channels).
+                send_to_origin = (os.getenv("PHISH_EMBED_SEND_TO_ORIGIN", "0") == "1")
+                target = None
+                if guild:
                     try:
                         target = await banlog.get_ban_log_channel(guild)
                     except Exception:
                         target = None
+                if send_to_origin and channel:
+                    target = channel
 
                 if target:
                     try:
@@ -121,7 +132,7 @@ class PhishBanEmbed(commands.Cog):
                         # Logging not critical – continue with delete/ban path
                         pass
 
-            # Auto delete offending message (best-effort, optional)
+            # Auto delete offending message (pHash-only; best-effort, optional)
             # Resolve safe data thread (never delete the mirror/data thread)
             safe_data_thread = 0
             try:
@@ -134,7 +145,7 @@ class PhishBanEmbed(commands.Cog):
             except Exception:
                 safe_data_thread = 0
 
-            if DELETE_MESSAGE and channel and mid:
+            if allow_action and DELETE_MESSAGE and channel and mid:
                 try:
                     if not safe_data_thread or int(channel.id) != safe_data_thread:
                         msg = await channel.fetch_message(int(mid))
@@ -142,8 +153,8 @@ class PhishBanEmbed(commands.Cog):
                 except Exception:
                     pass
 
-            # Auto-ban (optional)
-            if AUTO_BAN and guild and user:
+            # Auto-ban (pHash-only)
+            if allow_action and AUTO_BAN and guild and user:
                 try:
                     await guild.ban(
                         user,

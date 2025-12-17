@@ -312,12 +312,11 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
     """
     Lucky Pull Guard classifier.
 
-    This implementation routes requests through Groq using the GEMINI_* API
-    key env vars (GEMINI_API_KEYS / GEMINI_API_KEY / GEMINI_API_KEY_B).
-    We deliberately do NOT touch GROQ_API_KEY so that the phishing module
-    can keep using it separately.
+    Default behavior (do not alter): no forced shrinking and no forced key preference.
+    Keys are selected from GEMINI_API_KEYS / GEMINI_API_KEY in the declared order.
+    GEMINI_API_KEY_B is NOT prioritized here; it is reserved for the suspicious-gate path.
 
-    Return format remains unchanged:
+    Return format:
         (ok: bool, score: float, via: str, reason: str)
     """
     keys = _env_keys_list()
@@ -332,25 +331,32 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
     img_bytes, mime = _prepare_inline_image(image_bytes)
 
     per_timeout = _pick_timeout_sec()
-    total_budget = _pick_total_budget_sec(per_timeout)
+    total_budget = _pick_total_budget_sec(
+        per_timeout=per_timeout,
+        n_models=len(models),
+        n_keys=len(keys),
+    )
 
-    t0 = time.monotonic()
-    last_via = "gemini:unknown"
-    last_reason = "no_result"
+    last_via, last_reason = "none", "no_attempt"
+    deadline = time.time() + max(3.0, float(total_budget))
 
     for model in models:
         for key in keys:
-            if (time.monotonic() - t0) > total_budget:
-                return False, 0.0, last_via, "timeout_budget"
+            if time.time() > deadline:
+                return False, 0.0, last_via, "timeout_total_budget"
+            try:
+                ok, score, via, reason = await _classify_one(
+                    img_bytes=img_bytes,
+                    mime=mime,
+                    sys_prompt=sys_prompt,
+                    model=model,
+                    api_key=key,
+                    timeout_sec=per_timeout,
+                )
+            except Exception as e:
+                last_via, last_reason = "err", f"err:{type(e).__name__}"
+                continue
 
-            ok, score, via, reason = await _call_groq_lpg_once(
-                key=key,
-                model=model,
-                sys_prompt=sys_prompt,
-                img_bytes=img_bytes,
-                mime=mime,
-                timeout_sec=per_timeout,
-            )
             last_via, last_reason = via, reason
             score = float(score or 0.0)
 
@@ -364,3 +370,114 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
             return bool(ok), score, via, reason or "early(ok)"
 
     return False, 0.0, last_via, last_reason or "parse_error"
+
+
+async def classify_lucky_pull_bytes_suspicious(image_bytes: bytes, max_bytes: int | None = None):
+    """
+    Suspicious-gate variant for JPG/PNG/JPEG only.
+
+    - Best-effort shrink payload to <= max_bytes (default 0.5MB) to reduce cost/latency.
+    - Prefer GEMINI_API_KEY_B when the final payload <= max_bytes.
+    - Does NOT change the behavior of classify_lucky_pull_bytes().
+
+    Return format:
+        (ok: bool, score: float, via: str, reason: str)
+    """
+    if max_bytes is None:
+        max_bytes = int((_env("SUS_ATTACH_LPG_SUSPICIOUS_MAX_BYTES", "524288") or "524288").strip() or 524288)
+
+    # Shrink first (best-effort), then compute key preference.
+    shrunk, _mime = _shrink_for_gemini(image_bytes, max_bytes)
+    keys = _env_keys_list()
+    kb = (_env("GEMINI_API_KEY_B", "") or "").strip()
+
+    if kb and shrunk and (len(shrunk) <= max_bytes):
+        keys = [kb] + [k for k in keys if k != kb]
+
+    if not keys:
+        return False, 0.0, "none", "no_api_key"
+
+    models = _env_models_list()
+    if not models:
+        models = ["meta-llama/llama-4-scout-17b-16e-instruct"]
+
+    sys_prompt = _build_sys_prompt()
+    img_bytes, mime = _prepare_inline_image(shrunk)
+
+    per_timeout = _pick_timeout_sec()
+    total_budget = _pick_total_budget_sec(
+        per_timeout=per_timeout,
+        n_models=len(models),
+        n_keys=len(keys),
+    )
+
+    last_via, last_reason = "none", "no_attempt"
+    deadline = time.time() + max(3.0, float(total_budget))
+
+    for model in models:
+        for key in keys:
+            if time.time() > deadline:
+                return False, 0.0, last_via, "timeout_total_budget"
+            try:
+                ok, score, via, reason = await _classify_one(
+                    img_bytes=img_bytes,
+                    mime=mime,
+                    sys_prompt=sys_prompt,
+                    model=model,
+                    api_key=key,
+                    timeout_sec=per_timeout,
+                )
+            except Exception as e:
+                last_via, last_reason = "err", f"err:{type(e).__name__}"
+                continue
+
+            last_via, last_reason = via, reason
+            score = float(score or 0.0)
+
+            if bool(ok) and score >= 0.9:
+                return True, score, via, reason or "early(ok)"
+
+            rlow = (reason or "").lower()
+            if ("timeout" in rlow) or ("error" in rlow) or ("parse_error" in rlow):
+                continue
+
+            return bool(ok), score, via, reason or "early(ok)"
+
+    return False, 0.0, last_via, last_reason or "parse_error"
+def _shrink_for_gemini(image_bytes: bytes, max_bytes: int) -> tuple[bytes, str]:
+    """Try to ensure payload is <= max_bytes by converting to JPEG and lowering quality."""
+    mime = _sniff_mime(image_bytes)
+    if not image_bytes:
+        return image_bytes, mime
+    if len(image_bytes) <= max_bytes:
+        return image_bytes, mime
+
+    # If PIL is unavailable, we cannot reliably shrink; return as-is.
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        return image_bytes, mime
+
+    try:
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        q = int((_env("LPG_IMG_JPEG_QUALITY", "85") or "85").strip() or 85)
+        q = max(40, min(92, q))
+        best = None
+        for _ in range(10):
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=q, optimize=True)
+            b = buf.getvalue()
+            if len(b) <= max_bytes:
+                return b, "image/jpeg"
+            best = b
+            q = max(30, q - 8)
+        # Fallback: return smallest we got (even if still > max_bytes)
+        if best is not None:
+            return best, "image/jpeg"
+    except Exception:
+        pass
+
+    return image_bytes, mime
+
+
+

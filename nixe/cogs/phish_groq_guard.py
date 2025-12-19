@@ -11,7 +11,7 @@ log = logging.getLogger("nixe.cogs.phish_groq_guard")
 from nixe.helpers.ban_utils import emit_phish_detected
 
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES", "8192"))
-PHISH_WEBP_MAX_BYTES = int(os.getenv("PHISH_WEBP_MAX_BYTES", "1048576"))  # 1MB default
+PHISH_IMAGE_MAX_BYTES = int(os.getenv("PHISH_IMAGE_MAX_BYTES", os.getenv("PHISH_IMAGE_MAX_BYTES", "1048576")))  # 1MB default
 PHISH_SNIFF_FAKE_WEBP = (os.getenv("PHISH_SNIFF_FAKE_WEBP", "1") == "1")
 PHISH_GROQ_SEEN_TTL_SEC = int(os.getenv("PHISH_GROQ_SEEN_TTL_SEC", "300"))
 
@@ -283,7 +283,7 @@ class GroqPhishGuard(commands.Cog):
             if not imgs:
                 return
 
-                        # Only WEBP should go through Groq phishing (precision).
+                        # Only images under the size gate go through Groq phishing; WEBP keeps stricter heuristics.
             # We sniff magic-bytes to catch fake extensions (e.g. image.png that is actually WEBP).
             candidates = []
             timeout = aiohttp.ClientTimeout(total=TIMEOUT_MS / 1000.0)
@@ -296,18 +296,21 @@ class GroqPhishGuard(commands.Cog):
                     if _seen_recent(u):
                         continue
                     seen_urls.add(u)
-                    # size gate for WEBP pipeline
+                    # size gate for phishing image pipeline
                     try:
                         sz = int(getattr(a, 'size', 0) or 0)
                     except Exception:
                         sz = 0
-                    if sz and sz > PHISH_WEBP_MAX_BYTES:
+                    if sz and sz > PHISH_IMAGE_MAX_BYTES:
                         continue
                     is_webp = _is_webp_attachment(a)
                     if (not is_webp) and PHISH_SNIFF_FAKE_WEBP:
                         mt = await _sniff_mime_from_url(_sniff_sess, u)
                         is_webp = (mt == 'image/webp')
-                    if is_webp:
+                    # Candidate policy:
+                    # - Always consider WEBP (and fake-WEBP) under size gate.
+                    # - For non-WEBP (jpg/png/etc), allow if heuristics say it's suspicious OR the message has multiple images.
+                    if is_webp or _sus(a) or len(imgs) > 1:
                         candidates.append(a)
                         _mark_seen(u)
             if not candidates:

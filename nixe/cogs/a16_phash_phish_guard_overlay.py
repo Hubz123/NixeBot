@@ -164,7 +164,7 @@ class PhashPhishGuard(commands.Cog):
         # WEBP pHash matching must be strict to avoid false positives.
         self.bits_max_webp: int = _env_int("PHISH_PHASH_WEBP_MAX_BITS", min(self.bits_max, 6))
         # Only enforce pHash-ban for WEBP under this size.
-        self.webp_max_bytes: int = _env_int("PHISH_WEBP_PHASH_MAX_BYTES", 1000000)
+        self.max_bytes: int = _env_int("PHISH_PHASH_MAX_BYTES", _env_int("PHISH_WEBP_PHASH_MAX_BYTES", 1048576))
         self.seen_ttl_sec: int = _env_int("PHISH_PHASH_SEEN_TTL_SEC", 900)
         self.guard_ids: Set[int] = _env_set("LPG_GUARD_CHANNELS")
         # Channels/threads where pHash phishing guard must NEVER act
@@ -355,24 +355,30 @@ class PhashPhishGuard(commands.Cog):
             looks_image = (ct in allowed_cts) or any(name.endswith(ext) for ext in allowed_exts)
             if not looks_image:
                 continue
-            # Only WEBP goes through phishing pHash-ban pipeline (per policy).
+
+            # Size gate: phishing pHash scan runs ONLY for images <= max_bytes.
+            # Larger images are left for LPG / other pipelines.
+            try:
+                size = int(getattr(a, "size", 0) or 0)
+            except Exception:
+                size = 0
+            if size and size > self.max_bytes:
+                continue
+
             url = getattr(a, "url", None) or ""
-            if url and not _once(f"phash:webp:{url}", ttl=self.seen_ttl_sec):
+            if url and not _once(f"phash:any:{url}", ttl=self.seen_ttl_sec):
                 continue
-            size = int(getattr(a, "size", 0) or 0)
-            if size and size > self.webp_max_bytes:
-                continue
+
             try:
                 b = await a.read()
                 if not b:
                     continue
-                if len(b) > self.webp_max_bytes:
+                # Hard enforce after download as well.
+                if len(b) > self.max_bytes:
                     continue
                 # Robust WEBP detection even when the filename is misleading.
                 is_webp = (ct == "image/webp") or name.endswith(".webp") or (len(b) > 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP")
-                if not is_webp:
-                    continue
-                images.append((b, True))
+                images.append((b, bool(is_webp)))
             except Exception:
                 continue
 

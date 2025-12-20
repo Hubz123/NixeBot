@@ -38,7 +38,7 @@ Optional configs (runtime_env.json or env):
 
 from __future__ import annotations
 
-import os, json, logging, re, asyncio, base64, io
+import os, json, logging, re, asyncio, base64, io, difflib
 from typing import Optional, Tuple, List, Dict, Any
 from urllib import parse as urllib_parse
 
@@ -91,30 +91,57 @@ def _squash_blank_lines(s: str, max_consecutive: int = 2) -> str:
 
 
 def _normalize_for_compare(s: str) -> str:
+    # remove URLs and normalize whitespace/case for robust similarity checks
     s = re.sub(r"https?://\S+", " ", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
+def _tokenize_for_overlap(s: str) -> List[str]:
+    # Prefer word tokens for latin text; keep CJK/Hangul blocks as tokens to avoid losing script info.
+    s = re.sub(r"https?://\S+", " ", s, flags=re.I).lower()
+    tokens = re.findall(r"[a-zA-Z']+|[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+", s)
+    return [t for t in tokens if t]
+
+def _overlap_ratio(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    denom = max(len(sa), len(sb))
+    return inter / denom if denom else 0.0
+
 def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
+    """Heuristic: detect when model returns (mostly) the same text instead of translating."""
     ns = _normalize_for_compare(src)
     no = _normalize_for_compare(out)
     if not ns or not no:
         return False
     if ns == no:
         return True
-    # rough similarity based on char overlap
-    common = sum(1 for a, b in zip(ns, no) if a == b)
-    sim = common / max(len(ns), len(no))
-    if sim > 0.90:
-        return True
-    # if target is latin-based but output is heavy CJK/Hangul, likely untranslated
-    if target_lang.lower() in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl"):
+
+    # Robust similarity (handles insertions/deletions better than zip overlap)
+    try:
+        ratio = difflib.SequenceMatcher(a=ns, b=no).ratio()
+        if ratio >= 0.88:
+            return True
+    except Exception:
+        pass
+
+    # Token overlap as a second signal (helps when formatting changes)
+    try:
+        ta = _tokenize_for_overlap(src)
+        tb = _tokenize_for_overlap(out)
+        if _overlap_ratio(ta, tb) >= 0.80 and max(len(ns), len(no)) >= 80:
+            return True
+    except Exception:
+        pass
+
+    # If target is latin-based but output is heavy CJK/Hangul, likely wrong output language
+    if (target_lang or "").lower() in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl"):
         nonlatin = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", out))
         if nonlatin > 8 and nonlatin / max(1, len(out)) > 0.20:
             return True
     return False
-
-
 def _chunk_text(text: str, max_chars: int) -> List[str]:
     if len(text) <= max_chars:
         return [text]
@@ -530,18 +557,21 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
     ok, out = await _call(base_sys)
     if ok and _seems_untranslated(text, out, target_lang):
         tl = _normalize_lang_code(target_lang)
-        if not (tl == "id" and _is_probably_indonesian(text)):
+        skip = (tl == "id" and _is_probably_indonesian(text))
+        if not skip:
             ok2, out2 = await _call(strict_sys)
             if ok2 and out2:
                 out = out2
-        # HARD-ID-RETRY: Gemini sometimes treats ISO code 'id' ambiguously.
-        if _normalize_lang_code(target_lang) == "id" and ok and _seems_untranslated(text, out, target_lang):
-            hard_sys = _env(
-                "TRANSLATE_SYS_MSG_ID_HARD",
-                f"STRICT MODE. Translate ALL user text into Bahasa Indonesia. "
-                "Output ONLY the Indonesian translation, without the original text. "
+        # HARD-RETRY: if still looks unchanged, push a stricter system prompt.
+        if ok and (not skip) and _seems_untranslated(text, out, target_lang):
+            hard_default = (
+                f"STRICT MODE. Translate ALL user text into {target_label}. "
+                f"Output ONLY the translation in {target_label}, without the original text. "
                 f"Return ONLY compact JSON matching this schema: {schema}. No prose."
             )
+            hard_sys = _env("TRANSLATE_SYS_MSG_HARD", hard_default)
+            if tl == "id":
+                hard_sys = _env("TRANSLATE_SYS_MSG_ID_HARD", hard_sys)
             ok3, out3 = await _call(hard_sys)
             if ok3 and out3:
                 out = out3
@@ -699,8 +729,10 @@ async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     if not key:
         return False, "missing TRANSLATE_GROQ_API_KEY"
     model = _env("TRANSLATE_GROQ_MODEL", "llama-3.1-8b-instant")
+    target_label = _lang_label(target_lang)
     sys_msg = (
-        f"You are a translation engine. Translate user text to {target_lang}. "
+        f"You are a translation engine. Translate the user's text into {target_label}. "
+        f"The output MUST be entirely in {target_label} except proper nouns, usernames, or URLs. "
         "Output ONLY the translation, no commentary."
     )
     try:
@@ -719,6 +751,22 @@ async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
             temperature=0.2,
         )
         out = (resp.choices[0].message.content or "").strip()
+        if _seems_untranslated(text, out, target_lang):
+            strict = (
+                f"STRICT MODE. Translate ALL user text into {target_label}. "
+                f"Output ONLY the translation in {target_label}, without the original text."
+            )
+            resp2 = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": strict},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.2,
+            )
+            out2 = (resp2.choices[0].message.content or "").strip()
+            if out2:
+                out = out2
         return True, out or "(empty)"
     except Exception as e:
         return False, f"Groq request failed: {e!r}"
@@ -1063,12 +1111,14 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         # Hard rule: if target is Indonesian and OCR text already looks Indonesian, keep it unchanged.
         if _should_skip_translation_for_id(detected, target_lang):
             return True, detected, detected, "skip_id_source_is_id"
-        # HARD-ID-RETRY: If target is Indonesian but translation appears unchanged, retry with explicit label.
-        if _normalize_lang_code(target_lang) == "id" and _seems_untranslated(detected, translated, target_lang):
+        # HARD-RETRY: If translation appears unchanged, retry with a stricter, unambiguous instruction.
+        if _seems_untranslated(detected, translated, target_lang):
+            tlab = _lang_label(target_lang)
             prompt2 = (
                 "You are an OCR+translation engine.\n"
                 "1) Extract all readable text from the image.\n"
-                "2) Translate it to Bahasa Indonesia (Indonesian).\n"
+                f"2) Translate it to {tlab}.\n"
+                f"The translation MUST be written entirely in {tlab} (do not keep the original language).\n"
                 f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
                 "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}.\n"
             )

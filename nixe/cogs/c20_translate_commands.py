@@ -147,6 +147,44 @@ def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
     return False
 
 
+
+def _looks_english_global(txt: str) -> bool:
+    t = (txt or "").lower()
+    if not t:
+        return False
+    sw = (" the ", " and ", " to ", " of ", " in ", " is ", " was ", " were ", " with ", " as ", " at ", " for ")
+    score = sum(1 for s in sw if s in f" {t} ")
+    latin = len(re.findall(r"[a-z]", t))
+    return score >= 2 and latin >= 40
+
+
+def _needs_target_enforcement(out: str, target_lang: str) -> bool:
+    """Best-effort check that output matches target language expectation.
+
+    Used to force a second-pass translate when OCR pipelines return the original language.
+    """
+    tl = _normalize_lang_code(target_lang)
+    o = (out or "").strip()
+    if not o:
+        return False
+    if tl == "en":
+        return False
+
+    # Script-based targets should contain their scripts.
+    if tl == "ja":
+        return not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", o)
+    if tl == "ko":
+        return not re.search(r"[\uac00-\ud7af]", o)
+    if tl == "zh":
+        return not re.search(r"[\u3400-\u9fff]", o)
+
+    # Latin-based targets: if output still looks English, enforce.
+    if tl in ("id", "su", "jv"):
+        return _looks_english_global(o)
+
+    return False
+
+
 def _chunk_text(text: str, max_chars: int) -> List[str]:
     if len(text) <= max_chars:
         return [text]
@@ -737,9 +775,10 @@ async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_groq_key()
     if not key:
         return False, "missing TRANSLATE_GROQ_API_KEY"
+    target_label = _lang_label(target_lang)
     model = _env("TRANSLATE_GROQ_MODEL", "llama-3.1-8b-instant")
     sys_msg = (
-        f"You are a translation engine. Translate user text to {target_lang}. "
+        f"You are a translation engine. Translate user text to {target_label}. "
         "Output ONLY the translation, no commentary."
     )
     try:
@@ -1572,14 +1611,10 @@ class TranslateCommands(commands.Cog):
         can_followup = True
         try:
             await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-        except discord.NotFound:
+        except Exception:
+            # Unknown interaction / token expired / already responded / any HTTP issue.
             can_followup = False
             ephemeral = False  # cannot do ephemeral without a valid interaction token
-        except discord.InteractionResponded:
-            can_followup = True
-        except discord.HTTPException:
-            can_followup = False
-            ephemeral = False
 
         async def _safe_followup_text(text: str) -> None:
             txt = (text or "").strip()
@@ -1762,12 +1797,24 @@ class TranslateCommands(commands.Cog):
             detected_final = (detected or "").strip()
             translated_final = (translated_img or "").strip()
 
-            # Pastikan output benar-benar terjemahan (hindari echo OCR yang sering terjadi).
-            if detected_final and (_seems_untranslated(detected_final, translated_final, target_code) or (not translated_final)):
-                ok_t2, t2 = await _gemini_translate_text(detected_final, target_code)
-                if ok_t2 and (t2 or "").strip():
-                    translated_final = (t2 or "").strip()
+            src_check = detected_final or translated_final
 
+            # Pastikan output benar-benar terjemahan (hindari echo OCR / echo source yang sering terjadi).
+            if src_check and (
+                (not translated_final)
+                or _seems_untranslated(src_check, translated_final, target_code)
+                or _needs_target_enforcement(translated_final, target_code)
+            ):
+                ok_t2, t2 = await _gemini_translate_text(src_check, target_code)
+                if ok_t2 and (t2 or '').strip():
+                    translated_final = (t2 or '').strip()
+                else:
+                    ok_g2, g2 = await _groq_translate_text(src_check, target_code)
+                    if ok_g2 and (g2 or '').strip():
+                        translated_final = (g2 or '').strip()
+                    else:
+                        err_msg = (t2 if not ok_t2 else '') or (g2 if not ok_g2 else '') or 'translate_failed'
+                        translated_final = f"_Gagal menerjemahkan (provider error)._\n`{err_msg[:180]}`"
             if not translated_final:
                 translated_final = "_Tidak ada teks terbaca di gambar ini._"
 

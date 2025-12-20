@@ -38,7 +38,7 @@ Optional configs (runtime_env.json or env):
 
 from __future__ import annotations
 
-import os, json, logging, re, asyncio, base64
+import os, json, logging, re, asyncio, base64, io
 from typing import Optional, Tuple, List, Dict, Any
 from urllib import parse as urllib_parse
 
@@ -142,6 +142,72 @@ def _looks_like_only_urls(text: str) -> bool:
     t = re.sub(r"https?://\S+", " ", text, flags=re.I)
     t = re.sub(r"[\W_]+", " ", t)
     return len(t.strip()) == 0
+
+
+def _normalize_lang_code(lang: str) -> str:
+    t = (lang or "").strip().lower()
+    # allow common aliases used in the project
+    if t in ("id-id", "indo", "ind", "indonesia", "bahasa", "bahasa indonesia"):
+        return "id"
+    if t in ("jp", "ja-jp"):
+        return "ja"
+    if t in ("kr", "ko-kr"):
+        return "ko"
+    if t in ("cn", "zh-cn", "zh-hans", "zh-hant", "zh-tw"):
+        return "zh"
+    if t in ("jawa", "javanese"):
+        return "jv"
+    if t in ("sunda", "sundanese"):
+        return "su"
+    return t
+
+
+_ID_STOPWORDS = {
+    "yang","dan","di","ke","dari","untuk","ini","itu","kamu","aku","gue","lu","nya",
+    "ga","gak","nggak","enggak","tidak","bukan","udah","sudah","aja","lah","kok","sih",
+    "juga","bang","cok","woe","mana","kenapa","gimana","apa","tuh","nih","kayak",
+    "kalo","kalau","bisa","ngga","yg","dgn","tp","tapi","karena","soalnya","pake","pakai"
+}
+
+def _is_probably_indonesian(text: str) -> bool:
+    """Heuristic only: detect casual Indonesian so we can avoid paraphrase when target=ID."""
+    if not text:
+        return False
+    t = re.sub(r"\s+", " ", text.strip().lower())
+    if len(t) < 12:
+        return False
+    toks = re.findall(r"[a-zA-Z']+", t)
+    if len(toks) < 4:
+        return False
+    hits = sum(1 for w in toks if w in _ID_STOPWORDS)
+    if hits >= 2:
+        return True
+    if re.search(r"\b(nggak|enggak|tidak|banget|kalo|kalau|udah|sudah|aja|lah|sih|kok)\b", t):
+        return True
+    return False
+
+
+def _should_skip_translation_for_id(source_text: str, target_lang: str) -> bool:
+    return _normalize_lang_code(target_lang) == "id" and _is_probably_indonesian(source_text)
+
+
+def _embed_add_long_field(embed: discord.Embed, name: str, text: str, *, inline: bool = False) -> str:
+    """Add text to embed safely. Returns leftover text (attach to .txt if non-empty)."""
+    txt = (text or "").strip()
+    if not txt:
+        txt = "(empty)"
+    chunks = _chunk_text(txt, 1024)
+    remaining_fields = 25 - len(embed.fields)
+    if remaining_fields <= 0:
+        return txt
+    addable = min(len(chunks), remaining_fields)
+    for i in range(addable):
+        nm = name if len(chunks) == 1 else f"{name} ({i+1}/{len(chunks)})"
+        embed.add_field(name=nm, value=chunks[i] or "(empty)", inline=inline)
+    if addable < len(chunks):
+        leftover = "\n\n".join(chunks[addable:])
+        return leftover
+    return ""
 
 def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
     """Extract readable text from embeds, preferring description."""
@@ -387,6 +453,10 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
 
+    # Hard rule: if target is Indonesian AND source already Indonesian, do not translate (avoid paraphrase).
+    if _should_skip_translation_for_id(text, target_lang):
+        return True, (text or "").strip() or "(empty)"
+
     base_sys = _env(
         "TRANSLATE_SYS_MSG",
         f"You are a translation engine. Translate the user's text into {target_lang}. "
@@ -440,9 +510,11 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     ok, out = await _call(base_sys)
     if ok and _seems_untranslated(text, out, target_lang):
-        ok2, out2 = await _call(strict_sys)
-        if ok2 and out2:
-            out = out2
+        tl = _normalize_lang_code(target_lang)
+        if not (tl == "id" and _is_probably_indonesian(text)):
+            ok2, out2 = await _call(strict_sys)
+            if ok2 and out2:
+                out = out2
     return ok, out
 
 
@@ -957,6 +1029,9 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         detected = _squash_blank_lines(str(j.get("text", "") or ""))
         translated = _squash_blank_lines(str(j.get("translation", "") or ""))
         reason = str(j.get("reason", "") or "ok")
+        # Hard rule: if target is Indonesian and OCR text already looks Indonesian, keep it unchanged.
+        if _should_skip_translation_for_id(detected, target_lang):
+            return True, detected, detected, "skip_id_source_is_id"
         return True, detected, translated, reason
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"
@@ -1420,6 +1495,7 @@ class TranslateCommands(commands.Cog):
         # -------------------------
         raw_text = (getattr(src_msg, "content", "") or "").strip()
         text_for_chat = raw_text
+        raw_text_is_id = _is_probably_indonesian(raw_text)
 
         embeds = list(getattr(src_msg, "embeds", None) or [])
         if embeds:
@@ -1430,9 +1506,16 @@ class TranslateCommands(commands.Cog):
                     text_for_chat = emb_text
                 else:
                     # kalau dua-duanya ada teks, gabungkan supaya info embed juga ikut diterjemahkan
-                    text_for_chat = f"{text_for_chat}\n\n{emb_text}"
+                    if raw_text_is_id:
+                        # Hard rule: ignore Indonesian chat user text; keep embed text only.
+                        text_for_chat = emb_text
+                    else:
+                        text_for_chat = f"{text_for_chat}\n\n{emb_text}"
 
         text_for_chat = (text_for_chat or "").strip()
+        if raw_text_is_id and not embeds:
+            # Hard rule: ignore Indonesian chat user completely when it is the only text.
+            text_for_chat = ""
         # -------------------------
         # 2) Collect images (attachments + embed images)
         # -------------------------
@@ -1512,6 +1595,7 @@ class TranslateCommands(commands.Cog):
             target_display = str(target)
             target_code = str(target or "").strip().lower()
         embed = discord.Embed(title="Translation")
+        attachments_text: List[str] = []
 
         # 3a) Proses gambar-gambar (prioritas)
         image_any_ok = False
@@ -1531,20 +1615,22 @@ class TranslateCommands(commands.Cog):
                 # tampilkan teks asli + terjemahan
                 value_lines = []
                 value_lines.append("**Detected text:**")
-                value_lines.append((detected or "(empty)")[:600])
+                value_lines.append(detected or "(empty)")
                 value_lines.append("")
                 value_lines.append(f"**Translated → {target_display}:**")
-                value_lines.append((translated_img or "(empty)")[:600])
+                value_lines.append(translated_img or "(empty)")
                 val = "\n".join(value_lines)
             else:
                 # tidak ada teks terbaca
                 if (translated_img or "").strip():
                     # kadang model hanya mengembalikan terjemahan
-                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
+                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')}"
                 else:
                     val = "_Tidak ada teks terbaca di gambar ini._"
 
-            embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
+            leftover = _embed_add_long_field(embed, field_name, val, inline=False)
+            if leftover:
+                attachments_text.append(f"\n\n[{field_name}]\n" + leftover)
             image_any_ok = True
 
 
@@ -1702,7 +1788,14 @@ class TranslateCommands(commands.Cog):
                         value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
                         chat_val = "\n".join(value_lines)
         if chat_val is not None:
-            embed.add_field(name="💬 Chat user", value=(chat_val[:1024] or "(empty)"), inline=False)
+            # Hard rule: ignore chat-user segment if the *original* chat text is already Indonesian.
+            # (We check text_for_chat, not chat_val, because chat_val may include translated blocks / labels.)
+            if not _is_probably_indonesian(text_for_chat or ""):
+                leftover = _embed_add_long_field(embed, "💬 Chat user", chat_val, inline=False)
+                if leftover:
+                    attachments_text.append("\n\n[Chat user]\n" + leftover)
+            else:
+                pass
         # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
         if not embed.fields:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
@@ -1712,206 +1805,18 @@ class TranslateCommands(commands.Cog):
         footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
         embed.set_footer(text=" • ".join(footer_bits))
 
-        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        files = None
+        if attachments_text:
+            blob = "\n\n".join([t for t in attachments_text if t and t.strip()]).strip()
+            if blob:
+                files = [discord.File(fp=io.BytesIO(blob.encode("utf-8", errors="ignore")), filename="translation_full.txt")]
+        if files:
+            await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
 
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        """
-        Lightweight text command handler: "nixe translate ke <lang> ..." (no slash).
-
-        Examples:
-          nixe translate ke jp
-          please, marry me
-
-          nixe translate ke id please translate this
-
-        Behaviour:
-        - Only works in guild text channels.
-        - Respects TRANSLATE_TEXT_ENABLE and cooldown (TRANSLATE_COOLDOWN_SEC).
-        - Uses the same Gemini pipelines as context-menu translate, but only for plain text
-          (no embed/image handling here).
-        """
-        try:
-            if message.guild is None:
-                return
-            if message.author.bot:
-                return
-            if not _as_bool("TRANSLATE_ENABLE", True):
-                return
-            if not _as_bool("TRANSLATE_TEXT_ENABLE", True):
-                return
-
-            content = (message.content or "").strip()
-            if not content:
-                return
-
-            low = content.lower()
-            prefix = "nixe translate"
-            if not low.startswith(prefix):
-                return
-
-            # Cooldown per user
-            ok_cd, wait_s = self._cooldown_ok(message.author.id)
-            if not ok_cd:
-                # Ringan saja, jangan spam error.
-                return
-
-            # Split baris; baris pertama command, sisanya teks.
-            lines = content.splitlines()
-            first = lines[0]
-            rest_lines = lines[1:]
-
-            tokens = first.split()
-            # tokens minimal: ["nixe", "translate"]
-            target_token = None
-            # cari pola "ke <lang>"
-            for i, tok in enumerate(tokens):
-                if tok.lower() == "ke" and i + 1 < len(tokens):
-                    target_token = tokens[i + 1]
-                    break
-            if target_token is None and len(tokens) >= 3:
-                # fallback: anggap token ke-3 adalah kode bahasa
-                target_token = tokens[2]
-
-            # Mapping token ke nama bahasa yang dipakai oleh model
-            def _map_lang_token(tok: str) -> str:
-                t = (tok or "").strip().lower()
-                if not t:
-                    return ""
-                if t in ("jp", "ja", "jpn", "japanese", "nihongo", "日本語"):
-                    return "Japanese"
-                if t in ("kr", "ko", "kor", "korean", "hangul", "한국어"):
-                    return "Korean"
-                if t in ("cn", "zh", "zho", "chi", "chinese", "mandarin", "中文", "汉语", "漢語"):
-                    return "Chinese"
-                if t in ("id", "indo", "ind", "indonesian", "bahasa indonesia", "bahasa"):
-                    return "Indonesian"
-                if t in ("en", "eng", "english"):
-                    return "English"
-                if t in ("su", "sun", "sunda", "sundanese", "bahasa sunda"):
-                    return "Sundanese"
-                if t in ("jv", "jav", "jawa", "javanese", "bahasa jawa"):
-                    return "Javanese"
-                if t in ("ar", "arab", "arabic", "العربية"):
-                    return "Arabic"
-                # fallback: pakai apa adanya
-                return tok
-
-            default_target = _env("TRANSLATE_TARGET_LANG", "id")
-            target_lang = _map_lang_token(target_token or default_target)
-
-            # Tentukan teks yang ingin diterjemahkan.
-            if rest_lines:
-                text_to_translate = "\n".join(rest_lines).strip()
-            else:
-                # Ambil token setelah bahasa sebagai teks inline.
-                start_idx = None
-                if target_token is not None:
-                    # cari posisi pertama target_token di tokens
-                    for i, tok in enumerate(tokens):
-                        if tok == target_token:
-                            start_idx = i + 1
-                            break
-                else:
-                    # setelah "nixe translate"
-                    start_idx = 2
-                if start_idx is not None and start_idx < len(tokens):
-                    text_to_translate = " ".join(tokens[start_idx:]).strip()
-                else:
-                    text_to_translate = ""
-
-            # Kalau teks kosong, coba ambil dari message yang di-reply.
-            if not text_to_translate:
-                ref = message.reference
-                if ref and isinstance(ref.resolved, discord.Message):
-                    ref_msg = ref.resolved
-                    text_to_translate = (ref_msg.content or "").strip()
-
-            if not text_to_translate:
-                await message.channel.send(
-                    "Tidak ada teks yang bisa diterjemahkan dari perintah ini.",
-                    reference=message,
-                )
-                return
-
-            # Resolve profil bahasa untuk label dan multi-style.
-            prof = resolve_lang(target_lang)
-            if prof is not None:
-                target_display = prof.display
-                target_code = prof.code.lower()
-            else:
-                target_display = str(target_lang)
-                target_code = str(target_lang or "").strip().lower()
-
-            provider = _pick_provider()  # saat ini selalu "gemini"
-
-            # Jalur multi-style untuk JA/KO/ZH jika diaktifkan.
-            try:
-                if target_code.startswith("ja") and _as_bool("TRANSLATE_JA_DUAL_ENABLE", True):
-                    ok_multi, data = await _gemini_translate_text_ja_multi(text_to_translate)
-                    if not ok_multi:
-                        await message.channel.send(data.get("reason", "Gagal translate ke Jepang."), reference=message)
-                        return
-                    formal = (data.get("formal") or "").strip()
-                    casual = (data.get("casual") or "").strip()
-                    romaji = (data.get("romaji") or "").strip() if _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True) else ""
-                    wuwa = (data.get("wuwa") or "").strip()
-                    wuwa_romaji = (data.get("wuwa_romaji") or "").strip() if _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True) else ""
-                    embed = discord.Embed(title=f"Translation → {target_display}")
-                    embed.add_field(name="Formal (Global)", value=(formal or "(empty)")[:1024], inline=False)
-                    embed.add_field(name="Casual (Global)", value=(casual or "(empty)")[:1024], inline=False)
-                    if romaji:
-                        embed.add_field(name="Romaji (Global)", value=romaji[:1024], inline=False)
-                    if wuwa:
-                        embed.add_field(name="WuWa Gamer", value=wuwa[:1024], inline=False)
-                    if wuwa_romaji:
-                        embed.add_field(name="WuWa Romaji", value=wuwa_romaji[:1024], inline=False)
-                elif target_code.startswith("ko") and _as_bool("TRANSLATE_KO_DUAL_ENABLE", True):
-                    ok_multi, data = await _gemini_translate_text_ko_multi(text_to_translate)
-                    if not ok_multi:
-                        await message.channel.send(data.get("reason", "Gagal translate ke Korea."), reference=message)
-                        return
-                    formal = (data.get("formal") or "").strip()
-                    casual = (data.get("casual") or "").strip()
-                    embed = discord.Embed(title=f"Translation → {target_display}")
-                    embed.add_field(name="Formal", value=(formal or "(empty)")[:1024], inline=False)
-                    embed.add_field(name="Casual", value=(casual or "(empty)")[:1024], inline=False)
-                elif target_code.startswith("zh") and _as_bool("TRANSLATE_ZH_DUAL_ENABLE", True):
-                    ok_multi, data = await _gemini_translate_text_zh_multi(text_to_translate)
-                    if not ok_multi:
-                        await message.channel.send(data.get("reason", "Gagal translate ke Chinese."), reference=message)
-                        return
-                    formal = (data.get("formal") or "").strip()
-                    casual = (data.get("casual") or "").strip()
-                    embed = discord.Embed(title=f"Translation → {target_display}")
-                    embed.add_field(name="Formal", value=(formal or "(empty)")[:1024], inline=False)
-                    embed.add_field(name="Casual", value=(casual or "(empty)")[:1024], inline=False)
-                else:
-                    ok_single, out_single = await _gemini_translate_text(text_to_translate, target_lang)
-                    if not ok_single:
-                        await message.channel.send(out_single, reference=message)
-                        return
-                    translated = (out_single or "").strip()
-                    embed = discord.Embed(title="Translation")
-                    embed.add_field(name="Source", value=(text_to_translate or "(empty)")[:1024], inline=False)
-                    embed.add_field(
-                        name=f"Translated → {target_display}",
-                        value=(translated or "(empty)")[:1024],
-                        inline=False,
-                    )
-
-                footer_bits = [f"text={provider}", "image=gemini", f"target={target_lang}"]
-                embed.set_footer(text=" • ".join(footer_bits))
-
-                await message.channel.send(embed=embed, reference=message)
-            except Exception as e:
-                log.exception("[translate] text-command failed: %s", e)
-                await message.channel.send("Terjadi error saat translate teks ini.", reference=message)
-        except Exception:
-            # Jangan pernah biarkan error di on_message bocor keluar.
-            log.exception("[translate] on_message handler crashed")
-
+    
 
     @commands.Cog.listener()
     async def on_ready(self):

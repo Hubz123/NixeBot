@@ -192,23 +192,26 @@ def _should_skip_translation_for_id(source_text: str, target_lang: str) -> bool:
 
 
 def _embed_add_long_field(embed: discord.Embed, name: str, text: str, *, inline: bool = False) -> str:
-    """Add text to embed safely. Returns leftover text (attach to .txt if non-empty)."""
+    """Add text to embed safely.
+
+    Policy:
+    - Add ONLY ONE field per call (avoid (1/4) split fields).
+    - If the text doesn't fit, return the remainder so the caller can attach it as translation_full.txt.
+    """
     txt = (text or "").strip()
     if not txt:
         txt = "(empty)"
-    chunks = _chunk_text(txt, 1024)
-    remaining_fields = 25 - len(embed.fields)
-    if remaining_fields <= 0:
-        return txt
-    addable = min(len(chunks), remaining_fields)
-    for i in range(addable):
-        nm = name if len(chunks) == 1 else f"{name} ({i+1}/{len(chunks)})"
-        embed.add_field(name=nm, value=chunks[i] or "(empty)", inline=inline)
-    if addable < len(chunks):
-        leftover = "\n\n".join(chunks[addable:])
-        return leftover
-    return ""
 
+    if len(embed.fields) >= 25:
+        return txt
+
+    chunks = _chunk_text(txt, 1024)
+    head = chunks[0] if chunks else "(empty)"
+    embed.add_field(name=name, value=head or "(empty)", inline=inline)
+
+    if len(chunks) <= 1:
+        return ""
+    return "\n\n".join(chunks[1:])
 def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
     """Extract readable text from embeds, preferring description."""
     parts: List[str] = []
@@ -1594,43 +1597,46 @@ class TranslateCommands(commands.Cog):
         else:
             target_display = str(target)
             target_code = str(target or "").strip().lower()
-        embed = discord.Embed(title="Translation")
+        embed = discord.Embed(title=f"Translated → {target_display}")
         attachments_text: List[str] = []
+        desc_parts: List[str] = []
+        full_parts: List[str] = []
 
         # 3a) Proses gambar-gambar (prioritas)
         image_any_ok = False
+        multi_images = len(image_entries) > 1
         for idx, img_bytes in enumerate(image_entries, 1):
             ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, target)
             field_name = f"🖼 Gambar #{idx}"
             if not ok_img:
                 # Gagal untuk gambar ini saja; lanjut ke gambar berikutnya / chat.
-                embed.add_field(
-                    name=field_name,
-                    value=(f"Gagal menerjemahkan gambar ini: {reason}"[:1024] or "(error)"),
-                    inline=False,
-                )
+                err = (f"Gagal menerjemahkan gambar ini: {reason}" or "(error)").strip()
+                if multi_images:
+                    desc_parts.append(f"{field_name}\n{err}")
+                else:
+                    desc_parts.append(err)
+                full_parts.append(f"[{field_name}]\nERROR: {err}")
                 continue
 
-            if (detected or "").strip():
-                # tampilkan teks asli + terjemahan
-                value_lines = []
-                value_lines.append("**Detected text:**")
-                value_lines.append(detected or "(empty)")
-                value_lines.append("")
-                value_lines.append(f"**Translated → {target_display}:**")
-                value_lines.append(translated_img or "(empty)")
-                val = "\n".join(value_lines)
-            else:
-                # tidak ada teks terbaca
-                if (translated_img or "").strip():
-                    # kadang model hanya mengembalikan terjemahan
-                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')}"
-                else:
-                    val = "_Tidak ada teks terbaca di gambar ini._"
+            detected_final = (detected or "").strip()
+            translated_final = (translated_img or "").strip()
 
-            leftover = _embed_add_long_field(embed, field_name, val, inline=False)
-            if leftover:
-                attachments_text.append(f"\n\n[{field_name}]\n" + leftover)
+            # Untuk target ID: pastikan benar-benar terjemahan Indonesia (bukan sekadar echo).
+            if target_code.startswith("id") and detected_final:
+                if (not translated_final) or (translated_final == detected_final):
+                    ok_t2, t2 = await _gemini_translate_text(detected_final, "id")
+                    if ok_t2 and (t2 or "").strip():
+                        translated_final = (t2 or "").strip()
+
+            if not translated_final:
+                translated_final = "_Tidak ada teks terbaca di gambar ini._"
+
+            # Satu embed: tampilkan hanya hasil translate.
+            if multi_images:
+                desc_parts.append(f"{field_name}\n{translated_final}")
+            else:
+                desc_parts.append(translated_final)
+            full_parts.append(f"[{field_name}]\nTRANSLATED → {target_display}:\n{translated_final}")
             image_any_ok = True
 
 
@@ -1733,7 +1739,7 @@ class TranslateCommands(commands.Cog):
                 dual_formal = dual_casual = dual_romaji = ""
 
             # Susun field chat user
-            src_preview = text_for_chat[:600]
+            src_preview = text_for_chat
 
             if dual_kind and (dual_formal or dual_casual or dual_romaji):
                 # Untuk JA/KR/ZH, tampilkan 2 gaya + romanisasi sebagai field terpisah tanpa blok Source
@@ -1796,24 +1802,74 @@ class TranslateCommands(commands.Cog):
                     attachments_text.append("\n\n[Chat user]\n" + leftover)
             else:
                 pass
-        # Kalau embed masih tanpa field (harusnya tidak terjadi), fallback pesan teks.
-        if not embed.fields:
+        # Build single-embed description (image translations are rendered here).
+        desc = "\n\n".join([p for p in desc_parts if p and p.strip()]).strip()
+        desc_full = "\n\n".join([p for p in full_parts if p and p.strip()]).strip()
+
+        # If nothing to show at all, fallback message.
+        if not desc and not embed.fields:
             await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
             return
+
+        truncated = False
+        if desc:
+            # Embed description hard limit ~4096 chars; keep headroom.
+            if len(desc) > 3900:
+                truncated = True
+                desc = desc[:3900].rstrip() + "\n\n(Lanjutan ada di attachment: translation_full.txt)"
+            embed.description = desc
 
         # Footer info provider untuk debug ringan
         footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
         embed.set_footer(text=" • ".join(footer_bits))
 
-        files = None
+        # Attach full text only when needed (e.g., description truncated or leftover from fields).
+        blob_parts: List[str] = []
         if attachments_text:
             blob = "\n\n".join([t for t in attachments_text if t and t.strip()]).strip()
             if blob:
-                files = [discord.File(fp=io.BytesIO(blob.encode("utf-8", errors="ignore")), filename="translation_full.txt")]
-        if files:
-            await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
-        else:
-            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+                blob_parts.append(blob)
+        if truncated and desc_full:
+            blob_parts.append(desc_full)
+
+        files = None
+        if blob_parts:
+            blob2 = "\n\n".join([b for b in blob_parts if b and b.strip()]).strip()
+            if blob2:
+                files = [discord.File(fp=io.BytesIO(blob2.encode("utf-8", errors="ignore")), filename="translation_full.txt")]
+
+        # Prefer replying to the source message in-channel (single visible message).
+        try:
+            if not ephemeral and src_msg and interaction.channel and hasattr(interaction.channel, "send"):
+                ref = None
+                try:
+                    ref = src_msg.to_reference(fail_if_not_exists=False)
+                except Exception:
+                    ref = None
+                send_kwargs = {"embed": embed}
+                if files:
+                    send_kwargs["files"] = files
+                if ref:
+                    send_kwargs["reference"] = ref
+                    send_kwargs["mention_author"] = False
+                await interaction.channel.send(**send_kwargs)
+                # Complete the interaction silently (ephemeral).
+                # Complete interaction without emitting a visible ack (avoid extra 'Sent.' message).
+                try:
+                    await interaction.delete_original_response()
+                except Exception:
+                    pass
+            else:
+                if files:
+                    await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
+                else:
+                    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        except discord.HTTPException:
+            # Fallback to followup if reply-send fails due to perms/limits.
+            if files:
+                await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
+            else:
+                await interaction.followup.send(embed=embed, ephemeral=ephemeral)
 
 
     

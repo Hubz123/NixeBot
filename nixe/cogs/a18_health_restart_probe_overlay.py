@@ -45,6 +45,19 @@ _RESTART_FIELD_NAME = "Restart log"
 _MAX_RESTART_ENTRIES = 50
 
 
+
+
+def _fit_restart_lines(lines: list[str], limit: int = 1024) -> list[str]:
+    """Ensure joined restart_lines fit within Discord embed field limit (1024 chars)."""
+    if not lines:
+        return []
+    out = list(lines)
+    while len("\n".join(out)) > limit and len(out) > 1:
+        out.pop(0)
+    if len("\n".join(out)) > limit and out:
+        s = out[-1]
+        out = [s[: max(0, limit - 1)] + "…"]
+    return out
 class HealthRestartProbeOverlay(commands.Cog):
     """Send health / restart logs into a dedicated thread and sticky embed."""
 
@@ -227,7 +240,7 @@ class HealthRestartProbeOverlay(commands.Cog):
         if restart_lines:
             emb.add_field(
                 name=_RESTART_FIELD_NAME,
-                value="\n".join(restart_lines),
+                value="\n".join(_fit_restart_lines(restart_lines)),
                 inline=False,
             )
         emb.set_footer(text=_STICKY_MARKER)
@@ -248,6 +261,8 @@ class HealthRestartProbeOverlay(commands.Cog):
         restart_lines: list[str] = []
         if msg.embeds:
             restart_lines = self._extract_restart_lines_from_embed(msg.embeds[0])
+
+        restart_lines = _fit_restart_lines(restart_lines)
 
         now = datetime.datetime.now(datetime.timezone.utc)
         emb = self._build_presence_embed(now, restart_lines=restart_lines)
@@ -272,9 +287,12 @@ class HealthRestartProbeOverlay(commands.Cog):
         if msg.embeds:
             restart_lines = self._extract_restart_lines_from_embed(msg.embeds[0])
 
+        restart_lines = _fit_restart_lines(restart_lines)
+
         restart_lines.append(self._format_restart_line())
         if len(restart_lines) > _MAX_RESTART_ENTRIES:
             restart_lines = restart_lines[-_MAX_RESTART_ENTRIES:]
+        restart_lines = _fit_restart_lines(restart_lines)
 
         now = datetime.datetime.now(datetime.timezone.utc)
         emb = self._build_presence_embed(now, restart_lines=restart_lines)

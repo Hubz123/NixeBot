@@ -162,6 +162,21 @@ def _normalize_lang_code(lang: str) -> str:
     return t
 
 
+
+
+def _lang_label(lang_code: str) -> str:
+    """Human-friendly language label for LLM prompts (avoid ambiguous ISO codes like 'id')."""
+    lc = _normalize_lang_code(lang_code)
+    labels = {
+        "id": "Bahasa Indonesia (Indonesian)",
+        "en": "English",
+        "ja": "Japanese",
+        "ko": "Korean",
+        "zh": "Chinese",
+        "jv": "Javanese",
+        "su": "Sundanese",
+    }
+    return labels.get(lc, lc)
 _ID_STOPWORDS = {
     "yang","dan","di","ke","dari","untuk","ini","itu","kamu","aku","gue","lu","nya",
     "ga","gak","nggak","enggak","tidak","bukan","udah","sudah","aja","lah","kok","sih",
@@ -455,6 +470,7 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         return False, "missing TRANSLATE_GEMINI_API_KEY"
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
+    target_label = _lang_label(target_lang)
 
     # Hard rule: if target is Indonesian AND source already Indonesian, do not translate (avoid paraphrase).
     if _should_skip_translation_for_id(text, target_lang):
@@ -462,14 +478,14 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     base_sys = _env(
         "TRANSLATE_SYS_MSG",
-        f"You are a translation engine. Translate the user's text into {target_lang}. "
+        f"You are a translation engine. Translate the user's text into {target_label}. "
         "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
-        f"If the text is already in {target_lang}, return it unchanged. "
+        f"If the text is already in {target_label}, return it unchanged. "
         f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
     strict_sys = _env(
         "TRANSLATE_SYS_MSG_STRICT",
-        f"STRICT MODE. Translate ALL user text into {target_lang}. "
+        f"STRICT MODE. Translate ALL user text into {target_label}. "
         "No source-language remnants except proper nouns/usernames/URLs. "
         f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
@@ -518,6 +534,17 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
             ok2, out2 = await _call(strict_sys)
             if ok2 and out2:
                 out = out2
+        # HARD-ID-RETRY: Gemini sometimes treats ISO code 'id' ambiguously.
+        if _normalize_lang_code(target_lang) == "id" and ok and _seems_untranslated(text, out, target_lang):
+            hard_sys = _env(
+                "TRANSLATE_SYS_MSG_ID_HARD",
+                f"STRICT MODE. Translate ALL user text into Bahasa Indonesia. "
+                "Output ONLY the Indonesian translation, without the original text. "
+                f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+            )
+            ok3, out3 = await _call(hard_sys)
+            if ok3 and out3:
+                out = out3
     return ok, out
 
 
@@ -961,10 +988,11 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
     model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
+    target_label = _lang_label(target_lang)
     prompt = (
         "You are an OCR+translation engine.\n"
         "1) Extract all readable text from the image.\n"
-        f"2) Translate it to {target_lang}.\n"
+        f"2) Translate it to {target_label}.\n"
         f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
         "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
@@ -984,7 +1012,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                     }},
                 ],
             }],
-            "generationConfig": {"temperature": 0.2},
+            "generationConfig": {"temperature": 0.0},
         }
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
@@ -1035,6 +1063,49 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         # Hard rule: if target is Indonesian and OCR text already looks Indonesian, keep it unchanged.
         if _should_skip_translation_for_id(detected, target_lang):
             return True, detected, detected, "skip_id_source_is_id"
+        # HARD-ID-RETRY: If target is Indonesian but translation appears unchanged, retry with explicit label.
+        if _normalize_lang_code(target_lang) == "id" and _seems_untranslated(detected, translated, target_lang):
+            prompt2 = (
+                "You are an OCR+translation engine.\n"
+                "1) Extract all readable text from the image.\n"
+                "2) Translate it to Bahasa Indonesia (Indonesian).\n"
+                f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+                "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}.\n"
+            )
+            payload2 = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt2},
+                        {"inline_data": {
+                            "mime_type": mime,
+                            "data": base64.b64encode(image_bytes).decode("utf-8"),
+                        }},
+                    ],
+                }],
+                "generationConfig": {"temperature": 0.0},
+            }
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                    async with session.post(url, json=payload2) as resp:
+                        data2 = await resp.json(content_type=None)
+                candidates2 = data2.get("candidates") or []
+                parts2 = (((candidates2[0].get("content") or {}).get("parts")) or []) if candidates2 else []
+                out2 = "".join([p.get("text","") for p in parts2 if isinstance(p, dict)])
+                out2 = _clean_output(out2)
+                try:
+                    j2 = json.loads(out2)
+                except Exception:
+                    m22 = re.search(r"\{.*\}", out2, flags=re.DOTALL)
+                    j2 = json.loads(m22.group(0)) if m22 else None
+                if isinstance(j2, dict):
+                    t2 = _squash_blank_lines(str(j2.get("translation","") or ""))
+                    if t2:
+                        translated = t2
+                        reason = str(j2.get("reason","") or reason)
+            except Exception:
+                pass
+
         return True, detected, translated, reason
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"

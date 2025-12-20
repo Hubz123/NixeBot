@@ -91,57 +91,62 @@ def _squash_blank_lines(s: str, max_consecutive: int = 2) -> str:
 
 
 def _normalize_for_compare(s: str) -> str:
-    # remove URLs and normalize whitespace/case for robust similarity checks
     s = re.sub(r"https?://\S+", " ", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s
 
-def _tokenize_for_overlap(s: str) -> List[str]:
-    # Prefer word tokens for latin text; keep CJK/Hangul blocks as tokens to avoid losing script info.
-    s = re.sub(r"https?://\S+", " ", s, flags=re.I).lower()
-    tokens = re.findall(r"[a-zA-Z']+|[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+", s)
-    return [t for t in tokens if t]
-
-def _overlap_ratio(a: List[str], b: List[str]) -> float:
-    if not a or not b:
-        return 0.0
-    sa, sb = set(a), set(b)
-    inter = len(sa & sb)
-    denom = max(len(sa), len(sb))
-    return inter / denom if denom else 0.0
-
 def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
-    """Heuristic: detect when model returns (mostly) the same text instead of translating."""
+    """Heuristic to detect when a model likely echoed the source instead of translating."""
     ns = _normalize_for_compare(src)
     no = _normalize_for_compare(out)
     if not ns or not no:
         return False
+
+    tl = _normalize_lang_code(target_lang)
+
     if ns == no:
         return True
 
-    # Robust similarity (handles insertions/deletions better than zip overlap)
+    # Robust similarity (handles whitespace / line breaks better than zip-compare)
     try:
-        ratio = difflib.SequenceMatcher(a=ns, b=no).ratio()
-        if ratio >= 0.88:
+        if difflib.SequenceMatcher(None, ns, no).ratio() > 0.92:
             return True
     except Exception:
         pass
 
-    # Token overlap as a second signal (helps when formatting changes)
-    try:
-        ta = _tokenize_for_overlap(src)
-        tb = _tokenize_for_overlap(out)
-        if _overlap_ratio(ta, tb) >= 0.80 and max(len(ns), len(no)) >= 80:
-            return True
-    except Exception:
-        pass
+    # English-echo detector: if target is NOT English, but output still looks English,
+    # treat it as untranslated (common failure mode on OCR pipelines).
+    def _looks_english(txt: str) -> bool:
+        t = (txt or "").lower()
+        if not t:
+            return False
+        # quick stopword score
+        sw = ("the ", " and ", " to ", " of ", " in ", " is ", " was ", " were ", " with ", " as ", " at ", " for ")
+        score = sum(1 for s in sw if s in t)
+        # also require mostly latin letters
+        latin = len(re.findall(r"[a-z]", t))
+        return score >= 2 and latin >= 40
 
-    # If target is latin-based but output is heavy CJK/Hangul, likely wrong output language
-    if (target_lang or "").lower() in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl"):
+    if tl != "en" and _looks_english(src) and _looks_english(out):
+        return True
+
+    # Script expectations for certain targets (best-effort).
+    if tl == "ja" and _looks_english(src) and not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", out):
+        return True
+    if tl == "ko" and _looks_english(src) and not re.search(r"[\uac00-\ud7af]", out):
+        return True
+    if tl == "zh" and _looks_english(src) and not re.search(r"[\u3400-\u9fff]", out):
+        return True
+
+    # If target is latin-based but output is heavy CJK/Hangul, likely untranslated / wrong-mode.
+    if tl in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl", "su", "jv"):
         nonlatin = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", out))
         if nonlatin > 8 and nonlatin / max(1, len(out)) > 0.20:
             return True
+
     return False
+
+
 def _chunk_text(text: str, max_chars: int) -> List[str]:
     if len(text) <= max_chars:
         return [text]
@@ -173,22 +178,29 @@ def _looks_like_only_urls(text: str) -> bool:
 
 def _normalize_lang_code(lang: str) -> str:
     t = (lang or "").strip().lower()
-    # allow common aliases used in the project
-    if t in ("id-id", "indo", "ind", "indonesia", "bahasa", "bahasa indonesia"):
+
+    # allow common aliases / display names used across Nixe configs
+    if t in (
+        "id", "id-id", "indo", "ind", "indonesia", "indonesian",
+        "bahasa", "bahasa indonesia",
+    ):
         return "id"
-    if t in ("jp", "ja-jp"):
+    if t in ("en", "en-us", "en-gb", "english"):
+        return "en"
+    if t in ("jp", "ja-jp", "japanese", "nihongo", "日本語"):
         return "ja"
-    if t in ("kr", "ko-kr"):
+    if t in ("kr", "ko-kr", "korean", "한국어"):
         return "ko"
-    if t in ("cn", "zh-cn", "zh-hans", "zh-hant", "zh-tw"):
+    if t in (
+        "cn", "zh-cn", "zh-hans", "zh-hant", "zh-tw",
+        "chinese", "中文",
+    ):
         return "zh"
-    if t in ("jawa", "javanese"):
+    if t in ("jawa", "javanese", "jv", "bahasa jawa"):
         return "jv"
-    if t in ("sunda", "sundanese"):
+    if t in ("sunda", "sundanese", "su", "bahasa sunda"):
         return "su"
     return t
-
-
 
 
 def _lang_label(lang_code: str) -> str:
@@ -557,21 +569,18 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
     ok, out = await _call(base_sys)
     if ok and _seems_untranslated(text, out, target_lang):
         tl = _normalize_lang_code(target_lang)
-        skip = (tl == "id" and _is_probably_indonesian(text))
-        if not skip:
+        if not (tl == "id" and _is_probably_indonesian(text)):
             ok2, out2 = await _call(strict_sys)
             if ok2 and out2:
                 out = out2
-        # HARD-RETRY: if still looks unchanged, push a stricter system prompt.
-        if ok and (not skip) and _seems_untranslated(text, out, target_lang):
-            hard_default = (
-                f"STRICT MODE. Translate ALL user text into {target_label}. "
-                f"Output ONLY the translation in {target_label}, without the original text. "
+        # HARD-ID-RETRY: Gemini sometimes treats ISO code 'id' ambiguously.
+        if _normalize_lang_code(target_lang) == "id" and ok and _seems_untranslated(text, out, target_lang):
+            hard_sys = _env(
+                "TRANSLATE_SYS_MSG_ID_HARD",
+                f"STRICT MODE. Translate ALL user text into Bahasa Indonesia. "
+                "Output ONLY the Indonesian translation, without the original text. "
                 f"Return ONLY compact JSON matching this schema: {schema}. No prose."
             )
-            hard_sys = _env("TRANSLATE_SYS_MSG_HARD", hard_default)
-            if tl == "id":
-                hard_sys = _env("TRANSLATE_SYS_MSG_ID_HARD", hard_sys)
             ok3, out3 = await _call(hard_sys)
             if ok3 and out3:
                 out = out3
@@ -729,10 +738,8 @@ async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     if not key:
         return False, "missing TRANSLATE_GROQ_API_KEY"
     model = _env("TRANSLATE_GROQ_MODEL", "llama-3.1-8b-instant")
-    target_label = _lang_label(target_lang)
     sys_msg = (
-        f"You are a translation engine. Translate the user's text into {target_label}. "
-        f"The output MUST be entirely in {target_label} except proper nouns, usernames, or URLs. "
+        f"You are a translation engine. Translate user text to {target_lang}. "
         "Output ONLY the translation, no commentary."
     )
     try:
@@ -751,22 +758,6 @@ async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
             temperature=0.2,
         )
         out = (resp.choices[0].message.content or "").strip()
-        if _seems_untranslated(text, out, target_lang):
-            strict = (
-                f"STRICT MODE. Translate ALL user text into {target_label}. "
-                f"Output ONLY the translation in {target_label}, without the original text."
-            )
-            resp2 = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": strict},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.2,
-            )
-            out2 = (resp2.choices[0].message.content or "").strip()
-            if out2:
-                out = out2
         return True, out or "(empty)"
     except Exception as e:
         return False, f"Groq request failed: {e!r}"
@@ -1102,7 +1093,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             text_match = re.search(r'"text"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
             trans_match = re.search(r'"translation"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
             detected = _squash_blank_lines(text_match.group(1)) if text_match else out
-            translated = _squash_blank_lines(trans_match.group(1)) if trans_match else detected
+            translated = _squash_blank_lines(trans_match.group(1)) if trans_match else ""
             return True, detected, translated, "non_json_output"
 
         detected = _squash_blank_lines(str(j.get("text", "") or ""))
@@ -1111,14 +1102,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         # Hard rule: if target is Indonesian and OCR text already looks Indonesian, keep it unchanged.
         if _should_skip_translation_for_id(detected, target_lang):
             return True, detected, detected, "skip_id_source_is_id"
-        # HARD-RETRY: If translation appears unchanged, retry with a stricter, unambiguous instruction.
-        if _seems_untranslated(detected, translated, target_lang):
-            tlab = _lang_label(target_lang)
+        # HARD-ID-RETRY: If target is Indonesian but translation appears unchanged, retry with explicit label.
+        if _normalize_lang_code(target_lang) == "id" and _seems_untranslated(detected, translated, target_lang):
             prompt2 = (
                 "You are an OCR+translation engine.\n"
                 "1) Extract all readable text from the image.\n"
-                f"2) Translate it to {tlab}.\n"
-                f"The translation MUST be written entirely in {tlab} (do not keep the original language).\n"
+                "2) Translate it to Bahasa Indonesia (Indonesian).\n"
                 f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
                 "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}.\n"
             )
@@ -1577,7 +1566,38 @@ class TranslateCommands(commands.Cog):
             return
 
         ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
-        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+
+        # Acknowledge ASAP; if the interaction token has expired (Unknown interaction),
+        # we fall back to in-channel send to avoid traceback.
+        can_followup = True
+        try:
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        except discord.NotFound:
+            can_followup = False
+            ephemeral = False  # cannot do ephemeral without a valid interaction token
+        except discord.InteractionResponded:
+            can_followup = True
+        except discord.HTTPException:
+            can_followup = False
+            ephemeral = False
+
+        async def _safe_followup_text(text: str) -> None:
+            txt = (text or "").strip()
+            if not txt:
+                return
+            if can_followup:
+                try:
+                    await interaction.followup.send(txt, ephemeral=ephemeral)
+                    return
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    pass
+            try:
+                if interaction.channel and hasattr(interaction.channel, "send"):
+                    await interaction.channel.send(txt)
+            except Exception:
+                pass
 
         # Context-menu provides a partial Message; refetch for full embeds/attachments.
         try:
@@ -1704,7 +1724,7 @@ class TranslateCommands(commands.Cog):
 
         # Jika tidak ada teks chat/embed dan tidak ada gambar sama sekali -> langsung beri pesan kosong.
         if not text_for_chat and not image_entries:
-            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
+            await _safe_followup_text("Tidak ada teks yang bisa diterjemahkan dari pesan ini.")
             return
 
         # -------------------------
@@ -1742,12 +1762,11 @@ class TranslateCommands(commands.Cog):
             detected_final = (detected or "").strip()
             translated_final = (translated_img or "").strip()
 
-            # Untuk target ID: pastikan benar-benar terjemahan Indonesia (bukan sekadar echo).
-            if target_code.startswith("id") and detected_final:
-                if (not translated_final) or (translated_final == detected_final):
-                    ok_t2, t2 = await _gemini_translate_text(detected_final, "id")
-                    if ok_t2 and (t2 or "").strip():
-                        translated_final = (t2 or "").strip()
+            # Pastikan output benar-benar terjemahan (hindari echo OCR yang sering terjadi).
+            if detected_final and (_seems_untranslated(detected_final, translated_final, target_code) or (not translated_final)):
+                ok_t2, t2 = await _gemini_translate_text(detected_final, target_code)
+                if ok_t2 and (t2 or "").strip():
+                    translated_final = (t2 or "").strip()
 
             if not translated_final:
                 translated_final = "_Tidak ada teks terbaca di gambar ini._"
@@ -1815,7 +1834,7 @@ class TranslateCommands(commands.Cog):
                             # fallback: single-mode translate seluruh teks supaya hasil tetap ada
                             ok_single, out_single = await _gemini_translate_text(text_for_chat, target)
                             if not ok_single:
-                                await interaction.followup.send(out_single, ephemeral=ephemeral)
+                                await _safe_followup_text(out_single)
                                 return
                             translated_chat = out_single.strip()
                             ja_dual_enable = ko_dual_enable = zh_dual_enable = False
@@ -1848,7 +1867,7 @@ class TranslateCommands(commands.Cog):
                         # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
                         ok, out = await _gemini_translate_text(ch, target)
                         if not ok:
-                            await interaction.followup.send(out, ephemeral=ephemeral)
+                            await _safe_followup_text(out)
                             return
                         out_parts.append(out)
                     translated_chat = "\n".join(out_parts).strip()
@@ -1929,7 +1948,7 @@ class TranslateCommands(commands.Cog):
 
         # If nothing to show at all, fallback message.
         if not desc and not embed.fields:
-            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
+            await _safe_followup_text("Tidak ada teks yang bisa diterjemahkan dari pesan ini.")
             return
 
         truncated = False
@@ -1981,16 +2000,32 @@ class TranslateCommands(commands.Cog):
                 except Exception:
                     pass
             else:
+                if not can_followup and interaction.channel and hasattr(interaction.channel, "send"):
+                    send_kwargs = {"embed": embed}
+                    if files:
+                        send_kwargs["files"] = files
+                    await interaction.channel.send(**send_kwargs)
+                else:
+                    if files:
+                        await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
+                    else:
+                        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+        except discord.HTTPException:
+            # Fallback if reply-send fails due to perms/limits.
+            if interaction.channel and hasattr(interaction.channel, "send"):
+                try:
+                    send_kwargs = {"embed": embed}
+                    if files:
+                        send_kwargs["files"] = files
+                    await interaction.channel.send(**send_kwargs)
+                    return
+                except Exception:
+                    pass
+            if can_followup:
                 if files:
                     await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
                 else:
                     await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-        except discord.HTTPException:
-            # Fallback to followup if reply-send fails due to perms/limits.
-            if files:
-                await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
-            else:
-                await interaction.followup.send(embed=embed, ephemeral=ephemeral)
 
 
     

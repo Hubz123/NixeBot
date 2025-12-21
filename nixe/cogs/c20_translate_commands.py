@@ -314,6 +314,16 @@ def _is_probably_indonesian(text: str) -> bool:
 
     # Token-based stopword heuristic
     toks = re.findall(r"[a-zA-Z']+", t)
+
+    # Very short (1-2 tokens): treat common Indonesian UI words as Indonesian to avoid re-translation.
+    short_ui = {
+        'masuk','keluar','batal','konfirmasi','lanjut','kembali','daftar','kirim','simpan','hapus',
+        'verifikasi','kode','pengaturan','beranda','akun','sandi','kata sandi','nama','alamat','telepon','email'
+    }
+    if len(toks) <= 2:
+        if t in short_ui or any(w in short_ui for w in toks):
+            return True
+
     if len(toks) < 2:
         return False
 
@@ -601,8 +611,8 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
     if _should_skip_translation_for_id(text, target_code):
         return True, (text or "").strip() or "(empty)"
 
-    model_primary = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
-    model_strong = _env("TRANSLATE_GEMINI_MODEL_STRONG", "gemini-2.5-flash")
+    model_primary = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
+    model_strong = _env("TRANSLATE_GEMINI_MODEL_STRONG", model_primary)
 
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
 
@@ -624,10 +634,9 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         "If you are uncertain, still translate faithfully. "
         "ABSOLUTELY NO English sentences unless they are proper nouns/URLs."
     )
-
     src = (text or "").strip()
     if not src:
-        return True, "(empty)"
+        return False, "empty_source"
 
     async def _call(model: str, sys_msg: str) -> Tuple[bool, str]:
         try:
@@ -663,15 +672,39 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
                             out += p["text"]
                     out = _clean_output(out)
 
-                    # Accept JSON or plain text fallback
+                    # Accept JSON or plain text fallback.
+                    #
+                    # IMPORTANT: Gemini occasionally returns JSON with different key names
+                    # (e.g., translatedText/output/result). Returning "(empty)" as a
+                    # "successful" translation causes downstream to show `translate_failed`.
+                    # Treat empty outputs as a failure so we can retry / surface the real error.
                     out2 = ""
                     try:
                         jj = json.loads(out)
-                        out2 = str(jj.get("translation", "") or "").strip()
+                        if isinstance(jj, dict):
+                            for k in ("translation", "translated", "translated_text", "translatedText", "output", "result"):
+                                v = jj.get(k, None)
+                                if isinstance(v, str) and v.strip():
+                                    out2 = v.strip()
+                                    break
+                            # If still empty, sometimes the model nests it.
+                            if not out2:
+                                v2 = jj.get("data", None)
+                                if isinstance(v2, dict):
+                                    for k in ("translation", "translated", "translated_text", "translatedText", "output", "result"):
+                                        vv = v2.get(k, None)
+                                        if isinstance(vv, str) and vv.strip():
+                                            out2 = vv.strip()
+                                            break
+                        elif isinstance(jj, str):
+                            out2 = jj.strip()
                     except Exception:
                         out2 = out.strip()
 
-                    return True, out2 or "(empty)"
+                    if not out2 or out2.strip() in ("(empty)", "empty"):
+                        return False, "empty_translation"
+                    return True, out2
+
         except Exception as e:
             return False, f"Gemini request failed: {e!r}"
 
@@ -769,7 +802,7 @@ async def _call_with_model(sys_msg: str, model_override: str, temperature: float
             _seems_untranslated(text, out, target_lang)
             or _needs_target_enforcement(out, target_lang)
         ):
-            strong_model = _env("TRANSLATE_GEMINI_MODEL_STRONG", "gemini-2.5-flash")
+            strong_model = _env("TRANSLATE_GEMINI_MODEL_STRONG", _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash"))
             final_sys = _env(
                 "TRANSLATE_SYS_MSG_FINAL_STRICT",
                 f"FINAL STRICT MODE. Translate the user's text into {target_label}. "
@@ -815,7 +848,7 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
-    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
     schema = _env(
         "TRANSLATE_JA_SCHEMA",
         '{"formal": "...", "casual": "...", "romaji": "...", "wuwa": "...", "wuwa_romaji": "...", "reason": "..."}',
@@ -970,7 +1003,7 @@ async def _gemini_translate_text_ko_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
-    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
     schema = _env(
         "TRANSLATE_KO_SCHEMA",
         '{"formal": "...", "casual": "...", "romaji": "...", "reason": "..."}',
@@ -1087,7 +1120,7 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
-    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
     schema = _env(
         "TRANSLATE_ZH_SCHEMA",
         '{"formal": "...", "casual": "...", "romaji": "...", "reason": "..."}',
@@ -1203,7 +1236,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
-    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
+    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
     target_label = _lang_label(target_lang)
     prompt = (
@@ -1223,8 +1256,8 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                 "role": "user",
                 "parts": [
                     {"text": prompt},
-                    {"inline_data": {
-                        "mime_type": mime,
+                    {"inlineData": {
+                        "mimeType": mime,
                         "data": base64.b64encode(image_bytes).decode("utf-8"),
                     }},
                 ],
@@ -1234,6 +1267,9 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
             async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return False, "", "", f"gemini_vision_http_{resp.status}:{body[:220]}"
                 data = await resp.json(content_type=None)
 
         candidates = data.get("candidates") or []
@@ -1294,8 +1330,8 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                     "role": "user",
                     "parts": [
                         {"text": prompt2},
-                        {"inline_data": {
-                            "mime_type": mime,
+                        {"inlineData": {
+                            "mimeType": mime,
                             "data": base64.b64encode(image_bytes).decode("utf-8"),
                         }},
                     ],
@@ -1305,6 +1341,10 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
                     async with session.post(url, json=payload2) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            # If retry also fails, keep original result.
+                            raise RuntimeError(f"gemini_vision_retry_http_{resp.status}:{body[:220]}")
                         data2 = await resp.json(content_type=None)
                 candidates2 = data2.get("candidates") or []
                 parts2 = (((candidates2[0].get("content") or {}).get("parts")) or []) if candidates2 else []
@@ -1960,9 +2000,16 @@ class TranslateCommands(commands.Cog):
                 if ok_t2 and t2s and (not _seems_untranslated(src_check, t2s, img_target_code)) and (not _needs_target_enforcement(t2s, img_target_code)):
                     translated_final = t2s
                 else:
-                    # Policy: do NOT fall back to Groq for translate. If Gemini fails, report error safely.
-                    err_msg = (t2 if not ok_t2 else '') or 'translate_failed'
-                    translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
+                    # Policy: do NOT fall back to Groq for translate.
+                    # If this secondary enforcement step fails, do NOT overwrite an existing translation.
+                    if not translated_final:
+                        # If enforcement fails, surface a specific reason instead of generic "translate_failed".
+                        if not ok_t2:
+                            err_msg = (t2 or "").strip() or "translate_failed"
+                        else:
+                            # ok_t2=True but output got rejected by heuristics
+                            err_msg = "empty_translation" if not t2s else "untranslated_output"
+                        translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
             if not translated_final:
                 translated_final = "_Tidak ada teks terbaca di gambar ini._"
 

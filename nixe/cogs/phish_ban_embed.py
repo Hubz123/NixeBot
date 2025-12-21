@@ -12,6 +12,7 @@ log = logging.getLogger("nixe.cogs.phish_ban_embed")
 EMBED_COLOR = int(os.getenv("PHISH_EMBED_COLOR", "16007990"))  # default orange 0xF4511E
 DELETE_AFTER_SECONDS = int(os.getenv("PHISH_EMBED_TTL", os.getenv("BAN_EMBED_TTL_SEC", "3600")))
 AUTO_BAN = (os.getenv("PHISH_AUTO_BAN", "0") == "1" or os.getenv("PHISH_AUTOBAN", "0") == "1")
+PHISH_AUTOBAN_ON_PHASH = (os.getenv("PHISH_AUTOBAN_ON_PHASH", "0").strip().lower() in ("1","true","yes","on"))
 DELETE_MESSAGE = (os.getenv("PHISH_DELETE_MESSAGE", "1") == "1")
 
 # When BAN_UNIFIER_ENABLE=1 we normally let BanTemplateUnifier handle the
@@ -57,8 +58,11 @@ class PhishBanEmbed(commands.Cog):
             # IMPORTANT POLICY:
             # - Groq vision results are log-only (to avoid false positives).
             # - Delete/Ban actions are allowed ONLY for pHash matches.
-            is_phash = (provider.lower() == "phash") or kind.startswith("phash")
-            allow_action = bool(is_phash)
+            is_phash_confirmed = (provider.lower() == "phash") or kind.startswith("phash")
+            is_phash_autolearn = (provider.lower() == "phash-autolearn")
+            allow_log = bool(is_phash_confirmed or is_phash_autolearn)
+            allow_delete = bool(is_phash_confirmed)
+
 
 
             guild = self.bot.get_guild(int(gid)) if gid else None
@@ -145,7 +149,7 @@ class PhishBanEmbed(commands.Cog):
             except Exception:
                 safe_data_thread = 0
 
-            if allow_action and DELETE_MESSAGE and channel and mid:
+            if allow_delete and DELETE_MESSAGE and channel and mid:
                 try:
                     if not safe_data_thread or int(channel.id) != safe_data_thread:
                         msg = await channel.fetch_message(int(mid))
@@ -153,8 +157,8 @@ class PhishBanEmbed(commands.Cog):
                 except Exception:
                     pass
 
-            # Auto-ban (pHash-only)
-            if allow_action and AUTO_BAN and guild and user:
+            # Auto-ban (pHash confirmed only; gated by PHISH_AUTOBAN_ON_PHASH=1)
+            if allow_delete and AUTO_BAN and guild and user and PHISH_AUTOBAN_ON_PHASH:
                 try:
                     await guild.ban(
                         user,

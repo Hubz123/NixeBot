@@ -69,50 +69,45 @@ def _env_set(name: str) -> Set[int]:
             continue
     return out
 
-def _load_phash_list_from_content(content: str) -> Set[int]:
-    """Parse pinned message content into a set of 64-bit int hashes.
-
-    Expected formats:
-    - Pure JSON: {"phash":["809c7d...","82ca6d...", ...]}
-    - JSON wrapped in ```json ... ``` code block.
-    - JSON preceded/followed by marker lines (e.g. [phash-db-board]).
+def _load_phash_list_from_content(content: str) -> Tuple[Set[int], Set[int]]:
+    """Parse pinned message content into two sets:
+    - confirmed pHash tokens (plain hex strings)
+    - autolearn pHash tokens (prefixed with "a:")
     """
     if not content:
-        return set()
+        return set(), set()
 
     text = content.strip()
     data: Optional[object] = None
 
-    # Try raw JSON first (strict)
     try:
         data = json.loads(text)
     except Exception:
-        # Maybe code block
-        if text.startswith("```") and text.endswith("```"):
-            inner = text.strip("`\n ")
-            # Drop leading language hint if any
-            lines = inner.splitlines()
-            if lines and not lines[0].lstrip().startswith("{"):
-                inner = "\n".join(lines[1:])
-            try:
+        data = None
+
+    if data is None and "```" in text:
+        try:
+            s0 = text.find("```")
+            e0 = text.rfind("```")
+            if s0 != -1 and e0 != -1 and e0 > s0:
+                inner = text[s0 + 3 : e0].strip()
+                lines = inner.splitlines()
+                if lines and not lines[0].lstrip().startswith("{"):
+                    inner = "\n".join(lines[1:])
                 data = json.loads(inner)
-            except Exception:
-                # fall back to loose scan below
-                data = None
-        else:
+        except Exception:
             data = None
 
-    # Loose fallback: extract first {...} block in the text (to support marker headers)
     if data is None:
         start_brace = text.find("{")
         end_brace = text.rfind("}")
         if start_brace == -1 or end_brace == -1 or end_brace <= start_brace:
-            return set()
+            return set(), set()
         inner = text[start_brace : end_brace + 1]
         try:
             data = json.loads(inner)
         except Exception:
-            return set()
+            return set(), set()
 
     seq = None
     if isinstance(data, dict):
@@ -120,31 +115,29 @@ def _load_phash_list_from_content(content: str) -> Set[int]:
     elif isinstance(data, list):
         seq = data
     else:
-        return set()
+        seq = []
 
-    result: Set[int] = set()
-    for v in seq:
-        s = str(v).strip().lower()
-        if not s:
-            continue
+    confirmed: Set[int] = set()
+    autolearn: Set[int] = set()
+
+    for item in (seq or []):
         try:
-            if s.startswith("0x"):
-                result.add(int(s, 16))
+            raw = str(item).strip()
+            if not raw:
                 continue
-        except Exception:
-            pass
-        try:
-            # assume hex string
-            if all(c in "0123456789abcdef" for c in s) and len(s) <= 32:
-                result.add(int(s, 16))
-                continue
-        except Exception:
-            pass
-        try:
-            result.add(int(s))
+            is_auto = False
+            if raw.lower().startswith("a:"):
+                is_auto = True
+                raw = raw[2:].strip()
+            if raw.lower().startswith("0x"):
+                raw = raw[2:].strip()
+            hv = int(raw, 16)
+            (autolearn if is_auto else confirmed).add(hv)
         except Exception:
             continue
-    return result
+
+    return confirmed, autolearn
+
 
 
 class PhashPhishGuard(commands.Cog):
@@ -159,7 +152,8 @@ class PhashPhishGuard(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._hashes: Set[int] = set()
+        self._hashes_confirmed: Set[int] = set()
+        self._hashes_autolearn: Set[int] = set()
         self.bits_max: int = _env_int("PHASH_MATCH_DELETE_MAX_BITS", 12)
         # WEBP pHash matching must be strict to avoid false positives.
         self.bits_max_webp: int = _env_int("PHISH_PHASH_WEBP_MAX_BITS", min(self.bits_max, 6))
@@ -283,24 +277,29 @@ class PhashPhishGuard(commands.Cog):
             except Exception:
                 pass
 
-        merged: Set[int] = set()
+        merged_confirmed: Set[int] = set()
+        merged_autolearn: Set[int] = set()
         for m2 in msgs:
             try:
-                merged |= _load_phash_list_from_content(getattr(m2, "content", "") or "")
+                cset, aset = _load_phash_list_from_content(getattr(m2, "content", "") or "")
+                merged_confirmed |= cset
+                merged_autolearn |= aset
             except Exception:
                 continue
 
-        if not merged:
+        if not merged_confirmed and not merged_autolearn:
             log.warning(
                 "[phash-phish] db parse yields 0 hashes (thread=%s)",
                 getattr(ch, "id", 0) if ch else 0,
             )
             return
 
-        self._hashes = merged
+        self._hashes_confirmed = merged_confirmed
+        self._hashes_autolearn = merged_autolearn
         log.warning(
-            "[phash-phish] loaded %d hashes (thread=%s)",
-            len(merged),
+            "[phash-phish] loaded confirmed=%d autolearn=%d (thread=%s)",
+            len(merged_confirmed),
+            len(merged_autolearn),
             getattr(ch, "id", 0) if ch else 0,
         )
 
@@ -335,7 +334,7 @@ class PhashPhishGuard(commands.Cog):
         return cid in self.guard_ids or (pid and pid in self.guard_ids)
 
     async def _scan_message(self, m: discord.Message) -> None:
-        if not self._hashes:
+        if not self._hashes_confirmed and not self._hashes_autolearn:
             return
         if m.author.bot:
             return
@@ -345,10 +344,16 @@ class PhashPhishGuard(commands.Cog):
         if not self._should_guard_channel(ch):
             return
 
-        # Collect candidate image attachments (PNG/JPEG/WEBP/GIF).
+        # Collect candidate image attachments (filtered by PHISH_PHASH_EXTS).
         images: List[Tuple[bytes, bool]] = []  # (raw_bytes, is_webp)
-        allowed_exts = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-        allowed_cts = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif")
+        exts_env = os.getenv("PHISH_PHASH_EXTS", "webp,png").lower()
+        allowed_exts = tuple(sorted({('.' + e.strip().lstrip('.')) for e in exts_env.split(',') if e.strip()}))
+        ct_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif'}
+        allowed_cts = tuple(sorted({ct_map.get(ext) for ext in allowed_exts if ct_map.get(ext)}))
+        if not allowed_exts:
+            allowed_exts = ('.webp', '.png')
+        if not allowed_cts:
+            allowed_cts = ('image/webp', 'image/png')
         for a in getattr(m, "attachments", []) or []:
             name = (getattr(a, "filename", "") or "").lower()
             ct = (getattr(a, "content_type", "") or "").lower()
@@ -398,16 +403,20 @@ class PhashPhishGuard(commands.Cog):
                     hv = int(str(s), 16)
                 except Exception:
                     continue
-                for ref in self._hashes:
+
+                hit_provider: Optional[str] = None
+                hit_bits: int = bits_max_eff
+
+                # 1) Confirmed pHash tokens (hard hit)
+                for ref in self._hashes_confirmed:
                     if hamming(hv, ref) <= bits_max_eff:
                         # Extra verification for WEBP to reduce false positives.
-                        # We only confirm a hit if the match also holds after a
-                        # decode+re-encode to PNG.
                         if is_webp:
                             png = _transcode_to_png_bytes(raw)
                             if png:
+                                hashes2 = phash_list_from_bytes(png, max_frames=4)
                                 confirmed = False
-                                for s2 in phash_list_from_bytes(png, max_frames=1):
+                                for s2 in hashes2:
                                     try:
                                         hv2 = int(str(s2), 16)
                                     except Exception:
@@ -418,31 +427,69 @@ class PhashPhishGuard(commands.Cog):
                                 if not confirmed:
                                     continue
                             else:
-                                # If we cannot transcode, be stricter rather than
-                                # nuking normal WEBP images.
                                 if hamming(hv, ref) > max(0, bits_max_eff - 2):
                                     continue
-                        reason = f"phash-match≤{bits_max_eff} hv={hv:x}"
-                        ev_urls: List[str] = []
-                        for att in getattr(m, "attachments", []) or []:
-                            url = getattr(att, "url", None)
-                            if url:
-                                ev_urls.append(url)
-                        details = {
-                            "score": 1.0,
-                            "provider": "phash",
-                            "reason": reason,
-                            "kind": "image",
-                        }
-                        emit_phish_detected(self.bot, m, details, ev_urls)
-                        log.warning(
-                            "[phash-phish] HIT mid=%s user=%s ch=%s",
-                            getattr(m, "id", "?"),
-                            getattr(getattr(m, "author", None), "id", "?"),
-                            getattr(ch, "id", "?"),
-                        )
-                        return
 
+                        hit_provider = "phash"
+                        hit_bits = bits_max_eff
+                        break
+
+                # 2) Autolearn / probationary tokens (stricter match; NEVER auto-ban)
+                if hit_provider is None and self._hashes_autolearn:
+                    bits_auto = max(0, bits_max_eff - 2)
+                    for ref in self._hashes_autolearn:
+                        if hamming(hv, ref) <= bits_auto:
+                            if is_webp:
+                                png = _transcode_to_png_bytes(raw)
+                                if png:
+                                    hashes2 = phash_list_from_bytes(png, max_frames=4)
+                                    confirmed = False
+                                    for s2 in hashes2:
+                                        try:
+                                            hv2 = int(str(s2), 16)
+                                        except Exception:
+                                            continue
+                                        if hamming(hv2, ref) <= bits_auto:
+                                            confirmed = True
+                                            break
+                                    if not confirmed:
+                                        continue
+                                else:
+                                    if hamming(hv, ref) > max(0, bits_auto - 2):
+                                        continue
+
+                            hit_provider = "phash-autolearn"
+                            hit_bits = bits_auto
+                            break
+
+                if hit_provider is None:
+                    continue
+
+                reason = f"{hit_provider}≤{hit_bits} hv={hv:x}"
+                ev_urls: List[str] = []
+                for att in getattr(m, "attachments", []) or []:
+                    url = getattr(att, "url", None)
+                    if url:
+                        ev_urls.append(url)
+
+                details = {
+                    "score": 1.0 if hit_provider == "phash" else 0.95,
+                    "provider": hit_provider,
+                    "reason": reason,
+                    "kind": "image",
+                    "phash_hv": f"{hv:x}",
+                    "phash_bits": hit_bits,
+                }
+                emit_phish_detected(self.bot, m, details, ev_urls)
+                log.warning(
+                    "[phash-phish] HIT provider=%s mid=%s user=%s ch=%s hv=%s",
+                    hit_provider,
+                    getattr(m, "id", "?"),
+                    getattr(getattr(m, "author", None), "id", "?"),
+                    getattr(ch, "id", "?"),
+                    f"{hv:x}",
+                )
+                return
     @commands.Cog.listener("on_message")
     async def on_message(self, m: discord.Message) -> None:
         try:

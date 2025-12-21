@@ -69,6 +69,11 @@ class PhishAutoLearnPhash(commands.Cog):
         if score < PHISH_AUTO_LEARN_MIN_SCORE:
             return
 
+
+        # Never learn from pHash events (prevents DB self-poisoning / false positives)
+        provider = str(payload.get("provider", "") or "").strip().lower()
+        if provider in ("phash", "phash-autolearn"):
+            return
         ev = payload.get("evidence") or []
         if not isinstance(ev, list) or not ev:
             return
@@ -98,6 +103,20 @@ class PhishAutoLearnPhash(commands.Cog):
 
         if not tokens:
             return
+
+        # Normalize and mark autolearn tokens as probationary (prefix a:)
+        norm: Set[str] = set()
+        for tok in tokens:
+            s = str(tok).strip().lower()
+            if s.startswith('a:'):
+                s = s[2:].strip()
+            if s.startswith('0x'):
+                s = s[2:].strip()
+            # Keep only hex digits
+            if not s or any(c not in '0123456789abcdef' for c in s):
+                continue
+            norm.add(f"a:{s}")
+        tokens = norm
 
         # Merge into pinned DB (single edit per event).
         try:

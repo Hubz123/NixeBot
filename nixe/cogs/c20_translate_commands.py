@@ -589,6 +589,132 @@ def _pick_gemini_key() -> str:
     """
     return _env("TRANSLATE_GEMINI_API_KEY", "").strip()
 
+# ---- Gemini GenerateContent endpoint/model resolution (prevents 404 model-not-found) ----
+# We do NOT mutate runtime_env.json or require users to change config. We treat configured
+# model names as hints, then auto-resolve to a model that this API key actually supports.
+_GEMINI_ENDPOINT_CACHE: Dict[str, Tuple[str, str]] = {}  # kind -> (api_version, model)
+_GEMINI_BAD_MODELS: Dict[str, set] = {}  # kind -> set of models that returned 404/unsupported
+_GEMINI_IMAGE_INLINE_STYLE: str = "camel"  # "camel" -> inlineData/mimeType, "snake" -> inline_data/mime_type
+
+def _gemini_norm_model_name(name: str) -> str:
+    name = (name or "").strip()
+    if name.startswith("models/"):
+        name = name[len("models/"):]
+    return name
+
+def _gemini_candidate_models(preferred: str) -> List[str]:
+    preferred = _gemini_norm_model_name(preferred)
+    cand = []
+    if preferred:
+        cand.append(preferred)
+    # Prefer newer Flash/Flash-Lite families first; keep a broad fallback list.
+    for m in (
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-001",
+        "gemini-2.0-flash-lite-001",
+        # Last-resort older names (only if key supports them)
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-002",
+    ):
+        if m not in cand:
+            cand.append(m)
+    return cand
+
+async def _gemini_list_models(key: str, api_version: str) -> Tuple[bool, List[str], str]:
+    """Return models available for this key & API version that support generateContent."""
+    url = f"https://generativelanguage.googleapis.com/{api_version}/models?key={key}"
+    timeout_s = float(_env("TRANSLATE_LISTMODELS_TIMEOUT_SEC", "10"))
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return False, [], f"listmodels_http_{resp.status}:{body[:220]}"
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        return False, [], f"listmodels_exc:{e!r}"
+
+    out: List[str] = []
+    models = data.get("models") or []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        name = _gemini_norm_model_name(str(m.get("name") or ""))
+        if not name:
+            continue
+        methods = m.get("supportedGenerationMethods") or m.get("supportedActions") or []
+        # If methods is missing, be permissive (some responses omit it).
+        supports = True
+        if isinstance(methods, list) and methods:
+            supports = "generateContent" in methods
+        if supports:
+            out.append(name)
+    return True, out, ""
+
+def _gemini_pick_best(available: List[str], preferred: str, bad: Optional[set] = None) -> Optional[str]:
+    bad = bad or set()
+    avail_set = set(_gemini_norm_model_name(x) for x in available if isinstance(x, str))
+    # Try preferred/candidates first
+    for m in _gemini_candidate_models(preferred):
+        mn = _gemini_norm_model_name(m)
+        if mn in avail_set and mn not in bad:
+            return mn
+    # Otherwise, pick something that looks like Flash/Flash-Lite and isn't marked bad
+    for prefix in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
+        for mn in sorted(avail_set):
+            if mn.startswith(prefix) and mn not in bad:
+                return mn
+    # Fallback: first available not bad
+    for mn in sorted(avail_set):
+        if mn not in bad:
+            return mn
+    return None
+
+async def _gemini_resolve_generatecontent_endpoint(key: str, preferred_model: str, kind: str = "text") -> Tuple[str, str]:
+    """Resolve (api_version, model) that works for this key for generateContent."""
+    preferred_model = _gemini_norm_model_name(preferred_model)
+    bad = _GEMINI_BAD_MODELS.setdefault(kind, set())
+
+    # Cached result still valid unless it was marked bad.
+    cached = _GEMINI_ENDPOINT_CACHE.get(kind)
+    if cached and cached[1] not in bad:
+        return cached
+
+    # Try listModels on v1 first (newer), then v1beta.
+    for api_v in ("v1", "v1beta"):
+        ok, avail, _err = await _gemini_list_models(key, api_v)
+        if ok and avail:
+            pick = _gemini_pick_best(avail, preferred_model, bad=bad)
+            if pick:
+                _GEMINI_ENDPOINT_CACHE[kind] = (api_v, pick)
+                return api_v, pick
+
+    # If listModels is unavailable, fall back to preferred/candidates on v1beta.
+    for pick in _gemini_candidate_models(preferred_model):
+        mn = _gemini_norm_model_name(pick)
+        if mn and mn not in bad:
+            _GEMINI_ENDPOINT_CACHE[kind] = ("v1beta", mn)
+            return "v1beta", mn
+
+    # Worst case: return the preferred_model even if bad, to surface a meaningful error upstream.
+    return "v1beta", preferred_model or "gemini-2.0-flash"
+
+def _gemini_inline_part(mime: str, data_b64: str) -> Dict[str, Any]:
+    global _GEMINI_IMAGE_INLINE_STYLE
+    if _GEMINI_IMAGE_INLINE_STYLE == "snake":
+        return {"inline_data": {"mime_type": mime, "data": data_b64}}
+    return {"inlineData": {"mimeType": mime, "data": data_b64}}
+
+def _gemini_should_flip_inline_style(err_text: str) -> bool:
+    t = (err_text or "").lower()
+    # Typical error messages when field names don't match expected schema.
+    return ("unknown name" in t and "inlinedata" in t) or ("unknown name" in t and "inline_data" in t) or ("invalid json payload" in t)
+
 def _pick_groq_key() -> str:
     """Translate must not use Groq. This stub remains only for backward-compat safety."""
     return ""
@@ -644,7 +770,8 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         except Exception as e:
             return False, f"aiohttp missing: {e!r}"
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + key
+        api_v, model2 = await _gemini_resolve_generatecontent_endpoint(key, model, kind="text")
+        url = "https://generativelanguage.googleapis.com/" + api_v + "/models/" + model2 + ":generateContent?key=" + key
         payload = {
             "contents": [
                 {"role": "user", "parts": [{"text": f"{schema}\n\nTEXT:\n{src}"}]}
@@ -737,94 +864,100 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     # If we got only echoed/wrong-language outputs, treat as failure (so caller will not publish wrong language).
     if last_ok and last_out:
+        # FINAL ENFORCEMENT: one last strict pass using a stronger model hint.
+        try:
+            if _seems_untranslated(src, last_out, target_code) or _needs_target_enforcement(last_out, target_code):
+                strong_model = _env("TRANSLATE_GEMINI_MODEL_STRONG", model_strong or model_primary)
+                final_sys = _env(
+                    "TRANSLATE_SYS_MSG_FINAL_STRICT",
+                    f"FINAL STRICT MODE. Translate the user's text into {target_label}. "
+                    f"Output ONLY the translation in {target_label}. "
+                    "Do NOT include the original text. Do NOT include explanations."
+                )
+                okf, outf = await _call_with_model(key, src, strong_model, final_sys, temperature=0.0)
+                if okf and outf and (not _seems_untranslated(src, outf, target_code)) and (not _needs_target_enforcement(outf, target_code)):
+                    return True, outf
+
+                # Extra Indonesian hard-pass if still looks English.
+                if target_code == "id":
+                    final_sys2 = (
+                        "MODE TERAKHIR. TERJEMAHKAN SELURUH TEKS KE BAHASA INDONESIA. "
+                        "HASILKAN HANYA TERJEMAHAN BAHASA INDONESIA, TANPA TEKS ASLI, TANPA PENJELASAN."
+                    )
+                    okf2, outf2 = await _call_with_model(key, src, strong_model, final_sys2, temperature=0.0)
+                    if okf2 and outf2 and (not _seems_untranslated(src, outf2, target_code)) and (not _needs_target_enforcement(outf2, target_code)):
+                        return True, outf2
+        except Exception:
+            pass
         return False, "untranslated_output"
     return False, last_err or "translate_failed"
 
-async def _call_with_model(sys_msg: str, model_override: str, temperature: float = 0.0) -> Tuple[bool, str]:
-    """Call Gemini with an explicit model override (used for final strict enforcement)."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_override}:generateContent?key={key}"
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
-        ],
-        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": 2048},
-    }
+
+async def _call_with_model(
+    key: str,
+    text: str,
+    model_hint: str,
+    sys_msg: str,
+    temperature: float = 0.0,
+) -> Tuple[bool, str]:
+    """
+    Call Gemini generateContent using an explicit model hint, but still auto-resolve to a model
+    that the API key supports (prevents 404 model-not-found).
+
+    Returns (ok, output_text_or_error).
+    """
+    key = (key or "").strip()
+    if not key:
+        return False, "missing TRANSLATE_GEMINI_API_KEY"
+    text = (text or "").strip()
+
     try:
         import aiohttp  # type: ignore
     except Exception as e:
         return False, f"aiohttp missing: {e!r}"
+
+    # Resolve model using listModels (v1 first, then v1beta), with a broad fallback list.
+    api_v, model2 = await _gemini_resolve_generatecontent_endpoint(key, model_hint, kind="text")
+
+    url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model2}:generateContent?key={key}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}],
+        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": 2048},
+    }
 
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.post(url, json=payload, timeout=25) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
+                    # Mark the resolved model as bad for this kind when the server says it's unsupported/not found.
+                    if resp.status in (404, 400, 403):
+                        _GEMINI_BAD_MODELS.setdefault("text", set()).add(_gemini_norm_model_name(model2))
+                        _GEMINI_ENDPOINT_CACHE.pop("text", None)
                     return False, f"Gemini HTTP {resp.status}: {body[:200]}"
-                j = await resp.json()
-                cand = (j.get("candidates") or [{}])[0]
-                parts = (((cand.get("content") or {}).get("parts")) or [])
-                out = ""
-                for p in parts:
-                    if "text" in p:
-                        out += p["text"]
-                out = _clean_output(out)
-                try:
-                    jj = json.loads(out)
-                    out2 = str(jj.get("translation", "") or out)
-                    return True, out2.strip() or "(empty)"
-                except Exception:
-                    return True, out.strip() or "(empty)"
+                j = await resp.json(content_type=None)
     except Exception as e:
         return False, f"Gemini request failed: {e!r}"
 
-    ok, out = await _call(base_sys)
-    if ok and _seems_untranslated(text, out, target_lang):
-        tl = _normalize_lang_code(target_lang)
-        if not (tl == "id" and _is_probably_indonesian(text)):
-            ok2, out2 = await _call(strict_sys)
-            if ok2 and out2:
-                out = out2
-        # HARD-ID-RETRY: Gemini sometimes treats ISO code 'id' ambiguously.
-        if _normalize_lang_code(target_lang) == "id" and ok and _seems_untranslated(text, out, target_lang):
-            hard_sys = _env(
-                "TRANSLATE_SYS_MSG_ID_HARD",
-                f"STRICT MODE. Translate ALL user text into Bahasa Indonesia. "
-                "Output ONLY the Indonesian translation, without the original text. "
-                f"Return ONLY compact JSON matching this schema: {schema}. No prose."
-            )
-            ok3, out3 = await _call(hard_sys)
-            if ok3 and out3:
-                out = out3
-    # FINAL ENFORCEMENT: If output still looks like the source language (common OCR echo),
-    # force one last strict pass using a stronger model override (without requiring config changes).
     try:
-        if ok and (
-            _seems_untranslated(text, out, target_lang)
-            or _needs_target_enforcement(out, target_lang)
-        ):
-            strong_model = _env("TRANSLATE_GEMINI_MODEL_STRONG", _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash"))
-            final_sys = _env(
-                "TRANSLATE_SYS_MSG_FINAL_STRICT",
-                f"FINAL STRICT MODE. Translate the user's text into {target_label}. "
-                f"Output ONLY the translation in {target_label}. "
-                "Do NOT include the original text. Do NOT include explanations."
-            )
-            okf, outf = await _call_with_model(final_sys, strong_model, temperature=0.0)
-            if okf and outf:
-                out = outf
-
-            # Extra Indonesian hard-pass (in Indonesian) if still English-looking.
-            if ok and _normalize_lang_code(target_lang) == "id" and _needs_target_enforcement(out, target_lang):
-                final_sys2 = (
-                    "MODE TERAKHIR. TERJEMAHKAN SELURUH TEKS KE BAHASA INDONESIA. "
-                    "HASILKAN HANYA TERJEMAHAN BAHASA INDONESIA, TANPA TEKS ASLI, TANPA PENJELASAN."
-                )
-                okf2, outf2 = await _call_with_model(final_sys2, strong_model, temperature=0.0)
-                if okf2 and outf2:
-                    out = outf2
-    except Exception:
-        pass
-    return ok, out
+        cand = (j.get("candidates") or [{}])[0]
+        parts = (((cand.get("content") or {}).get("parts")) or [])
+        out = ""
+        for p in parts:
+            if isinstance(p, dict) and "text" in p:
+                out += str(p["text"])
+        out = _clean_output(out)
+        # If model returns JSON, try to extract translation field.
+        try:
+            jj = json.loads(out)
+            if isinstance(jj, dict):
+                out2 = str(jj.get("translation", "") or jj.get("translated", "") or out)
+                return True, (out2 or "").strip() or "(empty)"
+        except Exception:
+            pass
+        return True, out.strip() or "(empty)"
+    except Exception as e:
+        return False, f"parse_failed:{e!r}"
 
 
 async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, str]]:
@@ -869,7 +1002,8 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
         f"Return ONLY compact JSON matching this schema: {schema}. No prose. Do not wrap in code fences."
     )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    api_v, model2 = await _gemini_resolve_generatecontent_endpoint(key, model, kind="text")
+    url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model2}:generateContent?key={key}"
     payload = {
         "contents": [
             {
@@ -1236,7 +1370,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
-    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash"))
+    preferred_model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
     target_label = _lang_label(target_lang)
     prompt = (
@@ -1250,27 +1384,56 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
 
     try:
         import aiohttp
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        payload = {
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {"text": prompt},
-                    {"inlineData": {
-                        "mimeType": mime,
-                        "data": base64.b64encode(image_bytes).decode("utf-8"),
-                    }},
-                ],
-            }],
-            "generationConfig": {"temperature": 0.0},
-        }
+        api_v, model = await _gemini_resolve_generatecontent_endpoint(key, preferred_model, kind="image")
+        url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model}:generateContent?key={key}"
+        data_b64 = base64.b64encode(image_bytes).decode("utf-8")
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
+
+        def _make_payload(p: str) -> Dict[str, Any]:
+            return {
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"text": p},
+                        _gemini_inline_part(mime, data_b64),
+                    ],
+                }],
+                "generationConfig": {"temperature": 0.0},
+            }
+
+        async def _post_payload(session: aiohttp.ClientSession, p: str) -> Tuple[bool, Any, str]:
+            nonlocal api_v, model, url
+            last_status = None
+            last_body = ""
+            for _attempt in range(3):
+                payload = _make_payload(p)
+                async with session.post(url, json=payload) as resp:
+                    if resp.status == 200:
+                        return True, await resp.json(content_type=None), ""
+                    last_body = await resp.text()
+                    last_status = resp.status
+
+                # Model alias mismatch / unsupported: re-resolve and retry.
+                if last_status == 404 and ("not found" in (last_body or "").lower() or "not supported" in (last_body or "").lower()):
+                    _GEMINI_BAD_MODELS.setdefault("image", set()).add(model)
+                    _GEMINI_ENDPOINT_CACHE.pop("image", None)
+                    api_v, model = await _gemini_resolve_generatecontent_endpoint(key, preferred_model, kind="image")
+                    url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model}:generateContent?key={key}"
+                    continue
+
+                # Payload field-name mismatch: flip inline style and retry.
+                if last_status == 400 and _gemini_should_flip_inline_style(last_body):
+                    global _GEMINI_IMAGE_INLINE_STYLE
+                    _GEMINI_IMAGE_INLINE_STYLE = "snake" if _GEMINI_IMAGE_INLINE_STYLE == "camel" else "camel"
+                    continue
+
+                break
+            return False, None, f"gemini_vision_http_{last_status}:{(last_body or '')[:220]}"
+
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-            async with session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    return False, "", "", f"gemini_vision_http_{resp.status}:{body[:220]}"
-                data = await resp.json(content_type=None)
+            okv, data, errv = await _post_payload(session, prompt)
+            if not okv:
+                return False, "", "", errv
 
         candidates = data.get("candidates") or []
         parts: List[Dict[str, Any]] = []
@@ -1325,27 +1488,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                 f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
                 "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}.\n"
             )
-            payload2 = {
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"text": prompt2},
-                        {"inlineData": {
-                            "mimeType": mime,
-                            "data": base64.b64encode(image_bytes).decode("utf-8"),
-                        }},
-                    ],
-                }],
-                "generationConfig": {"temperature": 0.0},
-            }
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-                    async with session.post(url, json=payload2) as resp:
-                        if resp.status != 200:
-                            body = await resp.text()
-                            # If retry also fails, keep original result.
-                            raise RuntimeError(f"gemini_vision_retry_http_{resp.status}:{body[:220]}")
-                        data2 = await resp.json(content_type=None)
+                    okv2, data2, errv2 = await _post_payload(session, prompt2)
+                    if not okv2:
+                        # If retry also fails, keep original result.
+                        raise RuntimeError(errv2)
                 candidates2 = data2.get("candidates") or []
                 parts2 = (((candidates2[0].get("content") or {}).get("parts")) or []) if candidates2 else []
                 out2 = "".join([p.get("text","") for p in parts2 if isinstance(p, dict)])
@@ -2003,12 +2151,7 @@ class TranslateCommands(commands.Cog):
                     # Policy: do NOT fall back to Groq for translate.
                     # If this secondary enforcement step fails, do NOT overwrite an existing translation.
                     if not translated_final:
-                        # If enforcement fails, surface a specific reason instead of generic "translate_failed".
-                        if not ok_t2:
-                            err_msg = (t2 or "").strip() or "translate_failed"
-                        else:
-                            # ok_t2=True but output got rejected by heuristics
-                            err_msg = "empty_translation" if not t2s else "untranslated_output"
+                        err_msg = (t2 if not ok_t2 else "") or "translate_failed"
                         translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
             if not translated_final:
                 translated_final = "_Tidak ada teks terbaca di gambar ini._"

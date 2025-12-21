@@ -146,6 +146,8 @@ def _looks_english_global(txt: str) -> bool:
     outputs that otherwise slip through.
     """
     t = (txt or "").lower().strip()
+    # Normalize whitespace so stopword checks work even with OCR line-breaks.
+    t = re.sub(r"\s+", " ", t)
     if not t:
         return False
 
@@ -178,6 +180,42 @@ def _looks_english_global(txt: str) -> bool:
         return True
 
     return False
+
+def _looks_english_image_strict(txt: str) -> bool:
+    """Stricter English detector for IMAGE translation enforcement.
+
+    Gemini Vision sometimes returns very short English UI phrases (e.g. "Scan QR code").
+    The global detector is intentionally conservative; for images we must be stricter
+    to satisfy the policy: image->ID must not remain in English.
+    """
+    t = (txt or "").lower().strip()
+    t = re.sub(r"\s+", " ", t)
+    if not t:
+        return False
+    try:
+        if _is_probably_indonesian(t):
+            return False
+    except Exception:
+        pass
+
+    padded = f" {t} "
+    sw = (" the ", " and ", " to ", " of ", " in ", " is ", " are ", " was ", " were ", " this ", " that ")
+    if any(s in padded for s in sw):
+        # even short phrases like "this is" should trigger
+        return True
+
+    # Common phishing / UI English tokens observed in Discord scam images
+    ui = (
+        "scan", "qr", "code", "click", "claim", "free", "gift", "bonus", "nitro",
+        "join", "server", "invite", "verify", "update", "download", "security", "support",
+        "limited", "offer", "congratulations", "winner",
+    )
+    latin = len(re.findall(r"[a-z]", t))
+    if latin >= 8 and any(w in t for w in ui):
+        return True
+
+    return False
+
 def _needs_target_enforcement(out: str, target_lang: str) -> bool:
     """Best-effort check that output matches target language expectation.
 
@@ -1375,8 +1413,9 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     target_label = _lang_label(target_lang)
     prompt = (
         "You are an OCR+translation engine.\n"
-        "1) Extract all readable text from the image.\n"
+        "1) Extract all readable text from the image EXACTLY as-is (preserve line breaks; do not summarize).\n"
         f"2) Translate it to {target_label}.\n"
+        f"IMPORTANT: If the extracted text is already in {target_label}, set translation equal to text (do not paraphrase).\n"
         f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
         "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
@@ -2120,7 +2159,7 @@ class TranslateCommands(commands.Cog):
             img_target_display = img_prof.display if img_prof is not None else str(image_target).upper()
             img_target_code = (img_prof.code.lower() if img_prof is not None else _normalize_lang_code(image_target))
 
-            field_name = f"🖼 Gambar #{idx}" + (f" → {img_img_target_display}" if _normalize_lang_code(image_target) != _normalize_lang_code(target) else "")
+            field_name = f"🖼 Gambar #{idx}" + (f" → {img_target_display}" if _normalize_lang_code(image_target) != _normalize_lang_code(target) else "")
 
             if not ok_img:
                 # Gagal untuk gambar ini saja; lanjut ke gambar berikutnya / chat.
@@ -2135,21 +2174,38 @@ class TranslateCommands(commands.Cog):
             detected_final = (detected or "").strip()
             translated_final = (translated_img or "").strip()
 
+            # Policy: if target is Indonesian and the extracted text already looks Indonesian,
+            # do NOT re-translate / paraphrase. Prefer the extracted text verbatim.
+            if img_target_code == "id" and detected_final and _should_skip_translation_for_id(detected_final, "id"):
+                translated_final = detected_final
+
+
             src_check = detected_final or translated_final
 
             # Pastikan output benar-benar terjemahan (hindari echo OCR / echo source yang sering terjadi).
-            if src_check and (
-                (not translated_final)
-                or _seems_untranslated(src_check, translated_final, img_target_code)
-                or _needs_target_enforcement(translated_final, img_target_code)
-            ):
+            needs_enforce = False
+            if src_check:
+                try:
+                    needs_enforce = (
+                        (not translated_final)
+                        or (detected_final and _seems_untranslated(detected_final, translated_final, img_target_code))
+                        or _needs_target_enforcement(translated_final, img_target_code) or (img_target_code == "id" and _looks_english_image_strict(translated_final))
+                    )
+                except Exception:
+                    # Be conservative: if heuristics fail, force a text-only translate pass.
+                    needs_enforce = True
+
+            if src_check and needs_enforce:
                 ok_t2, t2 = await _gemini_translate_text(src_check, img_target_code)
                 t2s = (t2 or "").strip()
                 if ok_t2 and t2s and (not _seems_untranslated(src_check, t2s, img_target_code)) and (not _needs_target_enforcement(t2s, img_target_code)):
                     translated_final = t2s
                 else:
                     # Policy: do NOT fall back to Groq for translate.
-                    # If this secondary enforcement step fails, do NOT overwrite an existing translation.
+                    # IMPORTANT: do not keep a wrong-language/echo output pretending it is translated.
+                    err_msg = (t2 if not ok_t2 else "") or "translate_failed"
+                    translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
+
                     if not translated_final:
                         err_msg = (t2 if not ok_t2 else "") or "translate_failed"
                         translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
@@ -2344,9 +2400,14 @@ class TranslateCommands(commands.Cog):
                 desc = desc[:3900].rstrip() + "\n\n(Lanjutan ada di attachment: translation_full.txt)"
             embed.description = desc
 
-        # Footer info provider untuk debug ringan
-        footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
-        embed.set_footer(text=" • ".join(footer_bits))
+        # Optional debug footer (OFF by default). Users do not want provider metadata in normal output.
+        try:
+            show_footer = _as_bool("TRANSLATE_SHOW_PROVIDER_FOOTER", False) or debug
+        except Exception:
+            show_footer = False
+        if show_footer:
+            footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
+            embed.set_footer(text=" • ".join(footer_bits))
 
         # Attach full text only when needed (e.g., description truncated or leftover from fields).
         blob_parts: List[str] = []

@@ -1057,16 +1057,21 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     """
     OCR+translate an image using Gemini Vision REST API.
 
-    Note: We intentionally avoid the google-genai SDK here because several environments
-    (including yours) ship with an httpx version that is incompatible with recent SDK
-    releases, causing noisy follow_redirects / destructor errors. REST is stable.
+    Reliability policy (important):
+    - Gemini Vision is used as OCR (text extraction) first.
+    - Actual translation is enforced via the text translator (_gemini_translate_text),
+      with optional Groq fallback if configured.
+    This prevents the common failure mode where the vision model echoes the source text.
     """
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
+
     model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
     target_label = _lang_label(target_lang)
+
+    # Ask Vision for OCR + a first-pass translation (we may ignore translation if it looks wrong).
     prompt = (
         "You are an OCR+translation engine.\n"
         "1) Extract all readable text from the image.\n"
@@ -1074,10 +1079,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
         "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
+
     mime = _detect_image_mime(image_bytes)
 
     try:
-        import aiohttp
+        import aiohttp  # type: ignore
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
             "contents": [{
@@ -1092,6 +1099,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             }],
             "generationConfig": {"temperature": 0.0},
         }
+
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
             async with session.post(url, json=payload) as resp:
@@ -1107,18 +1115,24 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             if isinstance(p, dict) and "text" in p:
                 out += str(p["text"])
 
-        # Cleanup + squash insane blank lines before parsing
         out = _squash_blank_lines(_clean_output(out))
 
         j: Dict[str, Any] | None = None
 
         # 1) direct JSON parse
         try:
-            j = json.loads(out)
+            j = json.loads(_clean_json_for_gemini(out))
         except Exception:
             j = None
 
-        # 2) if model wrapped JSON in extra text, try to extract the first {...}
+        # 2) try to trim to first object
+        if j is None:
+            try:
+                j = json.loads(_trim_json_to_object(out))
+            except Exception:
+                j = None
+
+        # 3) extract first {...} if wrapped
         if j is None:
             m2 = re.search(r"\{.*\}", out, flags=re.DOTALL)
             if m2:
@@ -1127,64 +1141,44 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                 except Exception:
                     j = None
 
-        # 3) If still not JSON, best-effort regex extraction of "text" / "translation"
+        # 4) last resort: regex extraction
         if not isinstance(j, dict):
             text_match = re.search(r'"text"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
             trans_match = re.search(r'"translation"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
             detected = _squash_blank_lines(text_match.group(1)) if text_match else out
             translated = _squash_blank_lines(trans_match.group(1)) if trans_match else ""
-            return True, detected, translated, "non_json_output"
+            reason = "non_json_output"
+        else:
+            detected = _squash_blank_lines(str(j.get("text", "") or ""))
+            translated = _squash_blank_lines(str(j.get("translation", "") or ""))
+            reason = str(j.get("reason", "") or "ok")
 
-        detected = _squash_blank_lines(str(j.get("text", "") or ""))
-        translated = _squash_blank_lines(str(j.get("translation", "") or ""))
-        reason = str(j.get("reason", "") or "ok")
-        # Hard rule: if target is Indonesian and OCR text already looks Indonesian, keep it unchanged.
-        if _should_skip_translation_for_id(detected, target_lang):
-            return True, detected, detected, "skip_id_source_is_id"
-        # HARD-ID-RETRY: If target is Indonesian but translation appears unchanged, retry with explicit label.
-        if _normalize_lang_code(target_lang) == "id" and _seems_untranslated(detected, translated, target_lang):
-            prompt2 = (
-                "You are an OCR+translation engine.\n"
-                "1) Extract all readable text from the image.\n"
-                "2) Translate it to Bahasa Indonesia (Indonesian).\n"
-                f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
-                "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}.\n"
-            )
-            payload2 = {
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"text": prompt2},
-                        {"inline_data": {
-                            "mime_type": mime,
-                            "data": base64.b64encode(image_bytes).decode("utf-8"),
-                        }},
-                    ],
-                }],
-                "generationConfig": {"temperature": 0.0},
-            }
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-                    async with session.post(url, json=payload2) as resp:
-                        data2 = await resp.json(content_type=None)
-                candidates2 = data2.get("candidates") or []
-                parts2 = (((candidates2[0].get("content") or {}).get("parts")) or []) if candidates2 else []
-                out2 = "".join([p.get("text","") for p in parts2 if isinstance(p, dict)])
-                out2 = _clean_output(out2)
-                try:
-                    j2 = json.loads(out2)
-                except Exception:
-                    m22 = re.search(r"\{.*\}", out2, flags=re.DOTALL)
-                    j2 = json.loads(m22.group(0)) if m22 else None
-                if isinstance(j2, dict):
-                    t2 = _squash_blank_lines(str(j2.get("translation","") or ""))
-                    if t2:
-                        translated = t2
-                        reason = str(j2.get("reason","") or reason)
-            except Exception:
-                pass
+        detected = (detected or "").strip()
+        translated = (translated or "").strip()
 
-        return True, detected, translated, reason
+        # Some Gemini outputs place OCR text into "translation" and leave "text" empty.
+        if not detected and translated:
+            detected, translated = translated, ""
+
+        if not detected:
+            # No text to translate.
+            return True, "", "", (reason or "no_text")
+
+        # Enforce translation via text translator; this avoids "EN -> EN" echoes.
+        ok_txt, out_txt = await _gemini_translate_text(detected, target_lang)
+        if ok_txt and out_txt:
+            return True, detected, out_txt.strip(), f"vision_ocr+gemini_text:{reason}"
+
+        # Optional fallback to Groq if available
+        ok_groq, out_groq = await _groq_translate_text(detected, target_lang)
+        if ok_groq and out_groq:
+            return True, detected, out_groq.strip(), f"vision_ocr+groq_text:{reason}"
+
+        # As a last-resort, only accept Vision translation if it does not look like a direct echo.
+        if translated and not _seems_untranslated(detected, translated, target_lang):
+            return True, detected, translated, f"vision_translation_fallback:{reason}"
+
+        return False, detected, "", f"text_translate_failed:{out_txt or out_groq or reason or 'unknown'}"
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"
 

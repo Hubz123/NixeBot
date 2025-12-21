@@ -522,19 +522,14 @@ def _pick_provider() -> str:
     """
     return "gemini"
 def _pick_gemini_key() -> str:
-    key = _env("TRANSLATE_GEMINI_API_KEY", "")
-    if key:
-        return key
-    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        return _env("GEMINI_API_KEY", _env("GEMINI_API_KEY_B", _env("GEMINI_BACKUP_API_KEY", "")))
-    return ""
+    """Return the ONLY allowed API key for translate: TRANSLATE_GEMINI_API_KEY.
+
+    We must never fall back to GEMINI_API_KEY / GEMINI_API_KEY_B / backups here.
+    """
+    return _env("TRANSLATE_GEMINI_API_KEY", "").strip()
 
 def _pick_groq_key() -> str:
-    key = _env("TRANSLATE_GROQ_API_KEY", "")
-    if key:
-        return key
-    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        return _env("GROQ_API_KEY", "")
+    """Translate must not use Groq. Always return empty."""
     return ""
 
 # -------------------------
@@ -542,26 +537,12 @@ def _pick_groq_key() -> str:
 # -------------------------
 
 async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
-    """Translate plain text using Gemini (REST).
-
-    Design goals:
-    - Keep behavior compatible with previous versions (single string out).
-    - Be resilient to OCR pipelines that often echo the source language.
-    - Avoid "id" ambiguity by always using a human language label in prompts.
-    - Use a stronger model for the HARD-ID pass by default (configurable).
-    """
     key = _pick_gemini_key()
     if not key:
         return False, "missing TRANSLATE_GEMINI_API_KEY"
-
-    # Base model can be light; hard passes may use a stronger model.
-    base_model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
-    strict_model = _env("TRANSLATE_GEMINI_MODEL_STRICT", base_model)
-    hard_model = _env("TRANSLATE_GEMINI_MODEL_HARD", "gemini-2.5-flash")
-
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
     target_label = _lang_label(target_lang)
-    tl = _normalize_lang_code(target_lang)
 
     # Hard rule: if target is Indonesian AND source already Indonesian, do not translate (avoid paraphrase).
     if _should_skip_translation_for_id(text, target_lang):
@@ -571,6 +552,7 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         "TRANSLATE_SYS_MSG",
         f"You are a translation engine. Translate the user's text into {target_label}. "
         "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
+        f"If the text is already in {target_label}, return it unchanged. "
         f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
     strict_sys = _env(
@@ -579,20 +561,14 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         "No source-language remnants except proper nouns/usernames/URLs. "
         f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
-    hard_id_sys = _env(
-        "TRANSLATE_SYS_MSG_ID_HARD",
-        f"STRICT MODE. Translate ALL user text into Bahasa Indonesia (Indonesian). "
-        "Output ONLY the Indonesian translation. Do NOT output English sentences. "
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
-    )
 
-    async def _call(sys_msg: str, *, model_name: str, temperature: float) -> Tuple[bool, str]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+    async def _call(sys_msg: str) -> Tuple[bool, str]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
             "contents": [
-                {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + (text or "")}]}
+                {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
             ],
-            "generationConfig": {"temperature": float(temperature), "maxOutputTokens": 2048},
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
         }
         try:
             import aiohttp  # type: ignore
@@ -610,8 +586,8 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
                     parts = (((cand.get("content") or {}).get("parts")) or [])
                     out = ""
                     for p in parts:
-                        if isinstance(p, dict) and "text" in p:
-                            out += str(p["text"])
+                        if "text" in p:
+                            out += p["text"]
                     out = _clean_output(out)
                     # accept JSON or plain text fallback
                     try:
@@ -623,31 +599,91 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         except Exception as e:
             return False, f"Gemini request failed: {e!r}"
 
-    # 1) Base attempt
-    ok, out = await _call(base_sys, model_name=base_model, temperature=0.2)
 
-    # 2) If likely echo/untranslated, strict attempt
+async def _call_with_model(sys_msg: str, model_override: str, temperature: float = 0.0) -> Tuple[bool, str]:
+    """Call Gemini with an explicit model override (used for final strict enforcement)."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_override}:generateContent?key={key}"
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
+        ],
+        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": 2048},
+    }
+    try:
+        import aiohttp  # type: ignore
+    except Exception as e:
+        return False, f"aiohttp missing: {e!r}"
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(url, json=payload, timeout=25) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    return False, f"Gemini HTTP {resp.status}: {body[:200]}"
+                j = await resp.json()
+                cand = (j.get("candidates") or [{}])[0]
+                parts = (((cand.get("content") or {}).get("parts")) or [])
+                out = ""
+                for p in parts:
+                    if "text" in p:
+                        out += p["text"]
+                out = _clean_output(out)
+                try:
+                    jj = json.loads(out)
+                    out2 = str(jj.get("translation", "") or out)
+                    return True, out2.strip() or "(empty)"
+                except Exception:
+                    return True, out.strip() or "(empty)"
+    except Exception as e:
+        return False, f"Gemini request failed: {e!r}"
+
+    ok, out = await _call(base_sys)
     if ok and _seems_untranslated(text, out, target_lang):
-        # If target is Indonesian and source is already Indonesian, we avoid re-translate.
+        tl = _normalize_lang_code(target_lang)
         if not (tl == "id" and _is_probably_indonesian(text)):
-            ok2, out2 = await _call(strict_sys, model_name=strict_model, temperature=0.0)
+            ok2, out2 = await _call(strict_sys)
             if ok2 and out2:
                 out = out2
+        # HARD-ID-RETRY: Gemini sometimes treats ISO code 'id' ambiguously.
+        if _normalize_lang_code(target_lang) == "id" and ok and _seems_untranslated(text, out, target_lang):
+            hard_sys = _env(
+                "TRANSLATE_SYS_MSG_ID_HARD",
+                f"STRICT MODE. Translate ALL user text into Bahasa Indonesia. "
+                "Output ONLY the Indonesian translation, without the original text. "
+                f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+            )
+            ok3, out3 = await _call(hard_sys)
+            if ok3 and out3:
+                out = out3
+    # FINAL ENFORCEMENT: If output still looks like the source language (common OCR echo),
+    # force one last strict pass using a stronger model override (without requiring config changes).
+    try:
+        if ok and (
+            _seems_untranslated(text, out, target_lang)
+            or _needs_target_enforcement(out, target_lang)
+        ):
+            strong_model = _env("TRANSLATE_GEMINI_MODEL_STRONG", "gemini-2.5-flash")
+            final_sys = _env(
+                "TRANSLATE_SYS_MSG_FINAL_STRICT",
+                f"FINAL STRICT MODE. Translate the user's text into {target_label}. "
+                f"Output ONLY the translation in {target_label}. "
+                "Do NOT include the original text. Do NOT include explanations."
+            )
+            okf, outf = await _call_with_model(final_sys, strong_model, temperature=0.0)
+            if okf and outf:
+                out = outf
 
-    # 3) HARD-ID: use stronger model by default
-    if ok and tl == "id" and (_seems_untranslated(text, out, target_lang) or _looks_english_global(out)):
-        ok3, out3 = await _call(hard_id_sys, model_name=hard_model, temperature=0.0)
-        if ok3 and out3:
-            out = out3
-
-    # 4) Final guard: if still wrong-language (e.g., English-looking while target is Latin non-EN),
-    # optionally fall back to Groq if allowed.
-    if ok and _needs_target_enforcement(out, target_lang):
-        if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-            ok_g, g = await _groq_translate_text(text, target_lang)
-            if ok_g and (g or "").strip() and not _needs_target_enforcement(g, target_lang):
-                out = (g or "").strip()
-
+            # Extra Indonesian hard-pass (in Indonesian) if still English-looking.
+            if ok and _normalize_lang_code(target_lang) == "id" and _needs_target_enforcement(out, target_lang):
+                final_sys2 = (
+                    "MODE TERAKHIR. TERJEMAHKAN SELURUH TEKS KE BAHASA INDONESIA. "
+                    "HASILKAN HANYA TERJEMAHAN BAHASA INDONESIA, TANPA TEKS ASLI, TANPA PENJELASAN."
+                )
+                okf2, outf2 = await _call_with_model(final_sys2, strong_model, temperature=0.0)
+                if okf2 and outf2:
+                    out = outf2
+    except Exception:
+        pass
     return ok, out
 
 
@@ -1832,15 +1868,13 @@ class TranslateCommands(commands.Cog):
                 or _needs_target_enforcement(translated_final, target_code)
             ):
                 ok_t2, t2 = await _gemini_translate_text(src_check, target_code)
-                if ok_t2 and (t2 or '').strip():
-                    translated_final = (t2 or '').strip()
+                t2s = (t2 or "").strip()
+                if ok_t2 and t2s and (not _seems_untranslated(src_check, t2s, target_code)) and (not _needs_target_enforcement(t2s, target_code)):
+                    translated_final = t2s
                 else:
-                    ok_g2, g2 = await _groq_translate_text(src_check, target_code)
-                    if ok_g2 and (g2 or '').strip():
-                        translated_final = (g2 or '').strip()
-                    else:
-                        err_msg = (t2 if not ok_t2 else '') or (g2 if not ok_g2 else '') or 'translate_failed'
-                        translated_final = f"_Gagal menerjemahkan (provider error)._\n`{err_msg[:180]}`"
+                    # Policy: do NOT fall back to Groq for translate. If Gemini fails, report error safely.
+                    err_msg = (t2 if not ok_t2 else '') or 'translate_failed'
+                    translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
             if not translated_final:
                 translated_final = "_Tidak ada teks terbaca di gambar ini._"
 

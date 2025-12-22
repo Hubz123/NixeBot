@@ -2030,11 +2030,9 @@ class TranslateCommands(commands.Cog):
 
             detected_final = (detected or "").strip()
             translated_final = (translated_img or "").strip()
-
-            # Policy: if target is Indonesian and the extracted text already looks Indonesian,
-            # do NOT re-translate / paraphrase. Prefer the extracted text verbatim.
-            if img_target_code == "id" and detected_final and _should_skip_translation_for_id(detected_final, "id"):
-                translated_final = detected_final
+            # NOTE: We do not skip translation based on heuristic language detection.
+            # Always try to produce Indonesian output; if the source is already Indonesian,
+            # we accept an unchanged output as success (no paraphrase).
 
 
             src_check = detected_final or translated_final
@@ -2055,17 +2053,32 @@ class TranslateCommands(commands.Cog):
             if src_check and needs_enforce:
                 ok_t2, t2 = await _gemini_translate_text(src_check, img_target_code)
                 t2s = (t2 or "").strip()
-                if ok_t2 and t2s and (not _seems_untranslated(src_check, t2s, img_target_code)) and (not _needs_target_enforcement(t2s, img_target_code)):
+
+                accepted = False
+                if ok_t2 and t2s:
+                    # For image->ID we accept unchanged output as success (source may already be Indonesian).
+                    if img_target_code == "id":
+                        try:
+                            accepted = _is_probably_indonesian(t2s) or (not _looks_english_image_strict(t2s))
+                        except Exception:
+                            accepted = True
+                    else:
+                        try:
+                            accepted = (not _seems_untranslated(src_check, t2s, img_target_code)) and (not _needs_target_enforcement(t2s, img_target_code))
+                        except Exception:
+                            accepted = True
+
+                if accepted:
                     translated_final = t2s
                 else:
                     # Policy: do NOT fall back to Groq for translate.
-                    # IMPORTANT: do not keep a wrong-language/echo output pretending it is translated.
-                    err_msg = (t2 if not ok_t2 else "") or "translate_failed"
+                    # Surface a meaningful reason (avoid generic `translate_failed` when Gemini returned output).
+                    if ok_t2 and t2s:
+                        err_msg = "untranslated_output"
+                    else:
+                        err_msg = (t2 if not ok_t2 else "") or "translate_failed"
                     translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
 
-                    if not translated_final:
-                        err_msg = (t2 if not ok_t2 else "") or "translate_failed"
-                        translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
             if not translated_final:
                 translated_final = "_Tidak ada teks terbaca di gambar ini._"
 

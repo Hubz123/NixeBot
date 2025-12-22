@@ -26,20 +26,187 @@ from typing import Dict, List, Tuple
 import discord
 from discord.ext import commands
 
-# Reuse the existing translate implementation/utilities to keep embed/config identical to C45.
-from nixe.cogs.c20_translate_commands import (
-    _as_bool,
-    _as_float,
-    _env,
-    _embed_add_long_field,
-    _gemini_translate_text,
-    _gemini_translate_text_ja_multi,
-    _gemini_translate_text_ko_multi,
-    _gemini_translate_text_zh_multi,
-    _pick_provider,
-    _should_skip_translation_for_id,
-    resolve_lang,
+import os
+import re
+import httpx
+
+# ----------------------------
+# Self-contained text translate helpers
+# (Do NOT import c20_translate_commands to keep split isolation)
+# ----------------------------
+
+def _env(k: str, default: str = "") -> str:
+    try:
+        v = os.getenv(k)
+        return default if v is None else str(v)
+    except Exception:
+        return default
+
+def _as_bool(v, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+def _as_float(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+_LANG_MAP = {
+    "en": ("EN", "English"),
+    "english": ("EN", "English"),
+    "id": ("ID", "Indonesian"),
+    "indo": ("ID", "Indonesian"),
+    "indonesia": ("ID", "Indonesian"),
+    "indonesian": ("ID", "Indonesian"),
+    "ja": ("JA", "Japanese"),
+    "jp": ("JA", "Japanese"),
+    "japan": ("JA", "Japanese"),
+    "japanese": ("JA", "Japanese"),
+    "ko": ("KO", "Korean"),
+    "kr": ("KO", "Korean"),
+    "korea": ("KO", "Korean"),
+    "korean": ("KO", "Korean"),
+    "zh": ("ZH", "Chinese (Simplified)"),
+    "cn": ("ZH", "Chinese (Simplified)"),
+    "chinese": ("ZH", "Chinese (Simplified)"),
+    "mandarin": ("ZH", "Chinese (Simplified)"),
+    "su": ("SU", "Sundanese"),
+    "sunda": ("SU", "Sundanese"),
+    "sundanese": ("SU", "Sundanese"),
+    "jv": ("JV", "Javanese"),
+    "jawa": ("JV", "Javanese"),
+    "javanese": ("JV", "Javanese"),
+}
+
+def resolve_lang(raw: str) -> Tuple[str, str]:
+    s = (raw or "").strip().lower()
+    if not s:
+        return ("ID", "Indonesian")
+    if s in _LANG_MAP:
+        return _LANG_MAP[s]
+    # Accept formats like "ke EN", "to id", etc.
+    s = re.sub(r"[^a-z]", "", s)
+    if s in _LANG_MAP:
+        return _LANG_MAP[s]
+    return ("ID", "Indonesian")
+
+_ID_HINT_WORDS = (
+    "yang", "dan", "dengan", "untuk", "tidak", "bukan", "sudah", "belum", "bisa",
+    "akan", "kamu", "saya", "kami", "mereka", "ini", "itu", "dari", "pada", "juga",
+    "karena", "agar", "atau", "jadi", "sebagai", "lebih", "jadi", "mungkin",
 )
+
+def _looks_indonesian(text: str) -> bool:
+    if not text:
+        return False
+    t = " " + re.sub(r"\s+", " ", text.strip().lower()) + " "
+    hits = 0
+    for w in _ID_HINT_WORDS:
+        if f" {w} " in t:
+            hits += 1
+            if hits >= 2:
+                return True
+    # If it contains many common affixes, treat as Indonesian-ish
+    aff = sum(1 for a in ("meng", "meny", "ber", "ter", "per", "ke", "se", "di", "pe") if a in t)
+    return hits >= 1 and aff >= 2
+
+def _should_skip_translation_for_id(src: str) -> bool:
+    # Skip if it already appears to be Indonesian (anti-paraphrase)
+    return _looks_indonesian(src)
+
+def _pick_provider() -> str:
+    return "gemini"
+
+def _embed_add_long_field(embed: discord.Embed, title: str, value: str, *, max_inline_chars: int = 1024) -> Tuple[discord.Embed, List[discord.File]]:
+    """Discord embed field values cap at 1024. If longer, attach as .txt and keep embed clean."""
+    files: List[discord.File] = []
+    if value is None:
+        value = ""
+    if len(value) <= max_inline_chars:
+        embed.add_field(name=title, value=value or " ", inline=False)
+        return embed, files
+
+    # attach full text
+    buf = io.BytesIO(value.encode("utf-8", errors="replace"))
+    files.append(discord.File(buf, filename="translation_full.txt"))
+    # show truncated preview
+    preview = value[:max_inline_chars-20] + "\n…(lihat file translation_full.txt)"
+    embed.add_field(name=title, value=preview, inline=False)
+    return embed, files
+
+async def _gemini_generate_text(*, api_key: str, model: str, prompt: str, timeout_sec: float) -> Tuple[bool, str]:
+    if not api_key:
+        return False, "Missing TRANSLATE_GEMINI_API_KEY"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topP": 0.9,
+            "maxOutputTokens": 2048,
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            r = await client.post(url, json=payload)
+        if r.status_code >= 400:
+            # Keep a short diagnostic
+            try:
+                j = r.json()
+                msg = j.get("error", {}).get("message") or r.text
+            except Exception:
+                msg = r.text
+            msg = (msg or "").strip()
+            return False, f"Gemini API error {r.status_code}: {msg[:200]}"
+        j = r.json()
+        # standard response: candidates[0].content.parts[0].text
+        cand = (j.get("candidates") or [{}])[0]
+        content = (cand.get("content") or {})
+        parts = content.get("parts") or []
+        out = ""
+        for p in parts:
+            if isinstance(p, dict) and "text" in p:
+                out += str(p.get("text") or "")
+        out = (out or "").strip()
+        if not out:
+            return False, "Empty response from Gemini"
+        return True, out
+    except Exception as e:
+        return False, f"Gemini request failed: {type(e).__name__}: {e}"
+
+async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
+    # Keep model selection strict and modern; allow override.
+    model = (_env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite").strip() or "gemini-2.5-flash-lite")
+    api_key = _env("TRANSLATE_GEMINI_API_KEY", "").strip()
+    timeout = _as_float(_env("TRANSLATE_TEXT_TIMEOUT_SEC", "25"), 25.0)
+    timeout = max(5.0, min(60.0, timeout))
+
+    # Translate-only prompt; no explanations.
+    prompt = (
+        f"You are a translation engine. Translate the text to {target_lang}. "
+        "Return ONLY the translated text. Preserve line breaks. Do not add commentary.\n\n"
+        f"TEXT:\n{text}"
+    )
+    ok, out = await _gemini_generate_text(api_key=api_key, model=model, prompt=prompt, timeout_sec=timeout)
+    return ok, out
+
+async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, str]:
+    return await _gemini_translate_text(text, "Japanese")
+
+async def _gemini_translate_text_ko_multi(text: str) -> Tuple[bool, str]:
+    return await _gemini_translate_text(text, "Korean")
+
+async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, str]:
+    return await _gemini_translate_text(text, "Chinese (Simplified)")
 
 log = logging.getLogger(__name__)
 

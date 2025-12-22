@@ -621,11 +621,22 @@ def _pick_provider() -> str:
     """
     return "gemini"
 def _pick_gemini_key() -> str:
-    """Return the ONLY allowed API key for translate: TRANSLATE_GEMINI_API_KEY.
+    """Return the API key used for translate.
 
-    We must never fall back to GEMINI_API_KEY / GEMINI_API_KEY_B / backups here.
+    Primary key: TRANSLATE_GEMINI_API_KEY (recommended).
+    Optional fallback (OFF by default): set TRANSLATE_ALLOW_FALLBACK=1 to allow using
+    GEMINI_API_KEY / GEMINI_API_KEY_B when the translate key is missing.
     """
-    return _env("TRANSLATE_GEMINI_API_KEY", "").strip()
+    key = _env("TRANSLATE_GEMINI_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        allow_fallback = _as_bool("TRANSLATE_ALLOW_FALLBACK", False)
+    except Exception:
+        allow_fallback = False
+    if allow_fallback:
+        return (_env("GEMINI_API_KEY", "").strip() or _env("GEMINI_API_KEY_B", "").strip() or "")
+    return ""
 
 # ---- Gemini GenerateContent endpoint/model resolution (prevents 404 model-not-found) ----
 # We do NOT mutate runtime_env.json or require users to change config. We treat configured
@@ -1408,7 +1419,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
-    preferred_model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash"))
+    preferred_model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
     target_label = _lang_label(target_lang)
     prompt = (
@@ -1426,7 +1437,10 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         api_v, model = await _gemini_resolve_generatecontent_endpoint(key, preferred_model, kind="image")
         url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model}:generateContent?key={key}"
         data_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
+        base_timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "30"))
+        # Clamp: avoid too-small / too-large timeouts.
+        base_timeout_s = max(5.0, min(60.0, base_timeout_s))
+        timeout_s = base_timeout_s
 
         def _make_payload(p: str) -> Dict[str, Any]:
             return {
@@ -1469,10 +1483,18 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                 break
             return False, None, f"gemini_vision_http_{last_status}:{(last_body or '')[:220]}"
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-            okv, data, errv = await _post_payload(session, prompt)
-            if not okv:
-                return False, "", "", errv
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                okv, data, errv = await _post_payload(session, prompt)
+                if not okv:
+                    return False, "", "", errv
+        except asyncio.TimeoutError:
+            # Retry once with a slightly larger timeout for slow images.
+            timeout_s = min(60.0, base_timeout_s + 12.0)
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+                okv, data, errv = await _post_payload(session, prompt)
+                if not okv:
+                    return False, "", "", errv
 
         candidates = data.get("candidates") or []
         parts: List[Dict[str, Any]] = []
@@ -1560,8 +1582,6 @@ class TranslateCommands(commands.Cog):
         self._last_call: Dict[int, float] = {}
         self._registered = False
         self._register_lock = asyncio.Lock()
-        self._target_overrides: Dict[int, str] = {}
-
     def _cooldown_ok(self, user_id: int) -> Tuple[bool, float]:
         cd = _as_float("TRANSLATE_COOLDOWN_SEC", 5.0)
         now = asyncio.get_event_loop().time()
@@ -1572,8 +1592,6 @@ class TranslateCommands(commands.Cog):
         return True, 0.0
 
     async def _ensure_registered(self):
-        if not _as_bool("TRANSLATE_ENABLE", True):
-            return
         async with self._register_lock:
             if self._registered:
                 return
@@ -1585,7 +1603,7 @@ class TranslateCommands(commands.Cog):
 
             ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
             rev_ctx_name = _env("REVERSE_IMAGE_CTX_NAME", "Reverse image (Nixe)").strip() or "Reverse image (Nixe)"
-            extra_ctx = _as_bool("TRANSLATE_EXTRA_CTX_ENABLE", False)
+            extra_ctx = False  # hardlock: extra context menus disabled (text handled by c20_translate_commands_text.py)
             su_ctx_name = _env("TRANSLATE_SUNDA_CTX_NAME", "").strip()
             jw_ctx_name = _env("TRANSLATE_JAWA_CTX_NAME", "").strip()
             ar_ctx_name = _env("TRANSLATE_AR_CTX_NAME", "").strip()
@@ -1623,7 +1641,8 @@ class TranslateCommands(commands.Cog):
             except Exception:
                 pass
 
-            # add commands per guild
+            # add commands per guild (ONLY image translate ctx + reverse image)
+            # NOTE: Text translation is handled by `c20_translate_commands_text.py` and is not registered here.
             for gid in gids:
                 gobj = discord.Object(id=gid)
                 try:
@@ -1644,92 +1663,15 @@ class TranslateCommands(commands.Cog):
                     )
                 except Exception:
                     pass
+                try:
+                    self.bot.tree.add_command(
+                        app_commands.ContextMenu(name=rev_ctx_name, callback=self.reverse_image_ctx),
+                        guild=gobj,
+                    )
+                except Exception:
+                    pass
 
-                if su_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(name=su_ctx_name, callback=self.translate_message_ctx_sunda),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if su_to_id_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(
-                                name=su_to_id_ctx_name,
-                                callback=self.translate_message_ctx_sunda_to_id,
-                            ),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if su_to_en_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(
-                                name=su_to_en_ctx_name,
-                                callback=self.translate_message_ctx_sunda_to_en,
-                            ),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if jw_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(name=jw_ctx_name, callback=self.translate_message_ctx_jawa),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if jw_to_id_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(
-                                name=jw_to_id_ctx_name,
-                                callback=self.translate_message_ctx_jawa_to_id,
-                            ),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if jw_to_en_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(
-                                name=jw_to_en_ctx_name,
-                                callback=self.translate_message_ctx_jawa_to_en,
-                            ),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if ar_ctx_name:
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(name=ar_ctx_name, callback=self.translate_message_ctx_arabic),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if _as_bool("REVERSE_IMAGE_ENABLE", True):
-                    try:
-                        self.bot.tree.add_command(
-                            app_commands.ContextMenu(name=rev_ctx_name, callback=self.reverse_image_ctx),
-                            guild=gobj,
-                        )
-                    except Exception:
-                        pass
-
-                if _as_bool("TRANSLATE_SLASH_ENABLE", False):
+                if False:  # hardlock: slash translate disabled (use text module)
                     try:
                         self.bot.tree.add_command(self.translate_slash, guild=gobj)
                     except Exception:
@@ -1751,76 +1693,8 @@ class TranslateCommands(commands.Cog):
             self._registered = True
             log.info("[translate] registered ctx+slash to gids=%s", gids)
 
-
-    async def translate_message_ctx_sunda(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate specifically to Sundanese.
-        Uses the same pipeline as translate_message_ctx but overrides the target language for this interaction.
-        """
-        key = int(getattr(interaction, "id", 0) or 0)
-        try:
-            override = _env("TRANSLATE_SUNDA_TARGET", "Sundanese").strip() or "Sundanese"
-        except Exception:
-            override = "Sundanese"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
-    async def translate_message_ctx_jawa(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate specifically to Javanese.
-        Uses the same pipeline as translate_message_ctx but overrides the target language for this interaction.
-        """
-        key = int(getattr(interaction, "id", 0) or 0)
-        try:
-            override = _env("TRANSLATE_JAWA_TARGET", "Javanese").strip() or "Javanese"
-        except Exception:
-            override = "Javanese"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
-    async def translate_message_ctx_arabic(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate specifically to Arabic.
-        Uses the same pipeline as translate_message_ctx but overrides the target language for this interaction.
-        """
-        key = int(getattr(interaction, "id", 0) or 0)
-        try:
-            override = _env("TRANSLATE_AR_TARGET", "Arabic").strip() or "Arabic"
-        except Exception:
-            override = "Arabic"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
-    async def translate_message_ctx_sunda_to_id(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate Sundanese text to Indonesian (ID)."""
-        key = int(getattr(interaction, "id", 0) or 0)
-        override = "Indonesian"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
-    async def translate_message_ctx_sunda_to_en(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate Sundanese text to English (EN)."""
-        key = int(getattr(interaction, "id", 0) or 0)
-        override = "English"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
-    async def translate_message_ctx_jawa_to_id(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate Javanese text to Indonesian (ID)."""
-        key = int(getattr(interaction, "id", 0) or 0)
-        override = "Indonesian"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
-    async def translate_message_ctx_jawa_to_en(self, interaction: discord.Interaction, message: discord.Message):
-        """Context-menu: Translate Javanese text to English (EN)."""
-        key = int(getattr(interaction, "id", 0) or 0)
-        override = "English"
-        self._target_overrides[key] = override
-        await self.translate_message_ctx(interaction, message)
-
     async def reverse_image_ctx(self, interaction: discord.Interaction, message: discord.Message):
         """Message context-menu: Reverse image search for attachments / embed images."""
-        if not _as_bool("REVERSE_IMAGE_ENABLE", True):
-            await interaction.response.send_message("Reverse image search is disabled.", ephemeral=True)
-            return
 
         ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
@@ -1961,9 +1835,6 @@ class TranslateCommands(commands.Cog):
             raise
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
-        if not _as_bool("TRANSLATE_ENABLE", True):
-            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
-            return
 
         ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
@@ -2010,17 +1881,14 @@ class TranslateCommands(commands.Cog):
 
         # Unwrap reply/forward wrappers if needed.
         src_msg = _pick_best_source_message(message)
-
-        override = self._target_overrides.pop(int(getattr(interaction, "id", 0) or 0), None)
-        if override:
-            target = override
-        else:
-            target = _env("TRANSLATE_TARGET_LANG", "id").strip() or "id"
+        # Image-only context: always translate images to Indonesian (ID).
+        # Text-only translation lives in c20_translate_commands_text.py.
+        target = "id"
         debug = _as_bool("TRANSLATE_DEBUG_LOG", False)
 
         try:
             log.info(
-                "[translate] ctx invoke uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
+                "[translate] ctx invoke mode=img_ctx_strict_v3 uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
                 getattr(interaction.user, "id", None),
                 getattr(message, "id", None),
                 type(src_msg).__name__,
@@ -2035,32 +1903,14 @@ class TranslateCommands(commands.Cog):
 
         # -------------------------
         # 1) Collect base text (chat / embed text)
-
-        # 1) Collect base text (chat / embed text)
         # -------------------------
-        raw_text = (getattr(src_msg, "content", "") or "").strip()
-        text_for_chat = raw_text
-        raw_text_is_id = _is_probably_indonesian(raw_text)
+        # Image-only context menu: do NOT translate message text or embed text.
+        # Text translation is handled by `c20_translate_commands_text.py`.
+        text_for_chat = ""
 
+        # Keep embeds list for scanning embedded images only (Step 2).
         embeds = list(getattr(src_msg, "embeds", None) or [])
-        if embeds:
-            emb_text = _extract_text_from_embeds(embeds)
-            if emb_text:
-                if not text_for_chat or _looks_like_only_urls(text_for_chat):
-                    # kalau chat kosong / cuma URL, pakai teks embed saja
-                    text_for_chat = emb_text
-                else:
-                    # kalau dua-duanya ada teks, gabungkan supaya info embed juga ikut diterjemahkan
-                    if raw_text_is_id:
-                        # Hard rule: ignore Indonesian chat user text; keep embed text only.
-                        text_for_chat = emb_text
-                    else:
-                        text_for_chat = f"{text_for_chat}\n\n{emb_text}"
 
-        text_for_chat = (text_for_chat or "").strip()
-        if raw_text_is_id and not embeds:
-            # Hard rule: ignore Indonesian chat user completely when it is the only text.
-            text_for_chat = ""
         # -------------------------
         # 2) Collect images (attachments + embed images)
         # -------------------------
@@ -2123,22 +1973,29 @@ class TranslateCommands(commands.Cog):
                 if debug:
                     log.exception("[translate] error while scanning embeds for images")
 
-        # Jika tidak ada teks chat/embed dan tidak ada gambar sama sekali -> langsung beri pesan kosong.
-        if not text_for_chat and not image_entries:
-            await _safe_followup_text("Tidak ada teks yang bisa diterjemahkan dari pesan ini.")
+        # Image-only: this context menu is for image translation.
+        # If no image is present, guide the user to the text translate command.
+        if not image_entries:
+            await _safe_followup_text("Tidak ada gambar pada pesan ini. Untuk teks: gunakan `nixe translate ke <lang> <teks>`.")
             return
+        # Strict image-only output: this command must not translate message/embed text.
+        text_for_chat = ""
+
+        # For image translation, the displayed target should match the image policy (force ID by default).
+        title_target = "id" if _as_bool("TRANSLATE_IMAGE_FORCE_ID", True) else target
+
 
         # -------------------------
         # 3) Bangun embed gabungan (gambar dulu, lalu chat)
         # -------------------------
         # Resolve language profile for display label / multi-style heuristics.
-        prof = resolve_lang(target)
+        prof = resolve_lang(title_target)
         if prof is not None:
             target_display = prof.display
             target_code = prof.code.lower()
         else:
-            target_display = str(target)
-            target_code = str(target or "").strip().lower()
+            target_display = str(title_target)
+            target_code = str(title_target or "").strip().lower()
         embed = discord.Embed(title=f"Translated → {target_display}")
         attachments_text: List[str] = []
         desc_parts: List[str] = []
@@ -2219,162 +2076,14 @@ class TranslateCommands(commands.Cog):
                 desc_parts.append(translated_final)
             full_parts.append(f"[{field_name}]\nTRANSLATED → {img_target_display}:\n{translated_final}")
             image_any_ok = True
-
-
-
-        # 3b) Proses chat user (jika ada text_for_chat)
+        # 3b) Proses chat user (DISABLED)
+        # HARDLOCK: context-menu translate ini khusus GAMBAR (OCR → translate → ID).
+        # Untuk translate teks, gunakan module terpisah: c20_translate_commands_text.py.
         provider = _pick_provider()
-        translated_chat = ""
-        chat_val: str | None = None
+        chat_val = None
 
-                # Mode khusus: target JA/KR/ZH dengan dua gaya + romaji/pinyin
-        tgt_lower = target_code
-        is_ja_target = tgt_lower.startswith("ja")
-        is_ko_target = tgt_lower.startswith("ko")
-        is_zh_target = tgt_lower.startswith("zh")
-
-        ja_dual_enable = is_ja_target and _as_bool("TRANSLATE_JA_DUAL_ENABLE", True)
-        ko_dual_enable = is_ko_target and _as_bool("TRANSLATE_KO_DUAL_ENABLE", True)
-        zh_dual_enable = is_zh_target and _as_bool("TRANSLATE_ZH_DUAL_ENABLE", True)
-        ja_romaji_enable = _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True)
-
-        dual_kind: str | None = None
-        dual_formal = ""
-        dual_casual = ""
-        dual_romaji = ""
-
-        if text_for_chat:
-            # chunking seperti sebelumnya
-            try:
-                try:
-                    max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
-                except Exception:
-                    max_chars = 1800
-                chunks = _chunk_text(text_for_chat, max_chars)
-
-                if ja_dual_enable or ko_dual_enable or zh_dual_enable:
-                    formal_parts: List[str] = []
-                    casual_parts: List[str] = []
-                    romaji_parts: List[str] = []
-                    for ch in chunks:
-                        if ja_dual_enable:
-                            ok_multi, res = await _gemini_translate_text_ja_multi(ch)
-                        elif ko_dual_enable:
-                            ok_multi, res = await _gemini_translate_text_ko_multi(ch)
-                        elif zh_dual_enable:
-                            ok_multi, res = await _gemini_translate_text_zh_multi(ch)
-                        else:
-                            ok_multi, res = False, {"reason": "invalid_dual_state"}
-
-                        if not ok_multi:
-                            if debug:
-                                log.warning(
-                                    "[translate] multi-style failed; fallback to single translation: %s",
-                                    res.get("reason"),
-                                )
-                            # fallback: single-mode translate seluruh teks supaya hasil tetap ada
-                            ok_single, out_single = await _gemini_translate_text(text_for_chat, target)
-                            if not ok_single:
-                                await _safe_followup_text(out_single)
-                                return
-                            translated_chat = out_single.strip()
-                            ja_dual_enable = ko_dual_enable = zh_dual_enable = False
-                            dual_kind = None
-                            dual_formal = dual_casual = dual_romaji = ""
-                            break
-
-                        formal_parts.append(res.get("formal", ""))
-                        casual_parts.append(res.get("casual", ""))
-                        rom = res.get("romaji", "")
-                        if rom:
-                            romaji_parts.append(rom)
-
-                    if ja_dual_enable or ko_dual_enable or zh_dual_enable:
-                        if ja_dual_enable:
-                            dual_kind = "ja"
-                        elif ko_dual_enable:
-                            dual_kind = "ko"
-                        else:
-                            dual_kind = "zh"
-                        dual_formal = "\n".join(p for p in formal_parts if p).strip()
-                        dual_casual = "\n".join(p for p in casual_parts if p).strip()
-                        if romaji_parts:
-                            dual_romaji = "\n".join(p for p in romaji_parts if p).strip()
-
-                if not (ja_dual_enable or ko_dual_enable or zh_dual_enable):
-                    # mode lama: satu hasil terjemahan saja
-                    out_parts = []
-                    for ch in chunks:
-                        # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
-                        ok, out = await _gemini_translate_text(ch, target)
-                        if not ok:
-                            await _safe_followup_text(out)
-                            return
-                        out_parts.append(out)
-                    translated_chat = "\n".join(out_parts).strip()
-            except Exception as e:
-                if debug:
-                    log.exception("[translate] chat translation failed: %r", e)
-                translated_chat = ""
-                dual_kind = None
-                dual_formal = dual_casual = dual_romaji = ""
-
-            # Susun field chat user
-            src_preview = text_for_chat
-
-            if dual_kind and (dual_formal or dual_casual or dual_romaji):
-                # Untuk JA/KR/ZH, tampilkan 2 gaya + romanisasi sebagai field terpisah tanpa blok Source
-                if dual_kind == "ja":
-                    lang_label = "JA"
-                    romaji_label = "🔤 Romaji"
-                elif dual_kind == "ko":
-                    lang_label = "KO"
-                    romaji_label = "🔤 Romanization"
-                else:
-                    lang_label = "ZH"
-                    romaji_label = "🔤 Pinyin"
-
-                if dual_formal:
-                    embed.add_field(
-                        name=f"💬 {lang_label} (formal / polite)",
-                        value=(dual_formal[:1024] or "(empty)"),
-                        inline=False,
-                    )
-                if dual_casual:
-                    embed.add_field(
-                        name=f"💬 {lang_label} (casual / daily chat)",
-                        value=(dual_casual[:1024] or "(empty)"),
-                        inline=False,
-                    )
-                if dual_romaji:
-                    embed.add_field(
-                        name=romaji_label,
-                        value=(dual_romaji[:1024] or "(empty)"),
-                        inline=False,
-                    )
-                chat_val = None  # jangan buat field gabungan lagi
-            else:
-                if translated_chat and translated_chat.strip() != text_for_chat.strip():
-                    # ada hasil terjemahan berbeda
-                    value_lines = []
-                    value_lines.append("")
-                    value_lines.append(src_preview)
-                    value_lines.append("")
-                    value_lines.append(f"**Translated → {target_display}:**")
-                    value_lines.append(translated_chat)
-                    chat_val = "\n".join(value_lines)
-                else:
-                    # sama atau gagal terjemah; untuk kasus ini:
-                    # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
-                    #   menampilkan blok Chat user lagi agar embed tetap ringkas.
-                    if not (image_any_ok and target_code == "id"):
-                        value_lines = []
-                        value_lines.append("")
-                        value_lines.append(src_preview)
-                        value_lines.append("")
-                        value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
-                        chat_val = "\n".join(value_lines)
         if chat_val is not None:
+
             # Hard rule: ignore chat-user segment if the *original* chat text is already Indonesian.
             # (We check text_for_chat, not chat_val, because chat_val may include translated blocks / labels.)
             if not _is_probably_indonesian(text_for_chat or ""):
@@ -2395,9 +2104,18 @@ class TranslateCommands(commands.Cog):
         truncated = False
         if desc:
             # Embed description hard limit ~4096 chars; keep headroom.
-            if len(desc) > 3900:
+            try:
+                max_desc = int(float(_env("TRANSLATE_IMAGE_MAX_DESC_CHARS", "4000")))
+            except Exception:
+                max_desc = 4000
+            if max_desc < 1000:
+                max_desc = 1000
+            if max_desc > 4000:
+                max_desc = 4000
+
+            if len(desc) > max_desc:
                 truncated = True
-                desc = desc[:3900].rstrip() + "\n\n(Lanjutan ada di attachment: translation_full.txt)"
+                desc = desc[:max_desc].rstrip() + "\n\n(Lanjutan ada di attachment: translation_full.txt)"
             embed.description = desc
 
         # Optional debug footer (OFF by default). Users do not want provider metadata in normal output.
@@ -2406,7 +2124,7 @@ class TranslateCommands(commands.Cog):
         except Exception:
             show_footer = False
         if show_footer:
-            footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
+            footer_bits = [f"text={provider}", "image=gemini", f"target={title_target}"]
             embed.set_footer(text=" • ".join(footer_bits))
 
         # Attach full text only when needed (e.g., description truncated or leftover from fields).

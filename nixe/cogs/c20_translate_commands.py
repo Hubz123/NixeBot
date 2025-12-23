@@ -2,34 +2,43 @@
 c20_translate_commands.py
 
 Translate cog (guild-only, add-only):
-- Message Context Menu "Translate (Nixe)" (and optional /translate).
-- Translates plain text, embeds, and images.
-- Image mode performs OCR and then translates the extracted text.
-- Translate is STRICTLY Gemini-only and STRICTLY uses TRANSLATE_GEMINI_API_KEY.
-  (No Groq. No fallback to other Gemini keys.)
+- Provides Message Context Menu "Translate (Nixe)" and optional /translate slash.
+- Supports translating plain text, embeds (when message content is empty or only a URL),
+  and images via Gemini Vision OCR + translation.
+- Uses separate API keys (TRANSLATE_*) so it does NOT touch LPG Gemini or Phish Groq keys.
 
-Secret (.env only):
+Secrets (.env only):
   TRANSLATE_GEMINI_API_KEY=...
+  TRANSLATE_GROQ_API_KEY=...
 
 Optional configs (runtime_env.json or env):
   TRANSLATE_ENABLE=1
-  TRANSLATE_TARGET_LANG=id            (default: id)
-  TRANSLATE_IMAGE_FORCE_ID=1          (default: 1; always translate OCR-from-image to Indonesian)
+  TRANSLATE_PROVIDER=gemini|groq   (default: gemini if key present else groq)
+  TRANSLATE_TARGET_LANG=id        (default: id)
   TRANSLATE_GEMINI_MODEL=gemini-2.5-flash-lite
+  TRANSLATE_GROQ_MODEL=llama-3.1-8b-instant
   TRANSLATE_IMAGE_MODEL=gemini-2.5-flash
-  TRANSLATE_MAX_CHARS=6000
+  TRANSLATE_TIMEOUT_SEC=12
+  TRANSLATE_MAX_CHARS=1800
   TRANSLATE_COOLDOWN_SEC=5
-  TRANSLATE_EPHEMERAL=0
+  TRANSLATE_EPHEMERAL=1
   TRANSLATE_CTX_NAME="Translate (Nixe)"
-  TRANSLATE_SLASH_ENABLE=0
-  TRANSLATE_GUILD_ID / TRANSLATE_GUILD_IDS
-
-Other:
-  REVERSE_IMAGE_ENABLE=1 (reverse-image context menu; separate feature)
+  TRANSLATE_SLASH_ENABLE=1
+  TRANSLATE_GUILD_ID=<single guild id>
+  TRANSLATE_GUILD_IDS=<comma separated ids>
+  TRANSLATE_ALLOW_FALLBACK=1  (allow fallback to GEMINI_API_KEY / GEMINI_API_KEY_B)
+  TRANSLATE_JA_DUAL_ENABLE=1   (if target_lang is JA, output formal+casual+romaji)
+  TRANSLATE_JA_ROMAJI_ENABLE=1 (enable romaji field in JA dual mode)
+  REVERSE_IMAGE_ENABLE=1       (enable Reverse image context menu)
+  REVERSE_IMAGE_CTX_NAME="Reverse image (Nixe)"
+  REVERSE_IMAGE_MAX_IMAGES=3
+  REVERSE_IMAGE_EPHEMERAL=1
+  REVERSE_IMAGE_COOLDOWN_SEC=5
 """
+
 from __future__ import annotations
 
-import os, json, logging, re, asyncio, base64, io, difflib
+import os, json, logging, re, asyncio, base64, io
 from typing import Optional, Tuple, List, Dict, Any
 from urllib import parse as urllib_parse
 
@@ -38,6 +47,111 @@ import aiohttp
 from nixe.translate import resolve_lang
 from discord import app_commands
 from discord.ext import commands
+
+# ---------------------------------------------------------------------------
+# Safety helpers (missing in some patch revisions)
+# ---------------------------------------------------------------------------
+
+def _strip_common_model_labels(text: str) -> str:
+    """
+    Remove common provider/model label noise that some LLM backends prepend.
+    This is best-effort and intentionally conservative.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    # Drop leading "via=...", "provider=...", "model=..." tokens if present.
+    s = re.sub(r"^(?:via|provider|model)\s*[:=]\s*[^\n]+\n+", "", s, flags=re.IGNORECASE)
+    # Drop simple "gemini:" / "groq:" prefixes
+    s = re.sub(r"^(?:gemini|groq)\s*[:\-]\s*", "", s, flags=re.IGNORECASE)
+    return s
+
+def _pack_text_into_embed(
+    embed: discord.Embed,
+    full_text: str,
+    max_total_chars: int = 4800,
+) -> Tuple[discord.Embed, List[discord.File]]:
+    """
+    Pack text into a single embed as safely as possible.
+
+    - Keeps total packed characters <= max_total_chars (best-effort).
+    - Uses description first, then additional fields (<= 1024 each).
+    - Clears existing fields to avoid duplicates.
+    """
+    try:
+        embed.clear_fields()
+    except Exception:
+        pass
+
+    files: List[discord.File] = []
+
+    text = (full_text or "").strip()
+    if not text:
+        embed.description = "(empty)"
+        return embed, files
+
+    # Enforce max_total_chars budget (best-effort; keep head).
+    if max_total_chars and len(text) > max_total_chars:
+        text = text[:max_total_chars].rstrip() + "\n\n…"
+
+    # Description budget: Discord hard limit is 4096. Keep some headroom.
+    desc_budget = min(3900, 4096)
+    desc = text[:desc_budget].rstrip()
+    rest = text[len(desc):].lstrip("\n")
+
+    embed.description = desc
+
+    # Remaining goes to fields in 1024-char chunks.
+    # Field name cannot be empty; use zero-width space to keep it clean.
+    if rest:
+        chunks = []
+        while rest:
+            chunks.append(rest[:1024])
+            rest = rest[1024:]
+            if len(chunks) >= 20:  # safety cap (Discord field limit is 25; keep room for others)
+                break
+        for idx, c in enumerate(chunks, 1):
+            embed.add_field(name="\u200b" if idx == 1 else "\u200b", value=c or "(empty)", inline=False)
+
+    return embed, files
+
+async def _safe_followup_send(
+    interaction: discord.Interaction,
+    *,
+    content: Optional[str] = None,
+    embed: Optional[discord.Embed] = None,
+    files: Optional[List[discord.File]] = None,
+    ephemeral: bool = False,
+):
+    """
+    Send using interaction.followup when possible; fall back to channel.send.
+    Designed to avoid 'Unknown interaction' / response-state errors.
+    """
+    if files is None:
+        files = []
+    try:
+        # If response was deferred or already responded, followup is the right path.
+        if hasattr(interaction, "followup"):
+            return await interaction.followup.send(content=content, embed=embed, files=files, ephemeral=ephemeral)
+    except Exception:
+        pass
+
+    # Fallback: try responding directly if not done.
+    try:
+        if hasattr(interaction, "response") and not interaction.response.is_done():
+            return await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+    except Exception:
+        pass
+
+    # Last resort: channel message (non-ephemeral).
+    try:
+        ch = getattr(interaction, "channel", None)
+        if ch is not None:
+            return await ch.send(content=content, embed=embed, files=files)
+    except Exception:
+        pass
+    return None
+
 
 log = logging.getLogger(__name__)
 
@@ -87,164 +201,22 @@ def _normalize_for_compare(s: str) -> str:
     return s
 
 def _seems_untranslated(src: str, out: str, target_lang: str) -> bool:
-    """Heuristic to detect when a model likely echoed the source instead of translating."""
     ns = _normalize_for_compare(src)
     no = _normalize_for_compare(out)
     if not ns or not no:
         return False
-
-    tl = _normalize_lang_code(target_lang)
-
     if ns == no:
         return True
-
-    # Robust similarity (handles whitespace / line breaks better than zip-compare)
-    try:
-        if difflib.SequenceMatcher(None, ns, no).ratio() > 0.92:
-            return True
-    except Exception:
-        pass
-
-    # English-echo detector: if target is NOT English, but output still looks English,
-    # treat it as untranslated (common failure mode on OCR pipelines).
-    def _looks_english(txt: str) -> bool:
-        t = (txt or "").lower()
-        if not t:
-            return False
-        # quick stopword score
-        sw = ("the ", " and ", " to ", " of ", " in ", " is ", " was ", " were ", " with ", " as ", " at ", " for ")
-        score = sum(1 for s in sw if s in t)
-        # also require mostly latin letters
-        latin = len(re.findall(r"[a-z]", t))
-        return score >= 2 and latin >= 40
-
-    if tl != "en" and _looks_english(src) and _looks_english(out):
+    # rough similarity based on char overlap
+    common = sum(1 for a, b in zip(ns, no) if a == b)
+    sim = common / max(len(ns), len(no))
+    if sim > 0.90:
         return True
-
-    # Script expectations for certain targets (best-effort).
-    if tl == "ja" and _looks_english(src) and not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", out):
-        return True
-    if tl == "ko" and _looks_english(src) and not re.search(r"[\uac00-\ud7af]", out):
-        return True
-    if tl == "zh" and _looks_english(src) and not re.search(r"[\u3400-\u9fff]", out):
-        return True
-
-    # If target is latin-based but output is heavy CJK/Hangul, likely untranslated / wrong-mode.
-    if tl in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl", "su", "jv"):
+    # if target is latin-based but output is heavy CJK/Hangul, likely untranslated
+    if target_lang.lower() in ("id", "en", "ms", "fr", "es", "de", "pt", "it", "vi", "tl"):
         nonlatin = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", out))
         if nonlatin > 8 and nonlatin / max(1, len(out)) > 0.20:
             return True
-
-    return False
-
-
-
-def _looks_english_global(txt: str) -> bool:
-    """Detect likely-English output (heuristic, tuned for translate enforcement).
-
-    We intentionally keep this conservative, but we must catch short English
-    outputs that otherwise slip through.
-    """
-    t = (txt or "").lower().strip()
-    # Normalize whitespace so stopword checks work even with OCR line-breaks.
-    t = re.sub(r"\s+", " ", t)
-    if not t:
-        return False
-
-    # Quick reject: already looks Indonesian
-    try:
-        if _is_probably_indonesian(t):
-            return False
-    except Exception:
-        pass
-
-    # English stopwords + common UI verbs
-    sw = (
-        " the ", " and ", " to ", " of ", " in ", " is ", " are ", " was ", " were ",
-        " with ", " as ", " at ", " for ", " on ", " from ", " this ", " that ",
-    )
-    ui = (" please ", " sign in ", " login ", " log in ", " password ", " account ", " verify ", " verification ", " click ", " continue ")
-
-    padded = f" {t} "
-    sw_hits = sum(1 for s in sw if s in padded)
-    ui_hits = sum(1 for s in ui if s in padded)
-
-    latin = len(re.findall(r"[a-z]", t))
-
-    # Strong English signal
-    if sw_hits >= 2 and latin >= 30:
-        return True
-
-    # Short English UI strings
-    if (sw_hits >= 1 or ui_hits >= 1) and latin >= 18:
-        return True
-
-    return False
-
-def _looks_english_image_strict(txt: str) -> bool:
-    """Stricter English detector for IMAGE translation enforcement.
-
-    Gemini Vision sometimes returns very short English UI phrases (e.g. "Scan QR code").
-    The global detector is intentionally conservative; for images we must be stricter
-    to satisfy the policy: image->ID must not remain in English.
-    """
-    t = (txt or "").lower().strip()
-    t = re.sub(r"\s+", " ", t)
-    if not t:
-        return False
-    try:
-        if _is_probably_indonesian(t):
-            return False
-    except Exception:
-        pass
-
-    padded = f" {t} "
-    sw = (" the ", " and ", " to ", " of ", " in ", " is ", " are ", " was ", " were ", " this ", " that ")
-    if any(s in padded for s in sw):
-        # even short phrases like "this is" should trigger
-        return True
-
-    # Common phishing / UI English tokens observed in Discord scam images
-    ui = (
-        "scan", "qr", "code", "click", "claim", "free", "gift", "bonus", "nitro",
-        "join", "server", "invite", "verify", "update", "download", "security", "support",
-        "limited", "offer", "congratulations", "winner",
-    )
-    latin = len(re.findall(r"[a-z]", t))
-    if latin >= 8 and any(w in t for w in ui):
-        return True
-
-    return False
-
-def _needs_target_enforcement(out: str, target_lang: str) -> bool:
-    """Best-effort check that output matches target language expectation.
-
-    Used to force a second-pass translate when OCR pipelines return the original language.
-    """
-    tl = _normalize_lang_code(target_lang)
-    o = (out or "").strip()
-    if not o:
-        return False
-    if tl == "en":
-        return False
-
-    # Script-based targets should contain their scripts.
-    if tl == "ja":
-        return not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", o)
-    if tl == "ko":
-        return not re.search(r"[\uac00-\ud7af]", o)
-    if tl == "zh":
-        return not re.search(r"[\u3400-\u9fff]", o)
-    # Latin-based targets: if output still looks English (and not Indonesian), enforce.
-    if tl in ("id", "su", "jv"):
-        # If it already looks Indonesian, accept.
-        try:
-            if _is_probably_indonesian(o):
-                return False
-        except Exception:
-            pass
-        return _looks_english_global(o)
-
     return False
 
 
@@ -276,133 +248,6 @@ def _looks_like_only_urls(text: str) -> bool:
     t = re.sub(r"[\W_]+", " ", t)
     return len(t.strip()) == 0
 
-
-def _normalize_lang_code(lang: str) -> str:
-    t = (lang or "").strip().lower()
-
-    # allow common aliases / display names used across Nixe configs
-    if t in (
-        "id", "id-id", "indo", "ind", "indonesia", "indonesian",
-        "bahasa", "bahasa indonesia",
-    ):
-        return "id"
-    if t in ("en", "en-us", "en-gb", "english"):
-        return "en"
-    if t in ("jp", "ja-jp", "japanese", "nihongo", "日本語"):
-        return "ja"
-    if t in ("kr", "ko-kr", "korean", "한국어"):
-        return "ko"
-    if t in (
-        "cn", "zh-cn", "zh-hans", "zh-hant", "zh-tw",
-        "chinese", "中文",
-    ):
-        return "zh"
-    if t in ("jawa", "javanese", "jv", "bahasa jawa"):
-        return "jv"
-    if t in ("sunda", "sundanese", "su", "bahasa sunda"):
-        return "su"
-    return t
-
-
-def _lang_label(lang_code: str) -> str:
-    """Human-friendly language label for LLM prompts (avoid ambiguous ISO codes like 'id')."""
-    lc = _normalize_lang_code(lang_code)
-    labels = {
-        "id": "Bahasa Indonesia (Indonesian)",
-        "en": "English",
-        "ja": "Japanese",
-        "ko": "Korean",
-        "zh": "Chinese",
-        "jv": "Javanese",
-        "su": "Sundanese",
-    }
-    return labels.get(lc, lc)
-_ID_STOPWORDS = {
-    "yang","dan","di","ke","dari","untuk","ini","itu","kamu","aku","gue","lu","nya",
-    "ga","gak","nggak","enggak","tidak","bukan","udah","sudah","aja","lah","kok","sih",
-    "juga","bang","cok","woe","mana","kenapa","gimana","apa","tuh","nih","kayak",
-    "kalo","kalau","bisa","ngga","yg","dgn","tp","tapi","karena","soalnya","pake","pakai"
-}
-
-def _is_probably_indonesian(text: str) -> bool:
-    """Heuristic only: detect Indonesian (including short UI phrases / casual chat).
-
-    This is used to prevent needless/paraphrasing translation when target=ID and the
-    source is already Indonesian.
-    """
-    if not text:
-        return False
-
-    t = re.sub(r"\s+", " ", text.strip().lower())
-    if not t:
-        return False
-
-    # Very short strings are hard, but common UI words should still be detected.
-    common_id = (
-        "selamat", "datang", "masuk", "keluar", "daftar", "lanjut", "berikutnya", "kembali",
-        "batal", "kirim", "hapus", "simpan", "akun", "kata sandi", "sandi", "verifikasi",
-        "kode", "email", "nomor", "telepon", "alamat", "nama", "peringatan", "keamanan",
-        "silakan", "mohon", "maaf", "klik", "tautan", "buka", "tutup", "gratis", "promo",
-        "pembayaran", "bayar", "saldo", "transfer", "dompet", "bank",
-    )
-    if len(t) >= 6:
-        for w in common_id:
-            if w in t:
-                return True
-
-    # Token-based stopword heuristic
-    toks = re.findall(r"[a-zA-Z']+", t)
-
-    # Very short (1-2 tokens): treat common Indonesian UI words as Indonesian to avoid re-translation.
-    short_ui = {
-        'masuk','keluar','batal','konfirmasi','lanjut','kembali','daftar','kirim','simpan','hapus',
-        'verifikasi','kode','pengaturan','beranda','akun','sandi','kata sandi','nama','alamat','telepon','email'
-    }
-    if len(toks) <= 2:
-        if t in short_ui or any(w in short_ui for w in toks):
-            return True
-
-    if len(toks) < 2:
-        return False
-
-    # Short phrases: 1 stopword hit is enough
-    hits = sum(1 for w in toks if w in _ID_STOPWORDS)
-    if len(t) < 28:
-        return hits >= 1 or bool(re.search(r"\b(nggak|enggak|tidak|banget|kalo|kalau|udah|sudah|aja|lah|sih|kok|gak)\b", t))
-
-    # Longer text: stronger signal
-    if len(toks) >= 4 and hits >= 2:
-        return True
-
-    if re.search(r"\b(nggak|enggak|tidak|banget|kalo|kalau|udah|sudah|aja|lah|sih|kok|gak)\b", t):
-        return True
-
-    return False
-def _should_skip_translation_for_id(source_text: str, target_lang: str) -> bool:
-    return _normalize_lang_code(target_lang) == "id" and _is_probably_indonesian(source_text)
-
-
-def _embed_add_long_field(embed: discord.Embed, name: str, text: str, *, inline: bool = False) -> str:
-    """Add text to embed safely.
-
-    Policy:
-    - Add ONLY ONE field per call (avoid (1/4) split fields).
-    - If the text doesn't fit, return the remainder so the caller can attach it as translation_full.txt.
-    """
-    txt = (text or "").strip()
-    if not txt:
-        txt = "(empty)"
-
-    if len(embed.fields) >= 25:
-        return txt
-
-    chunks = _chunk_text(txt, 1024)
-    head = chunks[0] if chunks else "(empty)"
-    embed.add_field(name=name, value=head or "(empty)", inline=inline)
-
-    if len(chunks) <= 1:
-        return ""
-    return "\n\n".join(chunks[1:])
 def _extract_text_from_embeds(embeds: List[discord.Embed]) -> str:
     """Extract readable text from embeds, preferring description."""
     parts: List[str] = []
@@ -621,392 +466,89 @@ def _pick_provider() -> str:
     """
     return "gemini"
 def _pick_gemini_key() -> str:
-    """Return the API key used for translate.
-
-    Primary key: TRANSLATE_GEMINI_API_KEY (recommended).
-    Optional fallback (OFF by default): set TRANSLATE_ALLOW_FALLBACK=1 to allow using
-    GEMINI_API_KEY / GEMINI_API_KEY_B when the translate key is missing.
-    """
-    key = _env("TRANSLATE_GEMINI_API_KEY", "").strip()
+    key = _env("TRANSLATE_GEMINI_API_KEY", "")
     if key:
         return key
-    try:
-        allow_fallback = _as_bool("TRANSLATE_ALLOW_FALLBACK", False)
-    except Exception:
-        allow_fallback = False
-    if allow_fallback:
-        return (_env("GEMINI_API_KEY", "").strip() or _env("GEMINI_API_KEY_B", "").strip() or "")
+    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
+        return _env("GEMINI_API_KEY", _env("GEMINI_API_KEY_B", _env("GEMINI_BACKUP_API_KEY", "")))
     return ""
-
-# ---- Gemini GenerateContent endpoint/model resolution (prevents 404 model-not-found) ----
-# We do NOT mutate runtime_env.json or require users to change config. We treat configured
-# model names as hints, then auto-resolve to a model that this API key actually supports.
-_GEMINI_ENDPOINT_CACHE: Dict[str, Tuple[str, str]] = {}  # kind -> (api_version, model)
-_GEMINI_BAD_MODELS: Dict[str, set] = {}  # kind -> set of models that returned 404/unsupported
-_GEMINI_IMAGE_INLINE_STYLE: str = "camel"  # "camel" -> inlineData/mimeType, "snake" -> inline_data/mime_type
-
-def _gemini_norm_model_name(name: str) -> str:
-    name = (name or "").strip()
-    if name.startswith("models/"):
-        name = name[len("models/"):]
-    return name
-
-def _gemini_candidate_models(preferred: str) -> List[str]:
-    preferred = _gemini_norm_model_name(preferred)
-    cand = []
-    if preferred:
-        cand.append(preferred)
-    # Prefer newer Flash/Flash-Lite families first; keep a broad fallback list.
-    for m in (
-        "gemini-3-flash-preview",
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-flash",
-        "gemini-2.0-flash-lite",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-001",
-        "gemini-2.0-flash-lite-001",
-        # Last-resort older names (only if key supports them)
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
-        "gemini-1.5-flash-002",
-    ):
-        if m not in cand:
-            cand.append(m)
-    return cand
-
-async def _gemini_list_models(key: str, api_version: str) -> Tuple[bool, List[str], str]:
-    """Return models available for this key & API version that support generateContent."""
-    url = f"https://generativelanguage.googleapis.com/{api_version}/models?key={key}"
-    timeout_s = float(_env("TRANSLATE_LISTMODELS_TIMEOUT_SEC", "10"))
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    return False, [], f"listmodels_http_{resp.status}:{body[:220]}"
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        return False, [], f"listmodels_exc:{e!r}"
-
-    out: List[str] = []
-    models = data.get("models") or []
-    for m in models:
-        if not isinstance(m, dict):
-            continue
-        name = _gemini_norm_model_name(str(m.get("name") or ""))
-        if not name:
-            continue
-        methods = m.get("supportedGenerationMethods") or m.get("supportedActions") or []
-        # If methods is missing, be permissive (some responses omit it).
-        supports = True
-        if isinstance(methods, list) and methods:
-            supports = "generateContent" in methods
-        if supports:
-            out.append(name)
-    return True, out, ""
-
-def _gemini_pick_best(available: List[str], preferred: str, bad: Optional[set] = None) -> Optional[str]:
-    bad = bad or set()
-    avail_set = set(_gemini_norm_model_name(x) for x in available if isinstance(x, str))
-    # Try preferred/candidates first
-    for m in _gemini_candidate_models(preferred):
-        mn = _gemini_norm_model_name(m)
-        if mn in avail_set and mn not in bad:
-            return mn
-    # Otherwise, pick something that looks like Flash/Flash-Lite and isn't marked bad
-    for prefix in ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"):
-        for mn in sorted(avail_set):
-            if mn.startswith(prefix) and mn not in bad:
-                return mn
-    # Fallback: first available not bad
-    for mn in sorted(avail_set):
-        if mn not in bad:
-            return mn
-    return None
-
-async def _gemini_resolve_generatecontent_endpoint(key: str, preferred_model: str, kind: str = "text") -> Tuple[str, str]:
-    """Resolve (api_version, model) that works for this key for generateContent."""
-    preferred_model = _gemini_norm_model_name(preferred_model)
-    bad = _GEMINI_BAD_MODELS.setdefault(kind, set())
-
-    # Cached result still valid unless it was marked bad.
-    cached = _GEMINI_ENDPOINT_CACHE.get(kind)
-    if cached and cached[1] not in bad:
-        return cached
-
-    # Try listModels on v1 first (newer), then v1beta.
-    for api_v in ("v1", "v1beta"):
-        ok, avail, _err = await _gemini_list_models(key, api_v)
-        if ok and avail:
-            pick = _gemini_pick_best(avail, preferred_model, bad=bad)
-            if pick:
-                _GEMINI_ENDPOINT_CACHE[kind] = (api_v, pick)
-                return api_v, pick
-
-    # If listModels is unavailable, fall back to preferred/candidates on v1beta.
-    for pick in _gemini_candidate_models(preferred_model):
-        mn = _gemini_norm_model_name(pick)
-        if mn and mn not in bad:
-            _GEMINI_ENDPOINT_CACHE[kind] = ("v1beta", mn)
-            return "v1beta", mn
-
-    # Worst case: return the preferred_model even if bad, to surface a meaningful error upstream.
-    return "v1beta", preferred_model or "gemini-2.0-flash"
-
-def _gemini_inline_part(mime: str, data_b64: str) -> Dict[str, Any]:
-    global _GEMINI_IMAGE_INLINE_STYLE
-    if _GEMINI_IMAGE_INLINE_STYLE == "snake":
-        return {"inline_data": {"mime_type": mime, "data": data_b64}}
-    return {"inlineData": {"mimeType": mime, "data": data_b64}}
-
-def _gemini_should_flip_inline_style(err_text: str) -> bool:
-    t = (err_text or "").lower()
-    # Typical error messages when field names don't match expected schema.
-    return ("unknown name" in t and "inlinedata" in t) or ("unknown name" in t and "inline_data" in t) or ("invalid json payload" in t)
 
 def _pick_groq_key() -> str:
-    """Translate must not use Groq. This stub remains only for backward-compat safety."""
+    key = _env("TRANSLATE_GROQ_API_KEY", "")
+    if key:
+        return key
+    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
+        return _env("GROQ_API_KEY", "")
     return ""
-async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
-    """Translate plain text using Gemini *strictly* via TRANSLATE_GEMINI_API_KEY.
 
-    Policy constraints:
-    - No fallback to any other Gemini key.
-    - No Groq usage for translate.
-    - Avoid paraphrase if target is Indonesian and source already Indonesian.
-    """
+# -------------------------
+# Gemini / Groq text translate
+# -------------------------
+
+async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
     key = _pick_gemini_key()
     if not key:
         return False, "missing TRANSLATE_GEMINI_API_KEY"
-
-    target_code = _normalize_lang_code(target_lang)
-    target_label = _lang_label(target_code)
-
-    # Hard rule: if target is Indonesian AND source already Indonesian, do not translate (avoid paraphrase).
-    if _should_skip_translation_for_id(text, target_code):
-        return True, (text or "").strip() or "(empty)"
-
-    model_primary = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
-    model_strong = _env("TRANSLATE_GEMINI_MODEL_STRONG", model_primary)
-
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env("TRANSLATE_SCHEMA", '{"translation": "...", "reason": "..."}')
 
     base_sys = _env(
         "TRANSLATE_SYS_MSG",
-        f"You are a translation engine. Translate the user's text into {target_label}. "
+        f"You are a translation engine. Translate the user's text into {target_lang}. "
         "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
-        "Do NOT add commentary. Output only the translated result."
+        f"If the text is already in {target_lang}, return it unchanged. "
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+    )
+    strict_sys = _env(
+        "TRANSLATE_SYS_MSG_STRICT",
+        f"STRICT MODE. Translate ALL user text into {target_lang}. "
+        "No source-language remnants except proper nouns/usernames/URLs. "
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
 
-    strict_sys = (
-        f"Translate into {target_label}. Output ONLY {target_label}. "
-        "Do NOT repeat the original text. Do NOT include explanations, notes, or labels. "
-        "Keep formatting (paragraphs) similar to the source."
-    )
-
-    hard_sys = (
-        f"FINAL CHECK: Produce ONLY the {target_label} translation. "
-        "If you are uncertain, still translate faithfully. "
-        "ABSOLUTELY NO English sentences unless they are proper nouns/URLs."
-    )
-    src = (text or "").strip()
-    if not src:
-        return False, "empty_source"
-
-    async def _call(model: str, sys_msg: str) -> Tuple[bool, str]:
+    async def _call(sys_msg: str) -> Tuple[bool, str]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [
+                {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
+            ],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        }
         try:
-            import aiohttp
+            import aiohttp  # type: ignore
         except Exception as e:
             return False, f"aiohttp missing: {e!r}"
 
-        api_v, model2 = await _gemini_resolve_generatecontent_endpoint(key, model, kind="text")
-        url = "https://generativelanguage.googleapis.com/" + api_v + "/models/" + model2 + ":generateContent?key=" + key
-        payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": f"{schema}\n\nTEXT:\n{src}"}]}
-            ],
-            "systemInstruction": {"role": "system", "parts": [{"text": sys_msg}]},
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2048,
-            },
-        }
-
         try:
             async with aiohttp.ClientSession() as sess:
-                async with sess.post(url, json=payload, timeout=25) as resp:
+                async with sess.post(url, json=payload, timeout=20) as resp:
                     if resp.status != 200:
                         body = await resp.text()
-                        # Keep it short; do not leak large responses.
                         return False, f"Gemini HTTP {resp.status}: {body[:200]}"
                     j = await resp.json()
                     cand = (j.get("candidates") or [{}])[0]
                     parts = (((cand.get("content") or {}).get("parts")) or [])
                     out = ""
                     for p in parts:
-                        if isinstance(p, dict) and "text" in p:
+                        if "text" in p:
                             out += p["text"]
                     out = _clean_output(out)
-
-                    # Accept JSON or plain text fallback.
-                    #
-                    # IMPORTANT: Gemini occasionally returns JSON with different key names
-                    # (e.g., translatedText/output/result). Returning "(empty)" as a
-                    # "successful" translation causes downstream to show `translate_failed`.
-                    # Treat empty outputs as a failure so we can retry / surface the real error.
-                    out2 = ""
+                    # accept JSON or plain text fallback
                     try:
                         jj = json.loads(out)
-                        if isinstance(jj, dict):
-                            for k in ("translation", "translated", "translated_text", "translatedText", "output", "result"):
-                                v = jj.get(k, None)
-                                if isinstance(v, str) and v.strip():
-                                    out2 = v.strip()
-                                    break
-                            # If still empty, sometimes the model nests it.
-                            if not out2:
-                                v2 = jj.get("data", None)
-                                if isinstance(v2, dict):
-                                    for k in ("translation", "translated", "translated_text", "translatedText", "output", "result"):
-                                        vv = v2.get(k, None)
-                                        if isinstance(vv, str) and vv.strip():
-                                            out2 = vv.strip()
-                                            break
-                        elif isinstance(jj, str):
-                            out2 = jj.strip()
+                        out2 = str(jj.get("translation", "") or out)
+                        return True, out2.strip() or "(empty)"
                     except Exception:
-                        out2 = out.strip()
-
-                    if not out2 or out2.strip() in ("(empty)", "empty"):
-                        return False, "empty_translation"
-                    return True, out2
-
+                        return True, out.strip() or "(empty)"
         except Exception as e:
             return False, f"Gemini request failed: {e!r}"
 
-    # Multi-attempt with language enforcement. If model echoes source or wrong language, retry stricter.
-    attempts = [
-        (model_primary, base_sys),
-        (model_primary, strict_sys),
-        (model_strong, hard_sys),
-    ]
-
-    last_ok = False
-    last_out = ""
-    last_err = ""
-
-    for (m, sysmsg) in attempts:
-        ok, out = await _call(m, sysmsg)
-        if not ok:
-            last_ok = False
-            last_err = out
-            continue
-
-        # Enforce target language / non-echo
-        if _seems_untranslated(src, out, target_code) or _needs_target_enforcement(out, target_code):
-            last_ok = True
-            last_out = out
-            continue
-
-        # Good enough
-        return True, out
-
-    # If we got only echoed/wrong-language outputs, treat as failure (so caller will not publish wrong language).
-    if last_ok and last_out:
-        # FINAL ENFORCEMENT: one last strict pass using a stronger model hint.
-        try:
-            if _seems_untranslated(src, last_out, target_code) or _needs_target_enforcement(last_out, target_code):
-                strong_model = _env("TRANSLATE_GEMINI_MODEL_STRONG", model_strong or model_primary)
-                final_sys = _env(
-                    "TRANSLATE_SYS_MSG_FINAL_STRICT",
-                    f"FINAL STRICT MODE. Translate the user's text into {target_label}. "
-                    f"Output ONLY the translation in {target_label}. "
-                    "Do NOT include the original text. Do NOT include explanations."
-                )
-                okf, outf = await _call_with_model(key, src, strong_model, final_sys, temperature=0.0)
-                if okf and outf and (not _seems_untranslated(src, outf, target_code)) and (not _needs_target_enforcement(outf, target_code)):
-                    return True, outf
-
-                # Extra Indonesian hard-pass if still looks English.
-                if target_code == "id":
-                    final_sys2 = (
-                        "MODE TERAKHIR. TERJEMAHKAN SELURUH TEKS KE BAHASA INDONESIA. "
-                        "HASILKAN HANYA TERJEMAHAN BAHASA INDONESIA, TANPA TEKS ASLI, TANPA PENJELASAN."
-                    )
-                    okf2, outf2 = await _call_with_model(key, src, strong_model, final_sys2, temperature=0.0)
-                    if okf2 and outf2 and (not _seems_untranslated(src, outf2, target_code)) and (not _needs_target_enforcement(outf2, target_code)):
-                        return True, outf2
-        except Exception:
-            pass
-        return False, "untranslated_output"
-    return False, last_err or "translate_failed"
-
-
-async def _call_with_model(
-    key: str,
-    text: str,
-    model_hint: str,
-    sys_msg: str,
-    temperature: float = 0.0,
-) -> Tuple[bool, str]:
-    """
-    Call Gemini generateContent using an explicit model hint, but still auto-resolve to a model
-    that the API key supports (prevents 404 model-not-found).
-
-    Returns (ok, output_text_or_error).
-    """
-    key = (key or "").strip()
-    if not key:
-        return False, "missing TRANSLATE_GEMINI_API_KEY"
-    text = (text or "").strip()
-
-    try:
-        import aiohttp  # type: ignore
-    except Exception as e:
-        return False, f"aiohttp missing: {e!r}"
-
-    # Resolve model using listModels (v1 first, then v1beta), with a broad fallback list.
-    api_v, model2 = await _gemini_resolve_generatecontent_endpoint(key, model_hint, kind="text")
-
-    url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model2}:generateContent?key={key}"
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}],
-        "generationConfig": {"temperature": float(temperature), "maxOutputTokens": 2048},
-    }
-
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=payload, timeout=25) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    # Mark the resolved model as bad for this kind when the server says it's unsupported/not found.
-                    if resp.status in (404, 400, 403):
-                        _GEMINI_BAD_MODELS.setdefault("text", set()).add(_gemini_norm_model_name(model2))
-                        _GEMINI_ENDPOINT_CACHE.pop("text", None)
-                    return False, f"Gemini HTTP {resp.status}: {body[:200]}"
-                j = await resp.json(content_type=None)
-    except Exception as e:
-        return False, f"Gemini request failed: {e!r}"
-
-    try:
-        cand = (j.get("candidates") or [{}])[0]
-        parts = (((cand.get("content") or {}).get("parts")) or [])
-        out = ""
-        for p in parts:
-            if isinstance(p, dict) and "text" in p:
-                out += str(p["text"])
-        out = _clean_output(out)
-        # If model returns JSON, try to extract translation field.
-        try:
-            jj = json.loads(out)
-            if isinstance(jj, dict):
-                out2 = str(jj.get("translation", "") or jj.get("translated", "") or out)
-                return True, (out2 or "").strip() or "(empty)"
-        except Exception:
-            pass
-        return True, out.strip() or "(empty)"
-    except Exception as e:
-        return False, f"parse_failed:{e!r}"
+    ok, out = await _call(base_sys)
+    if ok and _seems_untranslated(text, out, target_lang):
+        ok2, out2 = await _call(strict_sys)
+        if ok2 and out2:
+            out = out2
+    return ok, out
 
 
 async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, str]]:
@@ -1030,7 +572,7 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
-    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env(
         "TRANSLATE_JA_SCHEMA",
         '{"formal": "...", "casual": "...", "romaji": "...", "wuwa": "...", "wuwa_romaji": "...", "reason": "..."}',
@@ -1051,8 +593,7 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
         f"Return ONLY compact JSON matching this schema: {schema}. No prose. Do not wrap in code fences."
     )
 
-    api_v, model2 = await _gemini_resolve_generatecontent_endpoint(key, model, kind="text")
-    url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model2}:generateContent?key={key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     payload = {
         "contents": [
             {
@@ -1157,9 +698,38 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
         }
 
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
-    # Safety: Translate is Gemini-only in Nixe. Keep this function as a hard-fail guard
-    # in case old wiring calls it accidentally.
-    return False, "Groq translate is disabled. Use TRANSLATE_GEMINI_API_KEY (Gemini) for translate."
+    key = _pick_groq_key()
+    if not key:
+        return False, "missing TRANSLATE_GROQ_API_KEY"
+    model = _env("TRANSLATE_GROQ_MODEL", "llama-3.1-8b-instant")
+    sys_msg = (
+        f"You are a translation engine. Translate user text to {target_lang}. "
+        "Output ONLY the translation, no commentary."
+    )
+    try:
+        from groq import Groq  # type: ignore
+    except Exception as e:
+        return False, f"Groq SDK missing: {e!r}"
+
+    try:
+        client = Groq(api_key=key)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": text},
+            ],
+            temperature=0.2,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return True, out or "(empty)"
+    except Exception as e:
+        return False, f"Groq request failed: {e!r}"
+
+# -------------------------
+# Gemini Vision OCR + translate image
+# -------------------------
+
 def _detect_image_mime(image_bytes: bytes) -> str:
     # quick magic
     if image_bytes[:4] == b"\x89PNG":
@@ -1186,7 +756,7 @@ async def _gemini_translate_text_ko_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
-    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env(
         "TRANSLATE_KO_SCHEMA",
         '{"formal": "...", "casual": "...", "romaji": "...", "reason": "..."}',
@@ -1303,7 +873,7 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
-    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-1.5-flash")
+    model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env(
         "TRANSLATE_ZH_SCHEMA",
         '{"formal": "...", "casual": "...", "romaji": "...", "reason": "..."}',
@@ -1419,14 +989,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     key = _pick_gemini_key()
     if not key:
         return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
-    preferred_model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
+    model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
-    target_label = _lang_label(target_lang)
     prompt = (
         "You are an OCR+translation engine.\n"
-        "1) Extract all readable text from the image EXACTLY as-is (preserve line breaks; do not summarize).\n"
-        f"2) Translate it to {target_label}.\n"
-        f"IMPORTANT: If the extracted text is already in {target_label}, set translation equal to text (do not paraphrase).\n"
+        "1) Extract all readable text from the image.\n"
+        f"2) Translate it to {target_lang}.\n"
         f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
         "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
@@ -1434,67 +1002,24 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
 
     try:
         import aiohttp
-        api_v, model = await _gemini_resolve_generatecontent_endpoint(key, preferred_model, kind="image")
-        url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model}:generateContent?key={key}"
-        data_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        base_timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "30"))
-        # Clamp: avoid too-small / too-large timeouts.
-        base_timeout_s = max(5.0, min(60.0, base_timeout_s))
-        timeout_s = base_timeout_s
-
-        def _make_payload(p: str) -> Dict[str, Any]:
-            return {
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"text": p},
-                        _gemini_inline_part(mime, data_b64),
-                    ],
-                }],
-                "generationConfig": {"temperature": 0.0},
-            }
-
-        async def _post_payload(session: aiohttp.ClientSession, p: str) -> Tuple[bool, Any, str]:
-            nonlocal api_v, model, url
-            last_status = None
-            last_body = ""
-            for _attempt in range(3):
-                payload = _make_payload(p)
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        return True, await resp.json(content_type=None), ""
-                    last_body = await resp.text()
-                    last_status = resp.status
-
-                # Model alias mismatch / unsupported: re-resolve and retry.
-                if last_status == 404 and ("not found" in (last_body or "").lower() or "not supported" in (last_body or "").lower()):
-                    _GEMINI_BAD_MODELS.setdefault("image", set()).add(model)
-                    _GEMINI_ENDPOINT_CACHE.pop("image", None)
-                    api_v, model = await _gemini_resolve_generatecontent_endpoint(key, preferred_model, kind="image")
-                    url = f"https://generativelanguage.googleapis.com/{api_v}/models/{model}:generateContent?key={key}"
-                    continue
-
-                # Payload field-name mismatch: flip inline style and retry.
-                if last_status == 400 and _gemini_should_flip_inline_style(last_body):
-                    global _GEMINI_IMAGE_INLINE_STYLE
-                    _GEMINI_IMAGE_INLINE_STYLE = "snake" if _GEMINI_IMAGE_INLINE_STYLE == "camel" else "camel"
-                    continue
-
-                break
-            return False, None, f"gemini_vision_http_{last_status}:{(last_body or '')[:220]}"
-
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-                okv, data, errv = await _post_payload(session, prompt)
-                if not okv:
-                    return False, "", "", errv
-        except asyncio.TimeoutError:
-            # Retry once with a slightly larger timeout for slow images.
-            timeout_s = min(60.0, base_timeout_s + 12.0)
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-                okv, data, errv = await _post_payload(session, prompt)
-                if not okv:
-                    return False, "", "", errv
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    }},
+                ],
+            }],
+            "generationConfig": {"temperature": 0.2},
+        }
+        timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json(content_type=None)
 
         candidates = data.get("candidates") or []
         parts: List[Dict[str, Any]] = []
@@ -1531,47 +1056,12 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
             text_match = re.search(r'"text"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
             trans_match = re.search(r'"translation"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
             detected = _squash_blank_lines(text_match.group(1)) if text_match else out
-            translated = _squash_blank_lines(trans_match.group(1)) if trans_match else ""
+            translated = _squash_blank_lines(trans_match.group(1)) if trans_match else detected
             return True, detected, translated, "non_json_output"
 
         detected = _squash_blank_lines(str(j.get("text", "") or ""))
         translated = _squash_blank_lines(str(j.get("translation", "") or ""))
         reason = str(j.get("reason", "") or "ok")
-        # Hard rule: if target is Indonesian and OCR text already looks Indonesian, keep it unchanged.
-        if _should_skip_translation_for_id(detected, target_lang):
-            return True, detected, detected, "skip_id_source_is_id"
-        # HARD-ID-RETRY: If target is Indonesian but translation appears unchanged, retry with explicit label.
-        if _normalize_lang_code(target_lang) == "id" and _seems_untranslated(detected, translated, target_lang):
-            prompt2 = (
-                "You are an OCR+translation engine.\n"
-                "1) Extract all readable text from the image.\n"
-                "2) Translate it to Bahasa Indonesia (Indonesian).\n"
-                f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
-                "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}.\n"
-            )
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-                    okv2, data2, errv2 = await _post_payload(session, prompt2)
-                    if not okv2:
-                        # If retry also fails, keep original result.
-                        raise RuntimeError(errv2)
-                candidates2 = data2.get("candidates") or []
-                parts2 = (((candidates2[0].get("content") or {}).get("parts")) or []) if candidates2 else []
-                out2 = "".join([p.get("text","") for p in parts2 if isinstance(p, dict)])
-                out2 = _clean_output(out2)
-                try:
-                    j2 = json.loads(out2)
-                except Exception:
-                    m22 = re.search(r"\{.*\}", out2, flags=re.DOTALL)
-                    j2 = json.loads(m22.group(0)) if m22 else None
-                if isinstance(j2, dict):
-                    t2 = _squash_blank_lines(str(j2.get("translation","") or ""))
-                    if t2:
-                        translated = t2
-                        reason = str(j2.get("reason","") or reason)
-            except Exception:
-                pass
-
         return True, detected, translated, reason
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"
@@ -1582,6 +1072,8 @@ class TranslateCommands(commands.Cog):
         self._last_call: Dict[int, float] = {}
         self._registered = False
         self._register_lock = asyncio.Lock()
+        self._target_overrides: Dict[int, str] = {}
+
     def _cooldown_ok(self, user_id: int) -> Tuple[bool, float]:
         cd = _as_float("TRANSLATE_COOLDOWN_SEC", 5.0)
         now = asyncio.get_event_loop().time()
@@ -1592,6 +1084,8 @@ class TranslateCommands(commands.Cog):
         return True, 0.0
 
     async def _ensure_registered(self):
+        if not _as_bool("TRANSLATE_ENABLE", True):
+            return
         async with self._register_lock:
             if self._registered:
                 return
@@ -1603,7 +1097,7 @@ class TranslateCommands(commands.Cog):
 
             ctx_name = _env("TRANSLATE_CTX_NAME", "Translate (Nixe)").strip() or "Translate (Nixe)"
             rev_ctx_name = _env("REVERSE_IMAGE_CTX_NAME", "Reverse image (Nixe)").strip() or "Reverse image (Nixe)"
-            extra_ctx = False  # hardlock: extra context menus disabled (text handled by c20_translate_commands_text.py)
+            extra_ctx = _as_bool("TRANSLATE_EXTRA_CTX_ENABLE", False)
             su_ctx_name = _env("TRANSLATE_SUNDA_CTX_NAME", "").strip()
             jw_ctx_name = _env("TRANSLATE_JAWA_CTX_NAME", "").strip()
             ar_ctx_name = _env("TRANSLATE_AR_CTX_NAME", "").strip()
@@ -1641,8 +1135,7 @@ class TranslateCommands(commands.Cog):
             except Exception:
                 pass
 
-            # add commands per guild (ONLY image translate ctx + reverse image)
-            # NOTE: Text translation is handled by `c20_translate_commands_text.py` and is not registered here.
+            # add commands per guild
             for gid in gids:
                 gobj = discord.Object(id=gid)
                 try:
@@ -1663,15 +1156,92 @@ class TranslateCommands(commands.Cog):
                     )
                 except Exception:
                     pass
-                try:
-                    self.bot.tree.add_command(
-                        app_commands.ContextMenu(name=rev_ctx_name, callback=self.reverse_image_ctx),
-                        guild=gobj,
-                    )
-                except Exception:
-                    pass
 
-                if False:  # hardlock: slash translate disabled (use text module)
+                if su_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(name=su_ctx_name, callback=self.translate_message_ctx_sunda),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if su_to_id_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=su_to_id_ctx_name,
+                                callback=self.translate_message_ctx_sunda_to_id,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if su_to_en_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=su_to_en_ctx_name,
+                                callback=self.translate_message_ctx_sunda_to_en,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if jw_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(name=jw_ctx_name, callback=self.translate_message_ctx_jawa),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if jw_to_id_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=jw_to_id_ctx_name,
+                                callback=self.translate_message_ctx_jawa_to_id,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if jw_to_en_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(
+                                name=jw_to_en_ctx_name,
+                                callback=self.translate_message_ctx_jawa_to_en,
+                            ),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if ar_ctx_name:
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(name=ar_ctx_name, callback=self.translate_message_ctx_arabic),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if _as_bool("REVERSE_IMAGE_ENABLE", True):
+                    try:
+                        self.bot.tree.add_command(
+                            app_commands.ContextMenu(name=rev_ctx_name, callback=self.reverse_image_ctx),
+                            guild=gobj,
+                        )
+                    except Exception:
+                        pass
+
+                if _as_bool("TRANSLATE_SLASH_ENABLE", False):
                     try:
                         self.bot.tree.add_command(self.translate_slash, guild=gobj)
                     except Exception:
@@ -1693,8 +1263,76 @@ class TranslateCommands(commands.Cog):
             self._registered = True
             log.info("[translate] registered ctx+slash to gids=%s", gids)
 
+
+    async def translate_message_ctx_sunda(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate specifically to Sundanese.
+        Uses the same pipeline as translate_message_ctx but overrides the target language for this interaction.
+        """
+        key = int(getattr(interaction, "id", 0) or 0)
+        try:
+            override = _env("TRANSLATE_SUNDA_TARGET", "Sundanese").strip() or "Sundanese"
+        except Exception:
+            override = "Sundanese"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_jawa(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate specifically to Javanese.
+        Uses the same pipeline as translate_message_ctx but overrides the target language for this interaction.
+        """
+        key = int(getattr(interaction, "id", 0) or 0)
+        try:
+            override = _env("TRANSLATE_JAWA_TARGET", "Javanese").strip() or "Javanese"
+        except Exception:
+            override = "Javanese"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_arabic(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate specifically to Arabic.
+        Uses the same pipeline as translate_message_ctx but overrides the target language for this interaction.
+        """
+        key = int(getattr(interaction, "id", 0) or 0)
+        try:
+            override = _env("TRANSLATE_AR_TARGET", "Arabic").strip() or "Arabic"
+        except Exception:
+            override = "Arabic"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_sunda_to_id(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Sundanese text to Indonesian (ID)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "Indonesian"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_sunda_to_en(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Sundanese text to English (EN)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "English"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_jawa_to_id(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Javanese text to Indonesian (ID)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "Indonesian"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
+    async def translate_message_ctx_jawa_to_en(self, interaction: discord.Interaction, message: discord.Message):
+        """Context-menu: Translate Javanese text to English (EN)."""
+        key = int(getattr(interaction, "id", 0) or 0)
+        override = "English"
+        self._target_overrides[key] = override
+        await self.translate_message_ctx(interaction, message)
+
     async def reverse_image_ctx(self, interaction: discord.Interaction, message: discord.Message):
         """Message context-menu: Reverse image search for attachments / embed images."""
+        if not _as_bool("REVERSE_IMAGE_ENABLE", True):
+            await interaction.response.send_message("Reverse image search is disabled.", ephemeral=True)
+            return
 
         ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
@@ -1826,8 +1464,11 @@ class TranslateCommands(commands.Cog):
 
         embed.set_footer(text="Reverse image search helper: Google Lens • Bing • Yandex • SauceNAO • IQDB")
 
+        files: List[discord.File] = []
+
+
         try:
-            await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+            await _safe_followup_send(interaction, embed=embed, files=files, ephemeral=ephemeral)
         except discord.HTTPException as exc:
             if getattr(exc, "status", None) == 429:
                 log.warning("[revimg] rate limited on interaction.followup.send(): %r", exc)
@@ -1835,6 +1476,9 @@ class TranslateCommands(commands.Cog):
             raise
 
     async def translate_message_ctx(self, interaction: discord.Interaction, message: discord.Message):
+        if not _as_bool("TRANSLATE_ENABLE", True):
+            await interaction.response.send_message("Translate is disabled.", ephemeral=True)
+            return
 
         ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
         if not ok_cd:
@@ -1842,34 +1486,7 @@ class TranslateCommands(commands.Cog):
             return
 
         ephemeral = _as_bool("TRANSLATE_EPHEMERAL", False)
-
-        # Acknowledge ASAP; if the interaction token has expired (Unknown interaction),
-        # we fall back to in-channel send to avoid traceback.
-        can_followup = True
-        try:
-            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
-        except Exception:
-            # Unknown interaction / token expired / already responded / any HTTP issue.
-            can_followup = False
-            ephemeral = False  # cannot do ephemeral without a valid interaction token
-
-        async def _safe_followup_text(text: str) -> None:
-            txt = (text or "").strip()
-            if not txt:
-                return
-            if can_followup:
-                try:
-                    await interaction.followup.send(txt, ephemeral=ephemeral)
-                    return
-                except discord.NotFound:
-                    pass
-                except discord.HTTPException:
-                    pass
-            try:
-                if interaction.channel and hasattr(interaction.channel, "send"):
-                    await interaction.channel.send(txt)
-            except Exception:
-                pass
+        await interaction.response.defer(thinking=True, ephemeral=ephemeral)
 
         # Context-menu provides a partial Message; refetch for full embeds/attachments.
         try:
@@ -1881,14 +1498,17 @@ class TranslateCommands(commands.Cog):
 
         # Unwrap reply/forward wrappers if needed.
         src_msg = _pick_best_source_message(message)
-        # Image-only context: always translate images to Indonesian (ID).
-        # Text-only translation lives in c20_translate_commands_text.py.
-        target = "id"
+
+        override = self._target_overrides.pop(int(getattr(interaction, "id", 0) or 0), None)
+        if override:
+            target = override
+        else:
+            target = _env("TRANSLATE_TARGET_LANG", "id").strip() or "id"
         debug = _as_bool("TRANSLATE_DEBUG_LOG", False)
 
         try:
             log.info(
-                "[translate] ctx invoke mode=img_ctx_strict_v3 uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
+                "[translate] ctx invoke uid=%s mid=%s src=%s rawlen=%s embeds=%s atts=%s snaps=%s target=%s",
                 getattr(interaction.user, "id", None),
                 getattr(message, "id", None),
                 type(src_msg).__name__,
@@ -1903,14 +1523,24 @@ class TranslateCommands(commands.Cog):
 
         # -------------------------
         # 1) Collect base text (chat / embed text)
+
+        # 1) Collect base text (chat / embed text)
         # -------------------------
-        # Image-only context menu: do NOT translate message text or embed text.
-        # Text translation is handled by `c20_translate_commands_text.py`.
-        text_for_chat = ""
+        raw_text = (getattr(src_msg, "content", "") or "").strip()
+        text_for_chat = raw_text
 
-        # Keep embeds list for scanning embedded images only (Step 2).
         embeds = list(getattr(src_msg, "embeds", None) or [])
+        if embeds:
+            emb_text = _extract_text_from_embeds(embeds)
+            if emb_text:
+                if not text_for_chat or _looks_like_only_urls(text_for_chat):
+                    # kalau chat kosong / cuma URL, pakai teks embed saja
+                    text_for_chat = emb_text
+                else:
+                    # kalau dua-duanya ada teks, gabungkan supaya info embed juga ikut diterjemahkan
+                    text_for_chat = f"{text_for_chat}\n\n{emb_text}"
 
+        text_for_chat = (text_for_chat or "").strip()
         # -------------------------
         # 2) Collect images (attachments + embed images)
         # -------------------------
@@ -1973,239 +1603,463 @@ class TranslateCommands(commands.Cog):
                 if debug:
                     log.exception("[translate] error while scanning embeds for images")
 
-        # Image-only: this context menu is for image translation.
-        # If no image is present, guide the user to the text translate command.
-        if not image_entries:
-            await _safe_followup_text("Tidak ada gambar pada pesan ini. Untuk teks: gunakan `nixe translate ke <lang> <teks>`.")
+        # Jika tidak ada teks chat/embed dan tidak ada gambar sama sekali -> langsung beri pesan kosong.
+        if not text_for_chat and not image_entries:
+            await interaction.followup.send("Tidak ada teks yang bisa diterjemahkan dari pesan ini.", ephemeral=ephemeral)
             return
-        # Strict image-only output: this command must not translate message/embed text.
-        text_for_chat = ""
-
-        # For image translation, the displayed target should match the image policy (force ID by default).
-        title_target = "id" if _as_bool("TRANSLATE_IMAGE_FORCE_ID", True) else target
-
 
         # -------------------------
         # 3) Bangun embed gabungan (gambar dulu, lalu chat)
         # -------------------------
         # Resolve language profile for display label / multi-style heuristics.
-        prof = resolve_lang(title_target)
+        prof = resolve_lang(target)
         if prof is not None:
             target_display = prof.display
             target_code = prof.code.lower()
         else:
-            target_display = str(title_target)
-            target_code = str(title_target or "").strip().lower()
-        embed = discord.Embed(title=f"Translated → {target_display}")
-        attachments_text: List[str] = []
-        desc_parts: List[str] = []
-        full_parts: List[str] = []
+            target_display = str(target)
+            target_code = str(target or "").strip().lower()
+        embed = discord.Embed(title="Translation")
 
         # 3a) Proses gambar-gambar (prioritas)
         image_any_ok = False
-        multi_images = len(image_entries) > 1
+        image_blocks: List[str] = []
         for idx, img_bytes in enumerate(image_entries, 1):
-            # Policy: OCR-from-image must translate to Indonesian by default (user requirement).
-            image_target = target
-            if _as_bool("TRANSLATE_IMAGE_FORCE_ID", True):
-                image_target = "id"
-
-            ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, image_target)
-
-            img_prof = resolve_lang(image_target)
-            img_target_display = img_prof.display if img_prof is not None else str(image_target).upper()
-            img_target_code = (img_prof.code.lower() if img_prof is not None else _normalize_lang_code(image_target))
-
-            field_name = f"🖼 Gambar #{idx}" + (f" → {img_target_display}" if _normalize_lang_code(image_target) != _normalize_lang_code(target) else "")
-
+            ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, target)
+            field_name = f"🖼 Gambar #{idx}"
             if not ok_img:
                 # Gagal untuk gambar ini saja; lanjut ke gambar berikutnya / chat.
-                err = (f"Gagal menerjemahkan gambar ini: {reason}" or "(error)").strip()
-                if multi_images:
-                    desc_parts.append(f"{field_name}\n{err}")
-                else:
-                    desc_parts.append(err)
-                full_parts.append(f"[{field_name}]\nERROR: {err}")
+                try:
+                    image_blocks.append(f"**{field_name}**\nGagal menerjemahkan gambar ini: {reason}")
+                except Exception:
+                    pass
+                embed.add_field(
+                    name=field_name,
+                    value=(f"Gagal menerjemahkan gambar ini: {reason}"[:1024] or "(error)"),
+                    inline=False,
+                )
                 continue
 
-            detected_final = (detected or "").strip()
-            translated_final = (translated_img or "").strip()
-            # NOTE: We do not skip translation based on heuristic language detection.
-            # Always try to produce Indonesian output; if the source is already Indonesian,
-            # we accept an unchanged output as success (no paraphrase).
-
-
-            src_check = detected_final or translated_final
-
-            # Pastikan output benar-benar terjemahan (hindari echo OCR / echo source yang sering terjadi).
-            needs_enforce = False
-            if src_check:
-                try:
-                    needs_enforce = (
-                        (not translated_final)
-                        or (detected_final and _seems_untranslated(detected_final, translated_final, img_target_code))
-                        or _needs_target_enforcement(translated_final, img_target_code) or (img_target_code == "id" and _looks_english_image_strict(translated_final))
-                    )
-                except Exception:
-                    # Be conservative: if heuristics fail, force a text-only translate pass.
-                    needs_enforce = True
-
-            if src_check and needs_enforce:
-                ok_t2, t2 = await _gemini_translate_text(src_check, img_target_code)
-                t2s = (t2 or "").strip()
-
-                accepted = False
-                if ok_t2 and t2s:
-                    # For image->ID we accept unchanged output as success (source may already be Indonesian).
-                    if img_target_code == "id":
-                        try:
-                            accepted = _is_probably_indonesian(t2s) or (not _looks_english_image_strict(t2s))
-                        except Exception:
-                            accepted = True
-                    else:
-                        try:
-                            accepted = (not _seems_untranslated(src_check, t2s, img_target_code)) and (not _needs_target_enforcement(t2s, img_target_code))
-                        except Exception:
-                            accepted = True
-
-                if accepted:
-                    translated_final = t2s
+            show_detected = _as_bool("TRANSLATE_IMAGE_SHOW_DETECTED", False)
+            if (detected or "").strip() and show_detected:
+                # tampilkan teks asli + terjemahan (mode debug)
+                value_lines = []
+                value_lines.append("**Detected text:**")
+                value_lines.append((detected or "(empty)")[:600])
+                value_lines.append("")
+                value_lines.append(f"**Translated → {target_display}:**")
+                value_lines.append((translated_img or "(empty)")[:600])
+                val = "\n".join(value_lines)
+            else:
+                # default: tampilkan TERJEMAHAN saja agar rapi (tanpa blok detected)
+                if (translated_img or "").strip():
+                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
                 else:
-                    # Policy: do NOT fall back to Groq for translate.
-                    # Surface a meaningful reason (avoid generic `translate_failed` when Gemini returned output).
-                    if ok_t2 and t2s:
-                        err_msg = "untranslated_output"
-                    else:
-                        err_msg = (t2 if not ok_t2 else "") or "translate_failed"
-                    translated_final = f"_Gagal menerjemahkan (Gemini error)._\n`{err_msg[:180]}`"
+                    val = "_Tidak ada teks terbaca di gambar ini._"
 
-            if not translated_final:
-                translated_final = "_Tidak ada teks terbaca di gambar ini._"
-
-            # Satu embed: tampilkan hanya hasil translate.
-            if multi_images:
-                desc_parts.append(f"{field_name}\n{translated_final}")
-            else:
-                desc_parts.append(translated_final)
-            full_parts.append(f"[{field_name}]\nTRANSLATED → {img_target_display}:\n{translated_final}")
-            image_any_ok = True
-        # 3b) Proses chat user (DISABLED)
-        # HARDLOCK: context-menu translate ini khusus GAMBAR (OCR → translate → ID).
-        # Untuk translate teks, gunakan module terpisah: c20_translate_commands_text.py.
-        provider = _pick_provider()
-        chat_val = None
-
-        if chat_val is not None:
-
-            # Hard rule: ignore chat-user segment if the *original* chat text is already Indonesian.
-            # (We check text_for_chat, not chat_val, because chat_val may include translated blocks / labels.)
-            if not _is_probably_indonesian(text_for_chat or ""):
-                leftover = _embed_add_long_field(embed, "💬 Chat user", chat_val, inline=False)
-                if leftover:
-                    attachments_text.append("\n\n[Chat user]\n" + leftover)
-            else:
+            # Build a text block for unified embed packing later.
+            try:
+                image_blocks.append(f"**{field_name}**\n{val}")
+            except Exception:
                 pass
-        # Build single-embed description (image translations are rendered here).
-        desc = "\n\n".join([p for p in desc_parts if p and p.strip()]).strip()
-        desc_full = "\n\n".join([p for p in full_parts if p and p.strip()]).strip()
+            embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
+            image_any_ok = True
 
-        # If nothing to show at all, fallback message.
-        if not desc and not embed.fields:
-            await _safe_followup_text("Tidak ada teks yang bisa diterjemahkan dari pesan ini.")
+
+
+        # 3b) Proses chat user (jika ada text_for_chat)
+        provider = _pick_provider()
+        translated_chat = ""
+        chat_val: str | None = None
+
+                # Mode khusus: target JA/KR/ZH dengan dua gaya + romaji/pinyin
+        tgt_lower = target_code
+        is_ja_target = tgt_lower.startswith("ja")
+        is_ko_target = tgt_lower.startswith("ko")
+        is_zh_target = tgt_lower.startswith("zh")
+
+        ja_dual_enable = is_ja_target and _as_bool("TRANSLATE_JA_DUAL_ENABLE", True)
+        ko_dual_enable = is_ko_target and _as_bool("TRANSLATE_KO_DUAL_ENABLE", True)
+        zh_dual_enable = is_zh_target and _as_bool("TRANSLATE_ZH_DUAL_ENABLE", True)
+        ja_romaji_enable = _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True)
+
+        dual_kind: str | None = None
+        dual_formal = ""
+        dual_casual = ""
+        dual_romaji = ""
+
+        if text_for_chat:
+            # chunking seperti sebelumnya
+            try:
+                try:
+                    max_chars = int(_as_float("TRANSLATE_MAX_CHARS", 1800))
+                except Exception:
+                    max_chars = 1800
+                chunks = _chunk_text(text_for_chat, max_chars)
+
+                if ja_dual_enable or ko_dual_enable or zh_dual_enable:
+                    formal_parts: List[str] = []
+                    casual_parts: List[str] = []
+                    romaji_parts: List[str] = []
+                    for ch in chunks:
+                        if ja_dual_enable:
+                            ok_multi, res = await _gemini_translate_text_ja_multi(ch)
+                        elif ko_dual_enable:
+                            ok_multi, res = await _gemini_translate_text_ko_multi(ch)
+                        elif zh_dual_enable:
+                            ok_multi, res = await _gemini_translate_text_zh_multi(ch)
+                        else:
+                            ok_multi, res = False, {"reason": "invalid_dual_state"}
+
+                        if not ok_multi:
+                            if debug:
+                                log.warning(
+                                    "[translate] multi-style failed; fallback to single translation: %s",
+                                    res.get("reason"),
+                                )
+                            # fallback: single-mode translate seluruh teks supaya hasil tetap ada
+                            ok_single, out_single = await _gemini_translate_text(text_for_chat, target)
+                            if not ok_single:
+                                await interaction.followup.send(out_single, ephemeral=ephemeral)
+                                return
+                            translated_chat = out_single.strip()
+                            ja_dual_enable = ko_dual_enable = zh_dual_enable = False
+                            dual_kind = None
+                            dual_formal = dual_casual = dual_romaji = ""
+                            break
+
+                        formal_parts.append(res.get("formal", ""))
+                        casual_parts.append(res.get("casual", ""))
+                        rom = res.get("romaji", "")
+                        if rom:
+                            romaji_parts.append(rom)
+
+                    if ja_dual_enable or ko_dual_enable or zh_dual_enable:
+                        if ja_dual_enable:
+                            dual_kind = "ja"
+                        elif ko_dual_enable:
+                            dual_kind = "ko"
+                        else:
+                            dual_kind = "zh"
+                        dual_formal = "\n".join(p for p in formal_parts if p).strip()
+                        dual_casual = "\n".join(p for p in casual_parts if p).strip()
+                        if romaji_parts:
+                            dual_romaji = "\n".join(p for p in romaji_parts if p).strip()
+
+                if not (ja_dual_enable or ko_dual_enable or zh_dual_enable):
+                    # mode lama: satu hasil terjemahan saja
+                    out_parts = []
+                    for ch in chunks:
+                        # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
+                        ok, out = await _gemini_translate_text(ch, target)
+                        if not ok:
+                            await interaction.followup.send(out, ephemeral=ephemeral)
+                            return
+                        out_parts.append(out)
+                    translated_chat = "\n".join(out_parts).strip()
+            except Exception as e:
+                if debug:
+                    log.exception("[translate] chat translation failed: %r", e)
+                translated_chat = ""
+                dual_kind = None
+                dual_formal = dual_casual = dual_romaji = ""
+
+            # Susun field chat user
+            src_preview = text_for_chat[:600]
+
+            if dual_kind and (dual_formal or dual_casual or dual_romaji):
+                # Untuk JA/KR/ZH, tampilkan 2 gaya + romanisasi sebagai field terpisah tanpa blok Source
+                if dual_kind == "ja":
+                    lang_label = "JA"
+                    romaji_label = "🔤 Romaji"
+                elif dual_kind == "ko":
+                    lang_label = "KO"
+                    romaji_label = "🔤 Romanization"
+                else:
+                    lang_label = "ZH"
+                    romaji_label = "🔤 Pinyin"
+
+                if dual_formal:
+                    embed.add_field(
+                        name=f"💬 {lang_label} (formal / polite)",
+                        value=(dual_formal[:1024] or "(empty)"),
+                        inline=False,
+                    )
+                if dual_casual:
+                    embed.add_field(
+                        name=f"💬 {lang_label} (casual / daily chat)",
+                        value=(dual_casual[:1024] or "(empty)"),
+                        inline=False,
+                    )
+                if dual_romaji:
+                    embed.add_field(
+                        name=romaji_label,
+                        value=(dual_romaji[:1024] or "(empty)"),
+                        inline=False,
+                    )
+                chat_val = None  # jangan buat field gabungan lagi
+            else:
+                if translated_chat and translated_chat.strip() != text_for_chat.strip():
+                    # ada hasil terjemahan berbeda
+                    value_lines = []
+                    value_lines.append("")
+                    value_lines.append(src_preview)
+                    value_lines.append("")
+                    value_lines.append(f"**Translated → {target_display}:**")
+                    value_lines.append(translated_chat)
+                    chat_val = "\n".join(value_lines)
+                else:
+                    # sama atau gagal terjemah; untuk kasus ini:
+                    # - jika sudah ada hasil gambar dan target adalah id, kita tidak perlu
+                    #   menampilkan blok Chat user lagi agar embed tetap ringkas.
+                    if not (image_any_ok and target_code == "id"):
+                        value_lines = []
+                        value_lines.append("")
+                        value_lines.append(src_preview)
+                        value_lines.append("")
+                        value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
+                        chat_val = "\n".join(value_lines)
+        # Gabungkan hasil (gambar dulu, lalu chat) ke 1 embed.
+        blocks: List[str] = []
+        for b in image_blocks:
+            b = (b or "").strip()
+            if b:
+                blocks.append(b)
+        if chat_val:
+            cv = _strip_common_model_labels(str(chat_val)).strip()
+            if cv:
+                blocks.append(cv)
+
+        full_text = "\n\n".join(blocks).strip()
+        if not full_text:
+            await _safe_followup_send(
+                interaction,
+                content="Tidak ada teks yang bisa diterjemahkan dari pesan ini.",
+                ephemeral=ephemeral,
+            )
             return
 
-        truncated = False
-        if desc:
-            # Embed description hard limit ~4096 chars; keep headroom.
-            try:
-                max_desc = int(float(_env("TRANSLATE_IMAGE_MAX_DESC_CHARS", "4000")))
-            except Exception:
-                max_desc = 4000
-            if max_desc < 1000:
-                max_desc = 1000
-            if max_desc > 4000:
-                max_desc = 4000
+        # Pack sampai 4800 karakter tampil (4096 desc + 1 field), overflow => attach .txt
+        embed, files = _pack_text_into_embed(
+            embed,
+            full_text,
+            max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
+        )
+        # Footer info provider untuk debug ringan
+        footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
+        embed.set_footer(text=" • ".join(footer_bits))
 
-            if len(desc) > max_desc:
-                truncated = True
-                desc = desc[:max_desc].rstrip() + "\n\n(Lanjutan ada di attachment: translation_full.txt)"
-            embed.description = desc
+        await _safe_followup_send(interaction, embed=embed, files=files, ephemeral=ephemeral)
 
-        # Optional debug footer (OFF by default). Users do not want provider metadata in normal output.
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """
+        Lightweight text command handler: "nixe translate ke <lang> ..." (no slash).
+
+        Examples:
+          nixe translate ke jp
+          please, marry me
+
+          nixe translate ke id please translate this
+
+        Behaviour:
+        - Only works in guild text channels.
+        - Respects TRANSLATE_TEXT_ENABLE and cooldown (TRANSLATE_COOLDOWN_SEC).
+        - Uses the same Gemini pipelines as context-menu translate, but only for plain text
+          (no embed/image handling here).
+        """
         try:
-            show_footer = _as_bool("TRANSLATE_SHOW_PROVIDER_FOOTER", False) or debug
-        except Exception:
-            show_footer = False
-        if show_footer:
-            footer_bits = [f"text={provider}", "image=gemini", f"target={title_target}"]
-            embed.set_footer(text=" • ".join(footer_bits))
+            if message.guild is None:
+                return
+            if message.author.bot:
+                return
+            if not _as_bool("TRANSLATE_ENABLE", True):
+                return
+            if not _as_bool("TRANSLATE_TEXT_ENABLE", True):
+                return
 
-        # Attach full text only when needed (e.g., description truncated or leftover from fields).
-        blob_parts: List[str] = []
-        if attachments_text:
-            blob = "\n\n".join([t for t in attachments_text if t and t.strip()]).strip()
-            if blob:
-                blob_parts.append(blob)
-        if truncated and desc_full:
-            blob_parts.append(desc_full)
+            content = (message.content or "").strip()
+            if not content:
+                return
 
-        files = None
-        if blob_parts:
-            blob2 = "\n\n".join([b for b in blob_parts if b and b.strip()]).strip()
-            if blob2:
-                files = [discord.File(fp=io.BytesIO(blob2.encode("utf-8", errors="ignore")), filename="translation_full.txt")]
+            low = content.lower()
+            prefix = "nixe translate"
+            if not low.startswith(prefix):
+                return
 
-        # Prefer replying to the source message in-channel (single visible message).
-        try:
-            if not ephemeral and src_msg and interaction.channel and hasattr(interaction.channel, "send"):
-                ref = None
-                try:
-                    ref = src_msg.to_reference(fail_if_not_exists=False)
-                except Exception:
-                    ref = None
-                send_kwargs = {"embed": embed}
-                if files:
-                    send_kwargs["files"] = files
-                if ref:
-                    send_kwargs["reference"] = ref
-                    send_kwargs["mention_author"] = False
-                await interaction.channel.send(**send_kwargs)
-                # Complete the interaction silently (ephemeral).
-                # Complete interaction without emitting a visible ack (avoid extra 'Sent.' message).
-                try:
-                    await interaction.delete_original_response()
-                except Exception:
-                    pass
+            # Cooldown per user
+            ok_cd, wait_s = self._cooldown_ok(message.author.id)
+            if not ok_cd:
+                # Ringan saja, jangan spam error.
+                return
+
+            # Split baris; baris pertama command, sisanya teks.
+            lines = content.splitlines()
+            first = lines[0]
+            rest_lines = lines[1:]
+
+            tokens = first.split()
+            # tokens minimal: ["nixe", "translate"]
+            target_token = None
+            # cari pola "ke <lang>"
+            for i, tok in enumerate(tokens):
+                if tok.lower() == "ke" and i + 1 < len(tokens):
+                    target_token = tokens[i + 1]
+                    break
+            if target_token is None and len(tokens) >= 3:
+                # fallback: anggap token ke-3 adalah kode bahasa
+                target_token = tokens[2]
+
+            # Mapping token ke nama bahasa yang dipakai oleh model
+            def _map_lang_token(tok: str) -> str:
+                t = (tok or "").strip().lower()
+                if not t:
+                    return ""
+                if t in ("jp", "ja", "jpn", "japanese", "nihongo", "日本語"):
+                    return "Japanese"
+                if t in ("kr", "ko", "kor", "korean", "hangul", "한국어"):
+                    return "Korean"
+                if t in ("cn", "zh", "zho", "chi", "chinese", "mandarin", "中文", "汉语", "漢語"):
+                    return "Chinese"
+                if t in ("id", "indo", "ind", "indonesian", "bahasa indonesia", "bahasa"):
+                    return "Indonesian"
+                if t in ("en", "eng", "english"):
+                    return "English"
+                if t in ("su", "sun", "sunda", "sundanese", "bahasa sunda"):
+                    return "Sundanese"
+                if t in ("jv", "jav", "jawa", "javanese", "bahasa jawa"):
+                    return "Javanese"
+                if t in ("ar", "arab", "arabic", "العربية"):
+                    return "Arabic"
+                # fallback: pakai apa adanya
+                return tok
+
+            default_target = _env("TRANSLATE_TARGET_LANG", "id")
+            target_lang = _map_lang_token(target_token or default_target)
+
+            # Tentukan teks yang ingin diterjemahkan.
+            if rest_lines:
+                text_to_translate = "\n".join(rest_lines).strip()
             else:
-                if not can_followup and interaction.channel and hasattr(interaction.channel, "send"):
-                    send_kwargs = {"embed": embed}
-                    if files:
-                        send_kwargs["files"] = files
-                    await interaction.channel.send(**send_kwargs)
+                # Ambil token setelah bahasa sebagai teks inline.
+                start_idx = None
+                if target_token is not None:
+                    # cari posisi pertama target_token di tokens
+                    for i, tok in enumerate(tokens):
+                        if tok == target_token:
+                            start_idx = i + 1
+                            break
                 else:
-                    if files:
-                        await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
-                    else:
-                        await interaction.followup.send(embed=embed, ephemeral=ephemeral)
-        except discord.HTTPException:
-            # Fallback if reply-send fails due to perms/limits.
-            if interaction.channel and hasattr(interaction.channel, "send"):
-                try:
-                    send_kwargs = {"embed": embed}
-                    if files:
-                        send_kwargs["files"] = files
-                    await interaction.channel.send(**send_kwargs)
-                    return
-                except Exception:
-                    pass
-            if can_followup:
-                if files:
-                    await interaction.followup.send(embed=embed, files=files, ephemeral=ephemeral)
+                    # setelah "nixe translate"
+                    start_idx = 2
+                if start_idx is not None and start_idx < len(tokens):
+                    text_to_translate = " ".join(tokens[start_idx:]).strip()
                 else:
-                    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+                    text_to_translate = ""
 
+            # Kalau teks kosong, coba ambil dari message yang di-reply.
+            if not text_to_translate:
+                ref = message.reference
+                if ref and isinstance(ref.resolved, discord.Message):
+                    ref_msg = ref.resolved
+                    text_to_translate = (ref_msg.content or "").strip()
 
-    
+            if not text_to_translate:
+                await message.channel.send(
+                    "Tidak ada teks yang bisa diterjemahkan dari perintah ini.",
+                    reference=message,
+                )
+                return
+
+            # Resolve profil bahasa untuk label dan multi-style.
+            prof = resolve_lang(target_lang)
+            if prof is not None:
+                target_display = prof.display
+                target_code = prof.code.lower()
+            else:
+                target_display = str(target_lang)
+                target_code = str(target_lang or "").strip().lower()
+
+            provider = _pick_provider()  # saat ini selalu "gemini"
+            files: List[discord.File] = []
+
+            # Jalur multi-style untuk JA/KO/ZH jika diaktifkan.
+            try:
+                if target_code.startswith("ja") and _as_bool("TRANSLATE_JA_DUAL_ENABLE", True):
+                    ok_multi, data = await _gemini_translate_text_ja_multi(text_to_translate)
+                    if not ok_multi:
+                        await message.channel.send(data.get("reason", "Gagal translate ke Jepang."), reference=message)
+                        return
+                    formal = (data.get("formal") or "").strip()
+                    casual = (data.get("casual") or "").strip()
+                    romaji = (data.get("romaji") or "").strip() if _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True) else ""
+                    wuwa = (data.get("wuwa") or "").strip()
+                    wuwa_romaji = (data.get("wuwa_romaji") or "").strip() if _as_bool("TRANSLATE_JA_ROMAJI_ENABLE", True) else ""
+                    embed = discord.Embed(title=f"Translation → {target_display}")
+                    parts: List[str] = []
+                    parts.append(f"**Formal (Global):**\n{formal or '(empty)'}")
+                    parts.append(f"**Casual (Global):**\n{casual or '(empty)'}")
+                    if romaji:
+                        parts.append(f"**Romaji (Global):**\n{romaji}")
+                    if wuwa:
+                        parts.append(f"**WuWa Gamer:**\n{wuwa}")
+                    if wuwa_romaji:
+                        parts.append(f"**WuWa Romaji:**\n{wuwa_romaji}")
+                    full_text = "\n\n".join(parts).strip()
+                    embed, files = _pack_text_into_embed(
+                        embed,
+                        full_text,
+                        max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
+                    )
+                elif target_code.startswith("ko") and _as_bool("TRANSLATE_KO_DUAL_ENABLE", True):
+                    ok_multi, data = await _gemini_translate_text_ko_multi(text_to_translate)
+                    if not ok_multi:
+                        await message.channel.send(data.get("reason", "Gagal translate ke Korea."), reference=message)
+                        return
+                    formal = (data.get("formal") or "").strip()
+                    casual = (data.get("casual") or "").strip()
+                    embed = discord.Embed(title=f"Translation → {target_display}")
+                    full_text = f"**Formal:**\n{formal or '(empty)'}\n\n**Casual:**\n{casual or '(empty)'}"
+                    embed, files = _pack_text_into_embed(
+                        embed,
+                        full_text,
+                        max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
+                    )
+                    ok_multi, data = await _gemini_translate_text_zh_multi(text_to_translate)
+                    if not ok_multi:
+                        await message.channel.send(data.get("reason", "Gagal translate ke Chinese."), reference=message)
+                        return
+                    formal = (data.get("formal") or "").strip()
+                    casual = (data.get("casual") or "").strip()
+                    embed = discord.Embed(title=f"Translation → {target_display}")
+                    embed.add_field(name="Formal", value=(formal or "(empty)")[:1024], inline=False)
+                    embed.add_field(name="Casual", value=(casual or "(empty)")[:1024], inline=False)
+                else:
+                    ok_single, out_single = await _gemini_translate_text(text_to_translate, target_lang)
+                    if not ok_single:
+                        await message.channel.send(out_single, reference=message)
+                        return
+                    translated = (out_single or "").strip()
+                    embed = discord.Embed(title=f"Translation → {target_display}")
+                    full_text = (translated or "(empty)").strip()
+                    embed, files = _pack_text_into_embed(
+                        embed,
+                        full_text,
+                        max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
+                    )
+
+                footer_bits = [f"text={provider}", "image=gemini", f"target={target_lang}"]
+                embed.set_footer(text=" • ".join(footer_bits))
+
+                await message.channel.send(embed=embed, files=files, reference=message)
+            except Exception as e:
+                log.exception("[translate] text-command failed: %s", e)
+                await message.channel.send("Terjadi error saat translate teks ini.", reference=message)
+        except Exception:
+            # Jangan pernah biarkan error di on_message bocor keluar.
+            log.exception("[translate] on_message handler crashed")
+
 
     @commands.Cog.listener()
     async def on_ready(self):

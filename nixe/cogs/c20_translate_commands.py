@@ -77,6 +77,7 @@ def _pack_text_into_embed(
     - Keeps total packed characters <= max_total_chars (best-effort).
     - Uses description first, then additional fields (<= 1024 each).
     - Clears existing fields to avoid duplicates.
+    - If the text would be truncated, attach the full content as translation_full.txt.
     """
     try:
         embed.clear_fields()
@@ -85,35 +86,53 @@ def _pack_text_into_embed(
 
     files: List[discord.File] = []
 
-    text = (full_text or "").strip()
-    if not text:
+    full_text = (full_text or "").strip()
+    if not full_text:
         embed.description = "(empty)"
         return embed, files
 
-    # Enforce max_total_chars budget (best-effort; keep head).
-    if max_total_chars and len(text) > max_total_chars:
-        text = text[:max_total_chars].rstrip() + "\n\n…"
+    note = ""
+    preview = full_text
 
-    # Description budget: Discord hard limit is 4096. Keep some headroom.
+    # If too long, keep a preview in the embed and attach the full text.
+    if max_total_chars and len(full_text) > max_total_chars:
+        try:
+            files.append(
+                discord.File(
+                    fp=io.BytesIO(full_text.encode("utf-8", errors="replace")),
+                    filename="translation_full.txt",
+                )
+            )
+            note = "\n\n(Full output attached: translation_full.txt)"
+        except Exception:
+            note = ""
+        preview = full_text[:max_total_chars].rstrip() + "\n\n…"
+
+    # Description budget: Discord hard limit is 4096.
+    # Keep headroom and reserve space for the note when present.
     desc_budget = min(3900, 4096)
-    desc = text[:desc_budget].rstrip()
-    rest = text[len(desc):].lstrip("\n")
+    if note and desc_budget > len(note) + 50:
+        desc_budget -= len(note)
+
+    desc = preview[:desc_budget].rstrip() + note
+    rest = preview[len(preview[:desc_budget].rstrip()):].lstrip("\n")
 
     embed.description = desc
 
     # Remaining goes to fields in 1024-char chunks.
     # Field name cannot be empty; use zero-width space to keep it clean.
     if rest:
-        chunks = []
+        chunks: List[str] = []
         while rest:
             chunks.append(rest[:1024])
             rest = rest[1024:]
             if len(chunks) >= 20:  # safety cap (Discord field limit is 25; keep room for others)
                 break
-        for idx, c in enumerate(chunks, 1):
-            embed.add_field(name="\u200b" if idx == 1 else "\u200b", value=c or "(empty)", inline=False)
+        for c in chunks:
+            embed.add_field(name="\u200b", value=c or "(empty)", inline=False)
 
     return embed, files
+
 
 async def _safe_followup_send(
     interaction: discord.Interaction,
@@ -372,7 +391,7 @@ async def _fetch_image_bytes(url: str, max_bytes: int = 6_000_000) -> Optional[b
     if not url:
         return None
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=float(_env("TRANSLATE_TIMEOUT_SEC", "15")))
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.get(url) as resp:
                 if resp.status != 200:
@@ -521,7 +540,7 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
         try:
             async with aiohttp.ClientSession() as sess:
-                async with sess.post(url, json=payload, timeout=20) as resp:
+                async with sess.post(url, json=payload, timeout=float(_env("TRANSLATE_TIMEOUT_SEC", "20"))) as resp:
                     if resp.status != 200:
                         body = await resp.text()
                         return False, f"Gemini HTTP {resp.status}: {body[:200]}"
@@ -605,7 +624,7 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
     }
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=payload, timeout=20) as resp:
+            async with sess.post(url, json=payload, timeout=float(_env("TRANSLATE_TIMEOUT_SEC", "20"))) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raw = f"Gemini HTTP {resp.status}: {body[:200]}"
@@ -782,7 +801,7 @@ async def _gemini_translate_text_ko_multi(text: str) -> Tuple[bool, Dict[str, st
     }
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=payload, timeout=20) as resp:
+            async with sess.post(url, json=payload, timeout=float(_env("TRANSLATE_TIMEOUT_SEC", "20"))) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raw = f"Gemini HTTP {resp.status}: {body[:200]}"
@@ -899,7 +918,7 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
     }
     try:
         async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json=payload, timeout=20) as resp:
+            async with sess.post(url, json=payload, timeout=float(_env("TRANSLATE_TIMEOUT_SEC", "20"))) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raw = f"Gemini HTTP {resp.status}: {body[:200]}"
@@ -1014,7 +1033,7 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
                     }},
                 ],
             }],
-            "generationConfig": {"temperature": 0.2},
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": int(_env("TRANSLATE_VISION_MAX_TOKENS", "8192") or 8192)},
         }
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
@@ -1070,6 +1089,7 @@ class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._last_call: Dict[int, float] = {}
+        self._last_call_rev: Dict[int, float] = {}
         self._registered = False
         self._register_lock = asyncio.Lock()
         self._target_overrides: Dict[int, str] = {}
@@ -1082,6 +1102,16 @@ class TranslateCommands(commands.Cog):
             return False, cd - (now - last)
         self._last_call[user_id] = now
         return True, 0.0
+
+    def _cooldown_ok_rev(self, user_id: int) -> Tuple[bool, float]:
+        cd = _as_float("REVERSE_IMAGE_COOLDOWN_SEC", _as_float("TRANSLATE_COOLDOWN_SEC", 5.0))
+        now = asyncio.get_event_loop().time()
+        last = self._last_call_rev.get(user_id, 0.0)
+        if now - last < cd:
+            return False, cd - (now - last)
+        self._last_call_rev[user_id] = now
+        return True, 0.0
+
 
     async def _ensure_registered(self):
         if not _as_bool("TRANSLATE_ENABLE", True):
@@ -1334,7 +1364,7 @@ class TranslateCommands(commands.Cog):
             await interaction.response.send_message("Reverse image search is disabled.", ephemeral=True)
             return
 
-        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
+        ok_cd, wait_s = self._cooldown_ok_rev(interaction.user.id)
         if not ok_cd:
             await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
             return
@@ -1480,7 +1510,7 @@ class TranslateCommands(commands.Cog):
             await interaction.response.send_message("Translate is disabled.", ephemeral=True)
             return
 
-        ok_cd, wait_s = self._cooldown_ok(interaction.user.id)
+        ok_cd, wait_s = self._cooldown_ok_rev(interaction.user.id)
         if not ok_cd:
             await interaction.response.send_message(f"Cooldown. Try again in {wait_s:.1f}s.", ephemeral=True)
             return
@@ -1641,28 +1671,45 @@ class TranslateCommands(commands.Cog):
                 continue
 
             show_detected = _as_bool("TRANSLATE_IMAGE_SHOW_DETECTED", False)
+
+            # We keep TWO versions:
+            # - val_field: short (<=1024) for per-image embed field (Discord limit)
+            # - val_full: full text for unified packing + optional .txt attachment
+            val_field = ""
+            val_full = ""
+
             if (detected or "").strip() and show_detected:
-                # tampilkan teks asli + terjemahan (mode debug)
+                # debug mode: show detected + translated (field is trimmed; full kept for attachment)
+                val_full = (
+                    "**Detected text:**\n"
+                    f"{(detected or '(empty)')}\n\n"
+                    f"**Translated → {target_display}:**\n"
+                    f"{(translated_img or '(empty)')}"
+                )
                 value_lines = []
                 value_lines.append("**Detected text:**")
                 value_lines.append((detected or "(empty)")[:600])
                 value_lines.append("")
                 value_lines.append(f"**Translated → {target_display}:**")
                 value_lines.append((translated_img or "(empty)")[:600])
-                val = "\n".join(value_lines)
+                val_field = "\n".join(value_lines)
             else:
-                # default: tampilkan TERJEMAHAN saja agar rapi (tanpa blok detected)
+                # default: show translation only
                 if (translated_img or "").strip():
-                    val = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
+                    val_full = f"Translated → {target_display}:\n{(translated_img or '(empty)')}"
+                    val_field = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
                 else:
-                    val = "_Tidak ada teks terbaca di gambar ini._"
+                    val_full = "_Tidak ada teks terbaca di gambar ini._"
+                    val_field = "_Tidak ada teks terbaca di gambar ini._"
 
-            # Build a text block for unified embed packing later.
+            # Build a text block for unified embed packing later (FULL, not truncated).
             try:
-                image_blocks.append(f"**{field_name}**\n{val}")
+                image_blocks.append(f"**{field_name}**\n{val_full}".strip())
             except Exception:
                 pass
-            embed.add_field(name=field_name, value=(val[:1024] or "(empty)"), inline=False)
+
+            # Per-image field (trimmed to Discord field limit).
+            embed.add_field(name=field_name, value=((val_field or val_full)[:1024] or "(empty)"), inline=False)
             image_any_ok = True
 
 
@@ -1845,9 +1892,10 @@ class TranslateCommands(commands.Cog):
             full_text,
             max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
         )
-        # Footer info provider untuk debug ringan
-        footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
-        embed.set_footer(text=" • ".join(footer_bits))
+        # Optional debug footer (default OFF)
+        if _as_bool("TRANSLATE_DEBUG_FOOTER", False):
+            footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
+            embed.set_footer(text=" • ".join(footer_bits))
 
         await _safe_followup_send(interaction, embed=embed, files=files, ephemeral=ephemeral)
 

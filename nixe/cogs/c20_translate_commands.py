@@ -513,16 +513,28 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     base_sys = _env(
         "TRANSLATE_SYS_MSG",
-        f"You are a translation engine. Translate the user's text into {target_lang}. "
-        "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
-        f"If the text is already in {target_lang}, return it unchanged. "
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+        f"You are a translation engine.\n"
+        f"Task: translate the user's text into {target_lang}.\n"
+        f"Style: write natural, fluent, and readable {target_lang} while staying faithful to the source meaning. Do not add, remove, or summarize content.\n"
+        f"Formatting: preserve paragraph breaks and the order of sentences. Keep quotation marks, lists, and punctuation. If the source has a title/header line, keep it as a title line.\n"
+        f"Proper nouns: keep names of people/places/organizations, usernames, product names, and URLs unchanged.\n"
+        f"Terminology (context-sensitive glossary):\n"
+        f"- When \"charm\" refers to a small accessory/trinket/pendant (e.g., hanging from clothes, alongside earrings/stickers/card holders), translate it as \"gantungan (charm)\" or \"jimat (charm)\" — NOT \"pesona\" or \"persona\".\n"
+        f"- trinket → pernak-pernik\n"
+        f"- card holder → tempat kartu\n"
+        f"- chiming/chime → bergemerincing\n"
+        f"If the text is already in {target_lang}, return it unchanged.\n"
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose. No markdown."
     )
+
     strict_sys = _env(
         "TRANSLATE_SYS_MSG_STRICT",
-        f"STRICT MODE. Translate ALL user text into {target_lang}. "
-        "No source-language remnants except proper nouns/usernames/URLs. "
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
+        f"STRICT MODE.\n"
+        f"Translate ALL user text into {target_lang} with maximum fidelity (no paraphrasing, no summarizing, no added detail).\n"
+        f"Do NOT leave any part in the source language except proper nouns, usernames, or URLs.\n"
+        f"Preserve paragraph breaks, punctuation, and quotation marks.\n"
+        f"Apply the same context-sensitive glossary: \"charm\" as accessory/trinket/pendant → \"gantungan (charm)\" or \"jimat (charm)\" (not \"pesona\"/\"persona\").\n"
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose. No markdown."
     )
 
     async def _call(sys_msg: str) -> Tuple[bool, str]:
@@ -1011,11 +1023,19 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
     prompt = (
-        "You are an OCR+translation engine.\n"
-        "1) Extract all readable text from the image.\n"
-        f"2) Translate it to {target_lang}.\n"
-        f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
-        "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
+        "You are an OCR + translation engine.\\n"
+        "Step 1 (OCR): Extract ALL readable text from the image exactly as written. Preserve line breaks and paragraph boundaries when possible.\\n"
+        f"Step 2 (Translate): Translate the extracted text into {target_lang}.\\n"
+        f"Style: natural, fluent, and readable {target_lang}, but stay faithful to the source meaning. Do not add, remove, or summarize content.\\n"
+        "Formatting: keep the same order. Preserve quotation marks, punctuation, and paragraph breaks.\\n"
+        "Proper nouns: keep names of people/places/organizations, usernames, product names, and URLs unchanged.\\n"
+        "Terminology (context-sensitive glossary):\\n"
+        "- When \"charm\" refers to a small accessory/trinket/pendant (e.g., hanging from clothes, alongside earrings/stickers/card holders), translate it as \"gantungan (charm)\" or \"jimat (charm)\" — NOT \"pesona\" or \"persona\".\\n"
+        "- trinket → pernak-pernik\\n"
+        "- card holder → tempat kartu\\n"
+        "- chiming/chime → bergemerincing\\n"
+        f"Return ONLY compact JSON matching schema: {schema}. No prose. No markdown.\\n"
+        "If there is no readable text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
     mime = _detect_image_mime(image_bytes)
 

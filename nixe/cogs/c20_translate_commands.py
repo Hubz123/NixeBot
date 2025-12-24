@@ -500,6 +500,24 @@ def _pick_groq_key() -> str:
         return _env("GROQ_API_KEY", "")
     return ""
 
+def _pick_groq_qc_key() -> str:
+    # In your runtime, GEMINI_API_KEY_B may actually store a Groq "LPG backup" key.
+    # Prefer that for QC, but allow an explicit override.
+    key = _env("TRANSLATE_GROQ_QC_API_KEY", "").strip()
+    if key:
+        return key
+    key = _env("GEMINI_API_KEY_B", "").strip()
+    if key:
+        return key
+    # As a last resort, reuse the translate Groq key if present.
+    key = _env("TRANSLATE_GROQ_API_KEY", "").strip()
+    if key:
+        return key
+    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
+        return _env("GROQ_API_KEY", "").strip()
+    return ""
+
+
 # -------------------------
 # Gemini / Groq text translate
 # -------------------------
@@ -513,28 +531,16 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
 
     base_sys = _env(
         "TRANSLATE_SYS_MSG",
-        f"You are a translation engine.\n"
-        f"Task: translate the user's text into {target_lang}.\n"
-        f"Style: write natural, fluent, and readable {target_lang} while staying faithful to the source meaning. Do not add, remove, or summarize content.\n"
-        f"Formatting: preserve paragraph breaks and the order of sentences. Keep quotation marks, lists, and punctuation. If the source has a title/header line, keep it as a title line.\n"
-        f"Proper nouns: keep names of people/places/organizations, usernames, product names, and URLs unchanged.\n"
-        f"Terminology (context-sensitive glossary):\n"
-        f"- When \"charm\" refers to a small accessory/trinket/pendant (e.g., hanging from clothes, alongside earrings/stickers/card holders), translate it as \"gantungan (charm)\" or \"jimat (charm)\" — NOT \"pesona\" or \"persona\".\n"
-        f"- trinket → pernak-pernik\n"
-        f"- card holder → tempat kartu\n"
-        f"- chiming/chime → bergemerincing\n"
-        f"If the text is already in {target_lang}, return it unchanged.\n"
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose. No markdown."
+        f"You are a translation engine. Translate the user's text into {target_lang}. "
+        "Do NOT leave any part in the source language except proper nouns, usernames, or URLs. "
+        f"If the text is already in {target_lang}, return it unchanged. "
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
-
     strict_sys = _env(
         "TRANSLATE_SYS_MSG_STRICT",
-        f"STRICT MODE.\n"
-        f"Translate ALL user text into {target_lang} with maximum fidelity (no paraphrasing, no summarizing, no added detail).\n"
-        f"Do NOT leave any part in the source language except proper nouns, usernames, or URLs.\n"
-        f"Preserve paragraph breaks, punctuation, and quotation marks.\n"
-        f"Apply the same context-sensitive glossary: \"charm\" as accessory/trinket/pendant → \"gantungan (charm)\" or \"jimat (charm)\" (not \"pesona\"/\"persona\").\n"
-        f"Return ONLY compact JSON matching this schema: {schema}. No prose. No markdown."
+        f"STRICT MODE. Translate ALL user text into {target_lang}. "
+        "No source-language remnants except proper nouns/usernames/URLs. "
+        f"Return ONLY compact JSON matching this schema: {schema}. No prose."
     )
 
     async def _call(sys_msg: str) -> Tuple[bool, str]:
@@ -774,6 +780,103 @@ def _detect_image_mime(image_bytes: bytes) -> str:
     return "image/png"
 
 
+
+
+async def _groq_qc_and_fix_id(source_text: str, translated_id: str) -> Tuple[bool, str, str]:
+    """
+    QC+post-edit for image->ID translations.
+
+    Groq does NOT see the image. It only compares:
+      - SOURCE: OCR text from the image
+      - TARGET: Indonesian translation produced by Gemini
+
+    Returns: (ok, fixed_translation, reason)
+      - ok=True means the function ran (or intentionally skipped) without fatal error.
+      - fixed_translation may equal translated_id when already good.
+    """
+    key = _pick_groq_qc_key()
+    if not key:
+        return True, translated_id, "qc_skipped_no_key"
+
+    model = _env("TRANSLATE_GROQ_QC_MODEL", _env("TRANSLATE_GROQ_MODEL", "llama-3.1-8b-instant"))
+
+    # Keep this strict: faithful meaning, no additions, preserve names/quotes/paragraphs.
+    # Glossary to prevent common drift (e.g., charm (accessory) -> pesona/persona).
+    sys_msg = (
+        "You are a translation QA and editor for Indonesian (Bahasa Indonesia).\n"
+        "You will receive SOURCE (English or any language) and TARGET_ID (Indonesian).\n"
+        "Task: If TARGET_ID is not faithful to SOURCE, FIX it.\n"
+        "Rules:\n"
+        "- Do NOT add information not present in SOURCE.\n"
+        "- Do NOT omit information from SOURCE.\n"
+        "- Preserve proper nouns, usernames, titles, and URLs exactly (do not translate them).\n"
+        "- Preserve quotes and paragraph breaks.\n"
+        "- Make Indonesian natural and readable, but keep meaning strictly aligned.\n"
+        "- Apply glossary when relevant: charm (accessory) -> 'gantungan (charm)' or 'jimat (charm)'; "
+        "trinket -> 'pernak-pernik'; card holder -> 'tempat kartu'; chiming -> 'bergemerincing'.\n"
+        "Output ONLY compact JSON with keys: pass (bool), fixed_translation (string), issues (array of short strings).\n"
+        "Set pass=true if no meaningful fixes are needed. If pass=false, fixed_translation MUST be the corrected Indonesian."
+    )
+
+    user_msg = f"SOURCE:\n{source_text}\n\nTARGET_ID:\n{translated_id}"
+
+    try:
+        from groq import Groq  # type: ignore
+    except Exception as e:
+        return True, translated_id, f"qc_skipped_no_groq_sdk:{e!r}"
+
+    try:
+        client = Groq(api_key=key)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.0,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return True, translated_id, f"qc_error:{e!r}"
+
+    # Parse JSON (robust)
+    j = None
+    try:
+        j = json.loads(out)
+    except Exception:
+        m = re.search(r"\{.*\}", out, flags=re.DOTALL)
+        if m:
+            try:
+                j = json.loads(m.group(0))
+            except Exception:
+                j = None
+
+    if not isinstance(j, dict):
+        # If Groq returned plain text, treat it as a best-effort fixed translation.
+        fixed = (out or "").strip()
+        if fixed:
+            return True, fixed, "qc_non_json_best_effort"
+        return True, translated_id, "qc_non_json_empty"
+
+    passed = bool(j.get("pass", False))
+    fixed = str(j.get("fixed_translation", "") or "").strip()
+    issues = j.get("issues", [])
+    issues_s = ""
+    try:
+        if isinstance(issues, list):
+            issues_s = ",".join(str(x) for x in issues[:4] if str(x).strip())
+        elif isinstance(issues, str):
+            issues_s = issues.strip()
+    except Exception:
+        issues_s = ""
+
+    reason = "pass" if passed else "fail"
+    if issues_s:
+        reason = f"{reason}:{issues_s[:160]}"
+    if fixed:
+        return True, fixed, reason
+    # If pass=true but no fixed_translation, keep original.
+    return True, translated_id, reason
 
 async def _gemini_translate_text_ko_multi(text: str) -> Tuple[bool, Dict[str, str]]:
     """Gemini helper for Korean dual-style translation + romanization."""
@@ -1023,19 +1126,11 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
     model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
     schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
     prompt = (
-        "You are an OCR + translation engine.\\n"
-        "Step 1 (OCR): Extract ALL readable text from the image exactly as written. Preserve line breaks and paragraph boundaries when possible.\\n"
-        f"Step 2 (Translate): Translate the extracted text into {target_lang}.\\n"
-        f"Style: natural, fluent, and readable {target_lang}, but stay faithful to the source meaning. Do not add, remove, or summarize content.\\n"
-        "Formatting: keep the same order. Preserve quotation marks, punctuation, and paragraph breaks.\\n"
-        "Proper nouns: keep names of people/places/organizations, usernames, product names, and URLs unchanged.\\n"
-        "Terminology (context-sensitive glossary):\\n"
-        "- When \"charm\" refers to a small accessory/trinket/pendant (e.g., hanging from clothes, alongside earrings/stickers/card holders), translate it as \"gantungan (charm)\" or \"jimat (charm)\" — NOT \"pesona\" or \"persona\".\\n"
-        "- trinket → pernak-pernik\\n"
-        "- card holder → tempat kartu\\n"
-        "- chiming/chime → bergemerincing\\n"
-        f"Return ONLY compact JSON matching schema: {schema}. No prose. No markdown.\\n"
-        "If there is no readable text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
+        "You are an OCR+translation engine.\n"
+        "1) Extract all readable text from the image.\n"
+        f"2) Translate it to {target_lang}.\n"
+        f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+        "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
     mime = _detect_image_mime(image_bytes)
 
@@ -1101,6 +1196,21 @@ async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple
         detected = _squash_blank_lines(str(j.get("text", "") or ""))
         translated = _squash_blank_lines(str(j.get("translation", "") or ""))
         reason = str(j.get("reason", "") or "ok")
+        # Optional: after Gemini OCR+translate, run Groq (LPG backup key) QC+post-edit for image->ID.
+        # This avoids re-calling Gemini while improving faithfulness/terminology.
+        try:
+            if _as_bool("TRANSLATE_IMAGE_GROQ_QC_ENABLE", True):
+                tgt = (target_lang or "").strip().lower()
+                if tgt in ("id", "indonesian", "bahasa indonesia", "indo"):
+                    if (detected or "").strip() and (translated or "").strip():
+                        ok_qc, fixed_id, qc_reason = await _groq_qc_and_fix_id(detected, translated)
+                        if ok_qc and (fixed_id or "").strip():
+                            translated = _squash_blank_lines(fixed_id)
+                        if qc_reason:
+                            reason = f"{reason};qc:{qc_reason}"
+        except Exception:
+            # Never fail the whole translate because QC failed
+            pass
         return True, detected, translated, reason
     except Exception as e:
         return False, "", "", f"vision_failed:{e!r}"

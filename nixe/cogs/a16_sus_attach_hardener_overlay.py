@@ -115,7 +115,33 @@ def _content_signals(message: discord.Message) -> Tuple[int,str]:
     try:
         content = (message.content or "").lower()
         if content and _SUS_RE.search(content):
-            score += 1; reasons.append("sus-words")
+            score += 1
+            try:
+                # Capture a small set of matched suspicious terms for debugging.
+                hits = []
+                for m in _SUS_RE.finditer(content):
+                    s = (m.group(0) or "").strip()
+                    if not s:
+                        continue
+                    # Normalize and cap length to keep logs compact.
+                    s = re.sub(r"\s+", " ", s)[:32]
+                    hits.append(s)
+                    if len(hits) >= 8:
+                        break
+                uniq = []
+                seen = set()
+                for h in hits:
+                    hl = h.lower()
+                    if hl in seen:
+                        continue
+                    seen.add(hl)
+                    uniq.append(h)
+                if uniq:
+                    reasons.append("sus-words:" + "|".join(uniq))
+                else:
+                    reasons.append("sus-words")
+            except Exception:
+                reasons.append("sus-words")
     except Exception:
         pass
     try:
@@ -200,9 +226,9 @@ class SusAttachHardener(commands.Cog):
             if sc: reasons.append(rs)
             # Only emit warnings when something is suspicious.
             if sc:
-                log.warning("[sus-hard] content-score=%s reasons=%s", sc, rs)
+                log.warning("[sus-hard] content-score=%s reasons=%s ch=%s(%s) gid=%s uid=%s mid=%s", sc, rs, getattr(message.channel, "name", "?"), getattr(message.channel, "id", "?"), getattr(getattr(message, "guild", None), "id", None), getattr(getattr(message, "author", None), "id", None), getattr(message, "id", None))
             elif self.verbose:
-                log.debug("[sus-hard] content-score=%s reasons=%s", sc, rs)
+                log.debug("[sus-hard] content-score=%s reasons=%s ch=%s(%s) gid=%s uid=%s mid=%s", sc, rs, getattr(message.channel, "name", "?"), getattr(message.channel, "id", "?"), getattr(getattr(message, "guild", None), "id", None), getattr(getattr(message, "author", None), "id", None), getattr(message, "id", None))
 
         # 2) Attachment scan
         for att in getattr(message, "attachments", []) or []:

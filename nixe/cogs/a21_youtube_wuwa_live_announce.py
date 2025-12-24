@@ -8,7 +8,7 @@ import os
 import pathlib
 import re
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -26,6 +26,10 @@ ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
 ANNOUNCE_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "1453036422465585283") or "1453036422465585283")
 POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "90") or "90")
 CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "4") or "4")
+
+ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "1").strip() == "1"
+BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
+ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", "0") or "0")
 
 WATCHLIST_PATH = os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json"
 STATE_PATH = os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json").strip() or "data/youtube_wuwa_state.json"
@@ -104,46 +108,57 @@ def _extract_json_blob(html: str, rx: re.Pattern) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool]:
+def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool, Optional[datetime]]:
     """
-    Returns (video_id, title, is_live_now).
-    We intentionally require isLiveNow == True when available to avoid scheduled streams and VOD spam.
+    Returns (video_id, title, is_live_now, start_ts_utc).
+
+    Notes:
+    - We prefer isLiveNow == True when available to avoid scheduled streams and VOD spam.
+    - start_ts_utc (when present) is used to suppress "already-live before bot boot" announcements.
     """
     vid = None
     title = None
     is_live_now = False
+    start_ts: Optional[datetime] = None
 
     vd = (player.get("videoDetails") or {}) if isinstance(player, dict) else {}
     vid = vd.get("videoId")
     title = vd.get("title")
     micro = (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
     live = micro.get("liveBroadcastDetails") or {}
-    # isLiveNow is the most reliable "actually live" switch
-    if isinstance(live, dict) and ("isLiveNow" in live):
-        is_live_now = bool(live.get("isLiveNow"))
-    else:
-        # fallback: infer from timestamps (avoid upcoming/scheduled spam)
-        now = datetime.now(timezone.utc)
-        def _parse_ts(ts: Any) -> Optional[datetime]:
-            if not ts or not isinstance(ts, str):
-                return None
-            try:
-                s = ts
-                if s.endswith("Z"):
-                    s = s[:-1] + "+00:00"
-                return datetime.fromisoformat(s)
-            except Exception:
-                return None
-        start = _parse_ts(live.get("startTimestamp") if isinstance(live, dict) else None)
-        end = _parse_ts(live.get("endTimestamp") if isinstance(live, dict) else None)
-        if start and start <= now and (not end or end > now):
-            is_live_now = True
-        else:
-            # last resort: hlsManifestUrl strongly suggests a live stream
-            sd = player.get("streamingData") or {}
-            is_live_now = bool(isinstance(sd, dict) and sd.get("hlsManifestUrl"))
 
-    return vid, title, is_live_now
+    def _parse_ts(ts: Any) -> Optional[datetime]:
+        if not ts or not isinstance(ts, str):
+            return None
+        try:
+            s = ts
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            d = datetime.fromisoformat(s)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    if isinstance(live, dict):
+        start_ts = _parse_ts(live.get("startTimestamp"))
+        # isLiveNow is the most reliable "actually live" switch
+        if "isLiveNow" in live:
+            is_live_now = bool(live.get("isLiveNow"))
+        else:
+            # fallback: infer from timestamps (avoid upcoming/scheduled spam)
+            now = datetime.now(timezone.utc)
+            end_ts = _parse_ts(live.get("endTimestamp"))
+            if start_ts and start_ts <= now and (not end_ts or end_ts > now):
+                is_live_now = True
+
+    if not is_live_now:
+        # last resort: hlsManifestUrl strongly suggests a live stream
+        sd = player.get("streamingData") or {}
+        is_live_now = bool(isinstance(sd, dict) and sd.get("hlsManifestUrl"))
+
+    return vid, title, is_live_now, start_ts
 
 # ----------------------------
 # Search resolve (name -> channelId)
@@ -214,9 +229,11 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
         self.sem = asyncio.Semaphore(max(1, CONCURRENCY))
+        self.boot_time = datetime.now(timezone.utc)
 
         self.state: Dict[str, Any] = _read_json_any(STATE_PATH) or {}
         self.state.setdefault("announced", {})   # key -> last video_id
+        self.state.setdefault("announced_vids", {})  # video_id -> unix_ts
         self.state.setdefault("resolved", {})    # query/name -> {"channel_id","title","url"}
 
         self.watch: Dict[str, Any] = {}
@@ -354,12 +371,12 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         if not player:
             return None
 
-        vid, title, is_live_now = _yt_live_info(player)
+        vid, title, is_live_now, start_ts = _yt_live_info(player)
         if not (vid and title and is_live_now):
             return None
         if not (self.title_rx.search(title) or self.title_rx.search(_normalize_title(title))):
             return None
-        return t, vid, title
+        return t, vid, title, start_ts
 
     def _render_template(self, creator_name: str, video_link: str) -> str:
         msg = self.template
@@ -404,14 +421,66 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         for res in results:
             if not res or isinstance(res, Exception):
                 continue
-            t, vid, title = res
-            key = t.channel_id or t.base_url() or t.query
-            prev = str(self.state.get("announced", {}).get(key) or "")
-            if prev == vid:
+            t, vid, title, start_ts = res
+
+            # Build stable keys to avoid duplicate posts when resolution improves (query->channel_id).
+            keys: List[str] = []
+            for cand in (t.channel_id, t.base_url(), t.url, t.handle, t.query, t.name):
+                if cand:
+                    keys.append(str(cand))
+            if not keys:
+                keys = [t.query]
+
+            ann_map = self.state.setdefault("announced", {})   # key -> last video_id
+            ann_vids = self.state.setdefault("announced_vids", {})  # video_id -> unix_ts (or 1)
+
+            # Hard de-dupe by video id (covers key changes across restarts).
+            if str(vid) in ann_vids or str(vid) in set(str(v) for v in ann_map.values()):
+                # keep keys aligned to the vid to prevent future re-announce with a new key
+                for k in keys:
+                    ann_map[k] = vid
                 continue
+
+            now = datetime.now(timezone.utc)
+
+            # Do not announce streams that started before this bot instance booted.
+            if ONLY_NEW_AFTER_BOOT:
+                if start_ts is None:
+                    # conservative: if we cannot know start time, suppress to avoid late spam after restarts
+                    for k in keys:
+                        ann_map[k] = vid
+                    ann_vids[str(vid)] = int(now.timestamp())
+                    _write_json_best_effort(STATE_PATH, self.state)
+                    log.info("[yt-wuwa] suppress (unknown start_ts) after boot: %s vid=%s", t.name, vid)
+                    continue
+                # Allow a small grace window for clock skew / extraction lag
+                if start_ts < (self.boot_time - timedelta(seconds=max(0, BOOT_GRACE_SECONDS))):
+                    for k in keys:
+                        ann_map[k] = vid
+                    ann_vids[str(vid)] = int(now.timestamp())
+                    _write_json_best_effort(STATE_PATH, self.state)
+                    age_min = int((now - start_ts).total_seconds() // 60)
+                    log.info("[yt-wuwa] suppress old-live after boot: %s vid=%s age_min=%s", t.name, vid, age_min)
+                    continue
+
+            # Optional: suppress "too old" lives even without restarts (0 disables)
+            if ANNOUNCE_MAX_AGE_MINUTES > 0 and start_ts is not None:
+                if (now - start_ts).total_seconds() > (ANNOUNCE_MAX_AGE_MINUTES * 60):
+                    for k in keys:
+                        ann_map[k] = vid
+                    ann_vids[str(vid)] = int(now.timestamp())
+                    _write_json_best_effort(STATE_PATH, self.state)
+                    age_min = int((now - start_ts).total_seconds() // 60)
+                    log.info("[yt-wuwa] suppress stale-live: %s vid=%s age_min=%s", t.name, vid, age_min)
+                    continue
             try:
                 await self._post(ch, t.name, title, vid)
-                self.state["announced"][key] = vid
+                # write to all keys to prevent key-change dupes after restart/resolve
+                ann_map = self.state.setdefault("announced", {})
+                ann_vids = self.state.setdefault("announced_vids", {})
+                for k in keys:
+                    ann_map[k] = vid
+                ann_vids[str(vid)] = int(datetime.now(timezone.utc).timestamp())
                 _write_json_best_effort(STATE_PATH, self.state)
                 log.info("[yt-wuwa] announced live: %s vid=%s", t.name, vid)
             except Exception as e:

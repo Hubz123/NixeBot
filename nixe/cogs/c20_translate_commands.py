@@ -734,7 +734,63 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": raw,
         }
 
+async def _groq_chat_completion_rest(
+    api_key: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+) -> Tuple[bool, str]:
+    """Groq chat.completions via OpenAI-compatible REST (no groq SDK required)."""
+    base = (_env("GROQ_BASE_URL", "https://api.groq.com/openai/v1") or "").strip().rstrip("/")
+    if not base:
+        base = "https://api.groq.com/openai/v1"
+    url = f"{base}/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+
+    try:
+        import aiohttp  # type: ignore
+    except Exception as e:
+        return False, f"aiohttp missing: {e!r}"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=45)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.post(url, headers=headers, json=payload) as resp:
+                raw = await resp.text()
+                if resp.status != 200:
+                    # keep the error short to avoid log spam
+                    return False, f"groq_http_{resp.status}:{raw[:400]}"
+                try:
+                    j = json.loads(raw)
+                except Exception:
+                    return False, f"groq_bad_json:{raw[:400]}"
+                content = ""
+                try:
+                    content = (
+                        j.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
+                except Exception:
+                    content = ""
+                return True, (content or "").strip()
+    except Exception as e:
+        return False, f"groq_request_failed:{e!r}"
+
+
 async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
+    """Optional Groq text translate (only used if you explicitly switch provider)."""
     key = _pick_groq_key()
     if not key:
         return False, "missing TRANSLATE_GROQ_API_KEY"
@@ -743,28 +799,25 @@ async def _groq_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
         f"You are a translation engine. Translate user text to {target_lang}. "
         "Output ONLY the translation, no commentary."
     )
-    try:
-        from groq import Groq  # type: ignore
-    except Exception as e:
-        return False, f"Groq SDK missing: {e!r}"
 
-    try:
-        client = Groq(api_key=key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.2,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-        return True, out or "(empty)"
-    except Exception as e:
-        return False, f"Groq request failed: {e!r}"
+    ok, out = await _groq_chat_completion_rest(
+        api_key=key,
+        model=model,
+        messages=[
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": text},
+        ],
+        temperature=0.2,
+        max_tokens=2048,
+    )
+    if not ok:
+        return False, out
+    return True, out or "(empty)"
 
 # -------------------------
 # Gemini Vision OCR + translate image
+# -------------------------
+
 # -------------------------
 
 def _detect_image_mime(image_bytes: bytes) -> str:
@@ -820,24 +873,20 @@ async def _groq_qc_and_fix_id(source_text: str, translated_id: str) -> Tuple[boo
 
     user_msg = f"SOURCE:\n{source_text}\n\nTARGET_ID:\n{translated_id}"
 
-    try:
-        from groq import Groq  # type: ignore
-    except Exception as e:
-        return True, translated_id, f"qc_skipped_no_groq_sdk:{e!r}"
 
-    try:
-        client = Groq(api_key=key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": sys_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.0,
-        )
-        out = (resp.choices[0].message.content or "").strip()
-    except Exception as e:
-        return True, translated_id, f"qc_error:{e!r}"
+    ok2, out = await _groq_chat_completion_rest(
+        api_key=key,
+        model=model,
+        messages=[
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.0,
+        max_tokens=2048,
+    )
+    if not ok2:
+        # Do not fail the whole command; just skip QC and keep Gemini result.
+        return True, translated_id, f"qc_error:{out}"
 
     # Parse JSON (robust)
     j = None
@@ -1112,65 +1161,26 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
         }
 
 
-def _split_image_vertical_tiles(image_bytes: bytes, n_tiles: int, overlap_px: int) -> List[bytes]:
-    '''Split a tall image into vertical tiles (with overlap) to improve OCR recall.
-    Falls back to returning the original image if Pillow isn't available or on error.
-    '''
-    try:
-        if n_tiles <= 1:
-            return [image_bytes]
-        from PIL import Image  # type: ignore
-        import io
-        im = Image.open(io.BytesIO(image_bytes))
-        im.load()
-        w, h = im.size
-        if h < 300:
-            return [image_bytes]
+async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
+    """
+    OCR+translate an image using Gemini Vision REST API.
 
-        overlap_px = max(0, int(overlap_px))
-        n_tiles = max(1, int(n_tiles))
-
-        # target tile height (ensure full coverage, allow overlap)
-        base = max(1, (h + (n_tiles - 1) * overlap_px) // n_tiles)
-
-        tiles: List[bytes] = []
-        y = 0
-        for i in range(n_tiles):
-            y0 = max(0, y - (overlap_px if i > 0 else 0))
-            y1 = min(h, y0 + base + (overlap_px if i < n_tiles - 1 else 0))
-            if y1 <= y0:
-                break
-            crop = im.crop((0, y0, w, y1))
-            buf = io.BytesIO()
-
-            fmt = (getattr(im, "format", None) or "PNG").upper()
-            save_fmt = "PNG" if fmt not in ("PNG", "JPEG", "JPG", "WEBP") else ("JPEG" if fmt in ("JPEG", "JPG") else "PNG")
-            crop.save(buf, format=save_fmt)
-            tiles.append(buf.getvalue())
-
-            y = y0 + base
-            if y >= h:
-                break
-
-        return tiles or [image_bytes]
-    except Exception:
-        return [image_bytes]
-
-
-async def _gemini_vision_ocr(image_bytes: bytes) -> Tuple[bool, str, str]:
-    '''OCR-only via Gemini Vision REST API. Returns (ok, text, reason).'''
+    Note: We intentionally avoid the google-genai SDK here because several environments
+    (including yours) ship with an httpx version that is incompatible with recent SDK
+    releases, causing noisy follow_redirects / destructor errors. REST is stable.
+    """
     key = _pick_gemini_key()
     if not key:
-        return False, "", "missing TRANSLATE_GEMINI_API_KEY"
-
+        return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
     model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
-    prompt = _env(
-        "TRANSLATE_IMAGE_OCR_PROMPT",
-        "You are an OCR engine. Extract ALL readable text from the image.\\n"
-        "Return ONLY the extracted text (no translation, no commentary). Preserve line breaks.\\n"
-        "If no text, return an empty string."
+    schema = _env("TRANSLATE_SCHEMA", '{"text": "...", "translation": "...", "reason": "..."}')
+    prompt = (
+        "You are an OCR+translation engine.\n"
+        "1) Extract all readable text from the image.\n"
+        f"2) Translate it to {target_lang}.\n"
+        f"Return ONLY compact JSON matching schema: {schema}. No prose.\n"
+        "If no text, return {\"text\":\"\",\"translation\":\"\",\"reason\":\"no_text\"}."
     )
-
     mime = _detect_image_mime(image_bytes)
 
     try:
@@ -1187,10 +1197,7 @@ async def _gemini_vision_ocr(image_bytes: bytes) -> Tuple[bool, str, str]:
                     }},
                 ],
             }],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": int(_env("TRANSLATE_VISION_OCR_MAX_TOKENS", _env("TRANSLATE_VISION_MAX_TOKENS", "8192")) or 8192),
-            },
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": int(_env("TRANSLATE_VISION_MAX_TOKENS", "8192") or 8192)},
         }
         timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
@@ -1207,71 +1214,55 @@ async def _gemini_vision_ocr(image_bytes: bytes) -> Tuple[bool, str, str]:
             if isinstance(p, dict) and "text" in p:
                 out += str(p["text"])
 
-        out = _squash_blank_lines(_clean_output(out)).strip()
-        return True, out, "ok"
+        # Cleanup + squash insane blank lines before parsing
+        out = _squash_blank_lines(_clean_output(out))
+
+        j: Dict[str, Any] | None = None
+
+        # 1) direct JSON parse
+        try:
+            j = json.loads(out)
+        except Exception:
+            j = None
+
+        # 2) if model wrapped JSON in extra text, try to extract the first {...}
+        if j is None:
+            m2 = re.search(r"\{.*\}", out, flags=re.DOTALL)
+            if m2:
+                try:
+                    j = json.loads(m2.group(0))
+                except Exception:
+                    j = None
+
+        # 3) If still not JSON, best-effort regex extraction of "text" / "translation"
+        if not isinstance(j, dict):
+            text_match = re.search(r'"text"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
+            trans_match = re.search(r'"translation"\s*:\s*"(.+?)"', out, flags=re.DOTALL)
+            detected = _squash_blank_lines(text_match.group(1)) if text_match else out
+            translated = _squash_blank_lines(trans_match.group(1)) if trans_match else detected
+            return True, detected, translated, "non_json_output"
+
+        detected = _squash_blank_lines(str(j.get("text", "") or ""))
+        translated = _squash_blank_lines(str(j.get("translation", "") or ""))
+        reason = str(j.get("reason", "") or "ok")
+        # Optional: after Gemini OCR+translate, run Groq (LPG backup key) QC+post-edit for image->ID.
+        # This avoids re-calling Gemini while improving faithfulness/terminology.
+        try:
+            if _as_bool("TRANSLATE_IMAGE_GROQ_QC_ENABLE", True):
+                tgt = (target_lang or "").strip().lower()
+                if tgt in ("id", "indonesian", "bahasa indonesia", "indo"):
+                    if (detected or "").strip() and (translated or "").strip():
+                        ok_qc, fixed_id, qc_reason = await _groq_qc_and_fix_id(detected, translated)
+                        if ok_qc and (fixed_id or "").strip():
+                            translated = _squash_blank_lines(fixed_id)
+                        if qc_reason:
+                            reason = f"{reason};qc:{qc_reason}"
+        except Exception:
+            # Never fail the whole translate because QC failed
+            pass
+        return True, detected, translated, reason
     except Exception as e:
-        return False, "", f"vision_ocr_failed:{e!r}"
-
-async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
-    '''Translate an image by OCR-first (Gemini Vision) then text-translate (Gemini text).
-    This improves recall for long screenshots and avoids 1-shot vision truncation.
-    Returns (ok, detected_text, translated_text, reason).
-    '''
-    # 1) OCR (optionally tiled)
-    tile_enable = _as_bool("TRANSLATE_IMAGE_TILE_ENABLE", True)
-    n_tiles = int(_env("TRANSLATE_IMAGE_TILE_N", "3") or 3)
-    overlap = int(_env("TRANSLATE_IMAGE_TILE_OVERLAP", "80") or 80)
-
-    tiles = _split_image_vertical_tiles(image_bytes, n_tiles, overlap) if tile_enable else [image_bytes]
-
-    detected_parts: List[str] = []
-    for t in tiles:
-        ok_ocr, txt, _ = await _gemini_vision_ocr(t)
-        if ok_ocr and (txt or "").strip():
-            detected_parts.append(txt.strip())
-
-    detected = _squash_blank_lines("\n\n".join(detected_parts)).strip()
-    if not detected:
-        return True, "", "", "no_text"
-
-    # 2) Translate detected text (chunked)
-    chunk_chars = int(_env("TRANSLATE_IMAGE_TEXT_CHUNK_CHARS", "2800") or 2800)
-    chunks = _chunk_text(detected, max(400, chunk_chars))
-
-    translated_chunks: List[str] = []
-    any_fail = False
-    for ch in chunks:
-        ok_t, out = await _gemini_translate_text(ch, target_lang)
-        if ok_t and (out or "").strip():
-            translated_chunks.append(out.strip())
-        else:
-            any_fail = True
-            translated_chunks.append(out.strip() if out else "")
-
-    translated = _squash_blank_lines("\n\n".join([x for x in translated_chunks if x is not None])).strip()
-
-    reason = "ok"
-    if any_fail:
-        reason = "partial_translate"
-    if tile_enable and len(tiles) > 1:
-        reason = f"{reason};tiled={len(tiles)}"
-
-    # 3) Optional Groq QC post-edit (ID only)
-    try:
-        if _as_bool("TRANSLATE_IMAGE_GROQ_QC_ENABLE", True):
-            tgt = (target_lang or "").strip().lower()
-            if tgt in ("id", "indonesian", "bahasa indonesia", "indo"):
-                if (detected or "").strip() and (translated or "").strip():
-                    ok_qc, fixed_id, qc_reason = await _groq_qc_and_fix_id(detected, translated)
-                    if ok_qc and (fixed_id or "").strip():
-                        translated = _squash_blank_lines(fixed_id)
-                    if qc_reason:
-                        reason = f"{reason};qc:{qc_reason}"
-    except Exception:
-        pass
-
-    return True, detected, translated, reason
-
+        return False, "", "", f"vision_failed:{e!r}"
 
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):

@@ -7,6 +7,8 @@ import logging
 import os
 import pathlib
 import re
+import unicodedata
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -31,8 +33,18 @@ STATE_PATH = os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json"
 ENV_REGEX_OVERRIDE = os.getenv("NIXE_YT_WUWA_TITLE_REGEX", "").strip()
 ENV_TEMPLATE_OVERRIDE = os.getenv("NIXE_YT_WUWA_MESSAGE_TEMPLATE", "").strip()
 
-DEFAULT_TITLE_REGEX = r"#?鳴潮|Wuthering\s*Waves|WuWa"
+DEFAULT_TITLE_REGEX = r"(?:#\s*)?(?:鳴潮|鸣潮)|Wuthering\s*Waves|WuWa|Wuwa|wuwa"
 DEFAULT_MESSAGE_TEMPLATE = "Hey, {creator.name} just posted a new video!\n{video.link}"
+
+# Normalize titles (brackets, fullwidth chars) to reduce regex misses.
+_BRACKET_TRANS = str.maketrans({c: " " for c in "【】[]()（）「」『』〈〉《》〔〕〖〗"})
+def _normalize_title(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.translate(_BRACKET_TRANS)
+    # normalize hashtag variants
+    s = s.replace("＃", "#")
+    return s
+
 
 USER_AGENT = "Mozilla/5.0 (compatible; NixeBot/1.0; +https://github.com/Hubz123/NixeBot)"
 
@@ -104,15 +116,32 @@ def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str],
     vd = (player.get("videoDetails") or {}) if isinstance(player, dict) else {}
     vid = vd.get("videoId")
     title = vd.get("title")
-
     micro = (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
     live = micro.get("liveBroadcastDetails") or {}
     # isLiveNow is the most reliable "actually live" switch
     if isinstance(live, dict) and ("isLiveNow" in live):
         is_live_now = bool(live.get("isLiveNow"))
     else:
-        # fallback: fail-closed (treat as not live)
-        is_live_now = False
+        # fallback: infer from timestamps (avoid upcoming/scheduled spam)
+        now = datetime.now(timezone.utc)
+        def _parse_ts(ts: Any) -> Optional[datetime]:
+            if not ts or not isinstance(ts, str):
+                return None
+            try:
+                s = ts
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                return datetime.fromisoformat(s)
+            except Exception:
+                return None
+        start = _parse_ts(live.get("startTimestamp") if isinstance(live, dict) else None)
+        end = _parse_ts(live.get("endTimestamp") if isinstance(live, dict) else None)
+        if start and start <= now and (not end or end > now):
+            is_live_now = True
+        else:
+            # last resort: hlsManifestUrl strongly suggests a live stream
+            sd = player.get("streamingData") or {}
+            is_live_now = bool(isinstance(sd, dict) and sd.get("hlsManifestUrl"))
 
     return vid, title, is_live_now
 
@@ -192,7 +221,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
         self.watch: Dict[str, Any] = {}
         self.targets: List[Target] = []
-        self.title_rx: re.Pattern = re.compile(DEFAULT_TITLE_REGEX, re.UNICODE)
+        self.title_rx: re.Pattern = re.compile(DEFAULT_TITLE_REGEX, re.UNICODE | re.IGNORECASE)
         self.template: str = DEFAULT_MESSAGE_TEMPLATE
 
         self._reload_watchlist()
@@ -217,9 +246,9 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         tpl = (ENV_TEMPLATE_OVERRIDE or cfg.get("message_template") or DEFAULT_MESSAGE_TEMPLATE)
 
         try:
-            self.title_rx = re.compile(rx_str, re.UNICODE)
+            self.title_rx = re.compile(rx_str, re.UNICODE | re.IGNORECASE)
         except Exception:
-            self.title_rx = re.compile(DEFAULT_TITLE_REGEX, re.UNICODE)
+            self.title_rx = re.compile(DEFAULT_TITLE_REGEX, re.UNICODE | re.IGNORECASE)
 
         self.template = str(tpl)
 
@@ -328,7 +357,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         vid, title, is_live_now = _yt_live_info(player)
         if not (vid and title and is_live_now):
             return None
-        if not self.title_rx.search(title):
+        if not (self.title_rx.search(title) or self.title_rx.search(_normalize_title(title))):
             return None
         return t, vid, title
 

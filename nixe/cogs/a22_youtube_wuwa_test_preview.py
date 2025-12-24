@@ -4,18 +4,20 @@ from __future__ import annotations
 """
 a22_youtube_wuwa_test_preview.py
 
-Text-command YouTube LIVE test (no slash), designed to behave like c20_translate_commands text handler:
-- Trigger: "nixe ytwtest ..." or "nixe yt test ..."
-- Uses the SAME env keys as a21_youtube_wuwa_live_announce:
-    NIXE_YT_WUWA_WATCHLIST_PATH
-    NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID
-    NIXE_YT_WUWA_MESSAGE_TEMPLATE
-- Picks random channel(s) from watchlist and checks /live page.
-- Posts a preview message with embed + link button. Always posts a result:
-    - LIVE -> embed Watch link to video
-    - NOT LIVE / scheduled / unknown -> embed Open Channel link
+Text-trigger test command for YouTube LIVE status, aligned with the "nixe ..." translate-style pattern.
 
-This cog does NOT write state and is safe for testing formatting.
+Triggers (message content):
+- "nixe ytwtest" [here|announce] [count]
+- "nixe yt test" [here|announce] [count]
+
+Behavior:
+- Picks random target(s) from watchlist (default 35)
+- For each target, checks /live page and parses ytInitialPlayerResponse
+- Posts an embed + link button:
+  - LIVE -> Watch button to youtu.be/<videoId>
+  - NOT LIVE -> Open Channel button to channel URL
+
+No slash commands. No moderator-gating.
 """
 
 import asyncio
@@ -25,7 +27,8 @@ import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import aiohttp
 import discord
@@ -33,305 +36,324 @@ from discord.ext import commands
 
 log = logging.getLogger(__name__)
 
-# Env (reuse a21 keys)
-WATCHLIST_PATH = (os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json") or "").strip() or "data/youtube_wuwa_watchlist.json"
-ANNOUNCE_CHANNEL_ID = (os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "0") or "0").strip()
-ENV_TEMPLATE_OVERRIDE = (os.getenv("NIXE_YT_WUWA_MESSAGE_TEMPLATE", "") or "").strip()
-DEFAULT_MESSAGE_TEMPLATE = "Hey, {creator.name} just posted a new video!\n{video.link}"
-
-# Safety toggles
-TEST_ENABLE = (os.getenv("NIXE_YT_WUWA_TEST_CMD_ENABLE", "1") or "1").strip() == "1"
-COOLDOWN_SEC = float((os.getenv("NIXE_YT_WUWA_TEST_COOLDOWN_SEC", "5") or "5").strip() or "5")
-
-USER_AGENT = "Mozilla/5.0 (compatible; NixeBot/1.0; +https://github.com/Hubz123/NixeBot)"
-
-# Regex to locate ytInitialPlayerResponse
-_YTIPR_MARKERS = (
-    "ytInitialPlayerResponse",
-    "var ytInitialPlayerResponse",
-    "window[\"ytInitialPlayerResponse\"]",
-)
 
 @dataclass
 class Target:
-    name: str = ""
-    handle: str = ""
-    channel_id: str = ""
-    url: str = ""
+    name: str
+    handle: str
+    channel_id: str
+    url: str
 
-    def base_url(self) -> str:
-        u = (self.url or "").strip()
-        if u.startswith("http"):
-            return u.rstrip("/")
-        h = (self.handle or "").strip()
-        if h.startswith("@"):
-            return f"https://www.youtube.com/{h}".rstrip("/")
-        cid = (self.channel_id or "").strip()
-        if cid:
-            return f"https://www.youtube.com/channel/{cid}".rstrip("/")
-        return ""
+    def channel_url(self) -> str:
+        if self.url:
+            return self.url
+        if self.channel_id:
+            return f"https://www.youtube.com/channel/{self.channel_id}"
+        if self.handle:
+            h = self.handle if self.handle.startswith("@") else f"@{self.handle}"
+            return f"https://www.youtube.com/{h}"
+        return "https://www.youtube.com/"
 
-def _candidate_paths(rel: str) -> List[str]:
-    rel = (rel or "").strip().lstrip("/\\")
-    if not rel:
-        return []
-    return [
-        rel,
-        os.path.join("data", os.path.basename(rel)),
-        os.path.join("DATA", os.path.basename(rel)),
-        os.path.join("nixe", rel),
-        os.path.join("nixe", "data", os.path.basename(rel)),
-        os.path.join("NIXE", "DATA", os.path.basename(rel)),
+    def live_url(self) -> str:
+        if self.channel_id:
+            return f"https://www.youtube.com/channel/{self.channel_id}/live"
+        if self.handle:
+            h = self.handle if self.handle.startswith("@") else f"@{self.handle}"
+            return f"https://www.youtube.com/{h}/live"
+        # fallback
+        cu = self.channel_url().rstrip("/")
+        return f"{cu}/live"
+
+
+def _try_paths(path_str: str) -> list[Path]:
+    """
+    Produce a small set of candidate paths for watchlist/state that matches the repo conventions:
+    - exact path
+    - ./path
+    - ./data/<basename>
+    - ./DATA/<basename>
+    """
+    p = Path(path_str)
+    b = p.name if p.name else "youtube_wuwa_watchlist.json"
+    cands = [
+        p,
+        Path(".") / p,
+        Path("data") / b,
+        Path("DATA") / b,
+        Path("NIXE") / "DATA" / b,
+        Path("nixe") / "DATA" / b,
     ]
+    # de-dup while preserving order
+    out: list[Path] = []
+    seen = set()
+    for c in cands:
+        cc = c.resolve() if c.exists() else c
+        key = str(cc)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
 
-def _read_json_any(path: str) -> Optional[Dict[str, Any]]:
-    for cand in _candidate_paths(path):
+
+def load_watchlist() -> Tuple[bool, str, list[Target]]:
+    watchlist_path = os.environ.get("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip()
+    for cand in _try_paths(watchlist_path):
         try:
-            with open(cand, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            continue
+            if cand.exists():
+                data = json.loads(cand.read_text(encoding="utf-8"))
+                targets_raw = data.get("targets", [])
+                targets: list[Target] = []
+                for t in targets_raw:
+                    targets.append(
+                        Target(
+                            name=str(t.get("name", "")).strip(),
+                            handle=str(t.get("handle", "")).strip(),
+                            channel_id=str(t.get("channel_id", "")).strip(),
+                            url=str(t.get("url", "")).strip(),
+                        )
+                    )
+                targets = [t for t in targets if (t.handle or t.channel_id or t.url)]
+                if not targets:
+                    return False, f"watchlist empty in {cand}", []
+                return True, f"{cand}", targets
         except Exception as e:
             log.warning("[ytwtest] failed read json %s: %r", cand, e)
             continue
-    return None
+    return False, f"watchlist not found. env NIXE_YT_WUWA_WATCHLIST_PATH={watchlist_path}", []
 
-def _render_template(creator_name: str, link: str) -> str:
-    tmpl = (ENV_TEMPLATE_OVERRIDE or DEFAULT_MESSAGE_TEMPLATE or "").strip()
-    if not tmpl:
-        tmpl = DEFAULT_MESSAGE_TEMPLATE
-    return tmpl.replace("{creator.name}", creator_name).replace("{video.link}", link)
 
-def _load_targets_from_watchlist() -> List[Target]:
-    cfg = _read_json_any(WATCHLIST_PATH) or {}
-    targets = cfg.get("targets") or []
-    out: List[Target] = []
-    if isinstance(targets, list):
-        for t in targets:
-            if not isinstance(t, dict):
-                continue
-            out.append(Target(
-                name=str(t.get("name") or ""),
-                handle=str(t.get("handle") or ""),
-                channel_id=str(t.get("channel_id") or ""),
-                url=str(t.get("url") or ""),
-            ))
-    return out
-
-def _extract_json_blob_from_marker(html: str, marker: str) -> Optional[dict]:
+def _extract_json_object(text: str, key: str = "ytInitialPlayerResponse") -> Optional[dict]:
     """
-    Very robust bracket-matching extraction for ytInitialPlayerResponse.
+    Extract JSON object assigned to ytInitialPlayerResponse using brace matching.
+    Returns dict or None.
     """
-    if not html or marker not in html:
+    # find assignment location
+    m = re.search(rf"{re.escape(key)}\s*=\s*", text)
+    if not m:
+        # other common pattern: "var ytInitialPlayerResponse = ..."
+        m = re.search(rf"var\s+{re.escape(key)}\s*=\s*", text)
+    if not m:
         return None
-    idx = html.find(marker)
-    if idx < 0:
+
+    i = m.end()
+    # skip whitespace
+    while i < len(text) and text[i].isspace():
+        i += 1
+    if i >= len(text) or text[i] != "{":
         return None
-    # Find first '{' after marker
-    brace = html.find("{", idx)
-    if brace < 0:
-        return None
+
     depth = 0
-    in_str = False
-    esc = False
-    for i in range(brace, len(html)):
-        ch = html[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == "\"":
-                in_str = False
-            continue
-        else:
-            if ch == "\"":
-                in_str = True
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    blob = html[brace:i+1]
-                    try:
-                        return json.loads(blob)
-                    except Exception:
-                        return None
+    start = i
+    for j in range(i, len(text)):
+        ch = text[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                blob = text[start : j + 1]
+                try:
+                    return json.loads(blob)
+                except Exception:
+                    return None
     return None
 
-async def _http_get_text(session: aiohttp.ClientSession, url: str, timeout_s: int = 20) -> str:
-    try:
-        async with session.get(url, headers={"User-Agent": USER_AGENT}, timeout=aiohttp.ClientTimeout(total=timeout_s)) as resp:
-            if resp.status != 200:
-                return ""
-            return await resp.text()
-    except Exception:
-        return ""
 
-def _parse_live_from_player(player: dict) -> Tuple[bool, str, str]:
+def _live_from_player(player: dict) -> Tuple[bool, str, str]:
     """
-    Returns (is_live_now, video_id, title).
-    Fail-closed: scheduled/upcoming returns is_live_now=False.
+    Returns (is_live_now, video_id, title)
     """
-    try:
-        video_id = str(player.get("videoDetails", {}).get("videoId") or "")
-        title = str(player.get("videoDetails", {}).get("title") or "YouTube Live")
-        lbs = player.get("liveBroadcastDetails") or {}
-        is_live_now = bool(lbs.get("isLiveNow") is True)
-        return is_live_now, video_id, title
-    except Exception:
-        return False, "", "YouTube Live"
+    video = player.get("videoDetails") or {}
+    vid = str(video.get("videoId") or "").strip()
+    title = str(video.get("title") or "").strip()
 
-async def _check_target_live(session: aiohttp.ClientSession, t: Target) -> Tuple[Target, bool, str, str]:
-    """
-    Returns (target, is_live_now, video_id, title)
-    """
-    base = t.base_url()
-    if not base:
-        return t, False, "", ""
-    live_url = base.rstrip("/") + "/live"
-    html = await _http_get_text(session, live_url, timeout_s=20)
-    if not html:
-        return t, False, "", ""
-    player = None
-    # Try multiple markers
-    for m in _YTIPR_MARKERS:
-        player = _extract_json_blob_from_marker(html, m)
-        if player:
-            break
-    if not player:
-        # fallback regex attempt for "ytInitialPlayerResponse": {...}
-        m = re.search(r"\"ytInitialPlayerResponse\"\s*:\s*(\{)", html)
-        if m:
-            player = _extract_json_blob_from_marker(html, "ytInitialPlayerResponse")
-    if not player:
-        return t, False, "", ""
-    is_live, vid, title = _parse_live_from_player(player)
-    return t, is_live, vid, title
+    micro = (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
+    if not title:
+        t = micro.get("title") or {}
+        if isinstance(t, dict):
+            title = str(t.get("simpleText") or "").strip()
+
+    live_details = micro.get("liveBroadcastDetails") or {}
+    is_live_now = bool(live_details.get("isLiveNow") is True)
+
+    return is_live_now, vid, title
+
 
 class YouTubeWuWaTestPreview(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._cooldown: dict[int, float] = {}
         self._session: Optional[aiohttp.ClientSession] = None
-        self._cooldowns: Dict[int, float] = {}
 
-    async def _ensure_session(self):
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+    async def cog_load(self):
+        # reuse session if app has one; otherwise create
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=25),
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NixeBot/ytwtest",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
 
-    def _cooldown_ok(self, user_id: int) -> bool:
-        import time
-        now = time.time()
-        last = float(self._cooldowns.get(user_id, 0.0))
-        if now - last < COOLDOWN_SEC:
-            return False
-        self._cooldowns[user_id] = now
-        return True
+    async def cog_unload(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
 
-    async def _safe_send(self, channel: discord.abc.Messageable, *, content: str = "", embed: Optional[discord.Embed] = None, view: Optional[discord.ui.View] = None):
+    def _ch_label(self, ch: object) -> str:
+        """Best-effort channel label for logs."""
         try:
-            await channel.send(
-                content=content,
-                embed=embed,
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            cid = getattr(ch, 'id', 'unknown')
+            name = getattr(ch, 'name', None)
+            if name:
+                return f"{name}({cid})"
+            return str(cid)
+        except Exception:
+            return 'unknown'
+
+    def _rate_limited(self, uid: int, cooldown_s: float = 5.0) -> bool:
+        now = asyncio.get_event_loop().time()
+        last = self._cooldown.get(uid, 0.0)
+        if now - last < cooldown_s:
+            return True
+        self._cooldown[uid] = now
+        return False
+
+    async def _fetch_live(self, target: Target) -> Tuple[bool, str, str]:
+        """
+        Returns (is_live_now, video_id, title). Fail-closed: if parsing fails, returns (False,"","").
+        """
+        if not self._session:
+            return False, "", ""
+
+        url = target.live_url()
+        try:
+            async with self._session.get(url, allow_redirects=True) as resp:
+                html = await resp.text(errors="ignore")
+        except Exception as e:
+            log.warning("[ytwtest] fetch failed %s: %r", url, e)
+            return False, "", ""
+
+        player = _extract_json_object(html, "ytInitialPlayerResponse")
+        if not player:
+            return False, "", ""
+
+        is_live_now, vid, title = _live_from_player(player)
+        return is_live_now, vid, title
+
+    async def _safe_send(self, channel: discord.abc.Messageable, *, embed: discord.Embed, view: Optional[discord.ui.View] = None):
+        try:
+            await channel.send(embed=embed, view=view)
             return
         except discord.Forbidden:
-            # Can't send here; nothing else we can do besides logging.
-            log.warning("[ytwtest] Forbidden: cannot send to channel=%s", getattr(channel, "id", "unknown"))
+            log.warning("[ytwtest] Forbidden: cannot send to channel=%s", self._ch_label(channel))
         except Exception as e:
             log.warning("[ytwtest] send failed: %r", e)
 
-    async def _post_preview(self, dest: discord.abc.Messageable, t: Target, is_live: bool, vid: str, title: str):
-        base = t.base_url() or (t.url or "").strip()
-        creator = t.name or t.handle or t.channel_id or "YouTube"
-        if is_live and vid:
-            link = f"https://youtu.be/{vid}"
-            content = _render_template(creator, link)
-            embed = discord.Embed(title=title or "LIVE", url=link)
-            embed.set_author(name=creator)
-            embed.set_image(url=f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
-            view = discord.ui.View(timeout=None)
-            view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Watch", url=link))
-            await self._safe_send(dest, content=content, embed=embed, view=view)
-        else:
-            # Not live: still post a visible test result.
-            ch_link = base if base.startswith("http") else ""
-            embed = discord.Embed(title="NOT LIVE (test)", description=f"{creator}\n\nTidak sedang LIVE sekarang.")
-            if ch_link:
-                embed.url = ch_link
-            view = discord.ui.View(timeout=None)
-            if ch_link:
-                view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Open Channel", url=ch_link))
-            await self._safe_send(dest, content="", embed=embed, view=view)
+    def _build_view(self, label: str, url: str) -> discord.ui.View:
+        v = discord.ui.View()
+        v.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url))
+        return v
 
-    async def _run(self, where: str, count: int, src_channel: discord.abc.Messageable, author_id: int) -> str:
-        if not TEST_ENABLE:
-            return "❌ YT test command disabled (NIXE_YT_WUWA_TEST_CMD_ENABLE=0)."
-        if not self._cooldown_ok(author_id):
-            return "⏳ Cooldown. Coba lagi sebentar."
-        targets = _load_targets_from_watchlist()
-        if not targets:
-            return f"❌ Watchlist tidak ditemukan / kosong. Path: {WATCHLIST_PATH}"
+    def _template_content(self, target: Target, video_url: str) -> str:
+        tpl = os.environ.get("NIXE_YT_WUWA_MESSAGE_TEMPLATE", "").strip()
+        if not tpl:
+            return ""  # keep content empty; embed carries the info
+        # Minimal replacements compatible with earlier templates
+        out = tpl.replace("{creator.name}", target.name or "Creator")
+        out = out.replace("{video.link}", video_url)
+        return out
 
-        # destination
-        dest: discord.abc.Messageable = src_channel
-        if where == "announce":
-            if not ANNOUNCE_CHANNEL_ID or ANNOUNCE_CHANNEL_ID == "0":
-                return "❌ Announce channel belum di-set. NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID=0"
+    async def _run(self, where: str, count: int, invoke_channel: discord.abc.Messageable, guild: Optional[discord.Guild]) -> None:
+        ok, wl_path, targets = load_watchlist()
+        if not ok:
+            emb = discord.Embed(title="ytwtest error", description=wl_path)
+            await self._safe_send(invoke_channel, embed=emb)
+            return
+
+        # destination resolve
+        dest: discord.abc.Messageable = invoke_channel
+        if where == "announce" and guild is not None:
+            ann = os.environ.get("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "").strip()
+            if not ann.isdigit():
+                await self._safe_send(
+                    invoke_channel,
+                    embed=discord.Embed(
+                        title="ytwtest announce not configured",
+                        description="Set env NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID to a channel ID, or use 'here'.",
+                    ),
+                )
+            else:
+                ch = guild.get_channel(int(ann))
+                if ch is None:
+                    try:
+                        ch = await guild.fetch_channel(int(ann))
+                    except Exception:
+                        ch = None
+                if ch is None:
+                    await self._safe_send(
+                        invoke_channel,
+                        embed=discord.Embed(
+                            title="ytwtest announce channel not found",
+                            description=f"NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID={ann} could not be resolved. Posting to the invoke channel instead.",
+                        ),
+                    )
+                else:
+                    dest = ch
+
+
+        picks = random.sample(targets, k=min(count, len(targets)))
+        for t in picks:
+            is_live, vid, title = await self._fetch_live(t)
+            if is_live and vid:
+                video_url = f"https://youtu.be/{vid}"
+                emb = discord.Embed(title=f"🔴 LIVE NOW: {t.name}", description=title or "Live")
+                emb.add_field(name="Channel", value=t.channel_url(), inline=False)
+                emb.add_field(name="Watch", value=video_url, inline=False)
+                view = self._build_view("Watch", video_url)
+            else:
+                video_url = t.channel_url()
+                emb = discord.Embed(title=f"⚪ NOT LIVE (test): {t.name}", description="No live stream detected right now.")
+                emb.add_field(name="Channel", value=t.channel_url(), inline=False)
+                view = self._build_view("Open Channel", t.channel_url())
+
+            content = self._template_content(t, video_url)
             try:
-                ch = self.bot.get_channel(int(ANNOUNCE_CHANNEL_ID))
-            except Exception:
-                ch = None
-            if ch is None:
-                return f"❌ Announce channel tidak ketemu. NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID={ANNOUNCE_CHANNEL_ID}"
-            dest = ch  # type: ignore
-
-        # pick random targets
-        sample = random.sample(targets, k=min(count, len(targets)))
-
-        await self._ensure_session()
-        assert self._session is not None
-
-        # run sequential (test-only, avoid bursts)
-        for t in sample:
-            try:
-                tt, is_live, vid, title = await _check_target_live(self._session, t)
-                await self._post_preview(dest, tt, is_live, vid, title)
+                await dest.send(content=content or None, embed=emb, view=view)
+            except discord.Forbidden:
+                log.warning("[ytwtest] Forbidden: cannot send to channel=%s", self._ch_label(dest))
+                # try fallback to invoke_channel
+                await self._safe_send(invoke_channel, embed=emb, view=view)
             except Exception as e:
-                log.warning("[ytwtest] check/post failed (%s): %r", t.name, e)
-                await self._safe_send(dest, content=f"❌ ytwtest error for {t.name}: {e}")
+                log.warning("[ytwtest] post failed: %r", e)
+                await self._safe_send(invoke_channel, embed=discord.Embed(title="ytwtest send error", description=str(e)))
 
-        return f"OK. Posted {len(sample)} test result(s) to {where}."
-
-    @commands.Cog.listener()
-    async def on_ready(self):
-        await self._ensure_session()
+            await asyncio.sleep(0.6)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # Mimic translate text-command behavior
         if getattr(message.author, "bot", False):
             return
-        if not message.guild:
+        if message.guild is None:
             return
+
         content = (message.content or "").strip()
         if not content:
             return
-        low = content.lower()
+        low = content.lower().strip()
+
         # Accept: "nixe ytwtest ..." and "nixe yt test ..."
         if not (low.startswith("nixe ytwtest") or low.startswith("nixe yt test")):
             return
 
-        # Parse tokens like translate does
-        parts = content.split()
+        uid = getattr(message.author, "id", 0) or 0
+        if uid and self._rate_limited(uid, cooldown_s=5.0):
+            return
+
         # tokens minimal: ["nixe","ytwtest"] or ["nixe","yt","test"]
+        parts = content.split()
         where = "here"
         count = 1
 
-        # normalize forms
         if low.startswith("nixe ytwtest"):
             # nixe ytwtest [announce|here] [count]
             if len(parts) >= 3 and parts[2].lower() in ("announce", "here"):
@@ -352,31 +374,27 @@ class YouTubeWuWaTestPreview(commands.Cog):
                     count = 1
 
         count = max(1, min(int(count), 3))
+        log.info("[ytwtest] invoke uid=%s ch=%s where=%s count=%s guild=%s", uid, self._ch_label(message.channel), where, count, getattr(message.guild, "id", "0"))
 
-        log.info("[ytwtest] invoke uid=%s ch=%s where=%s count=%s", getattr(message.author, "id", "0"), getattr(message.channel, "id", "0"), where, count)
-
-        # Always respond in some way (reply if possible, else channel send)
         try:
-            result = await self._run(where, count, message.channel, int(message.author.id))
+            await self._run(where, count, message.channel, message.guild)
         except Exception as e:
             log.exception("[ytwtest] run failed: %r", e)
-            result = f"❌ ytwtest internal error: {e}"
-
-        # Prefer reply, fallback to send
-        try:
-            await message.reply(result, mention_author=False)
-        except Exception:
             try:
-                await message.channel.send(result, allowed_mentions=discord.AllowedMentions.none())
-            except Exception as e:
-                log.warning("[ytwtest] cannot send result message: %r", e)
+                await message.reply(f"❌ ytwtest internal error: {e}", mention_author=False)
+            except Exception:
+                pass
 
-    async def cog_unload(self):
-        try:
-            if self._session and not self._session.closed:
-                await self._session.close()
-        except Exception:
-            pass
+    # Optional prefix fallback (does not affect the on_message path)
+    @commands.command(name="ytwtest")
+    async def cmd_ytwtest(self, ctx: commands.Context, where: str = "here", count: int = 1):
+        where = (where or "here").lower()
+        if where not in ("here", "announce"):
+            where = "here"
+        count = max(1, min(int(count), 3))
+        await ctx.reply("✅ ytwtest running…", mention_author=False)
+        await self._run(where, count, ctx.channel, ctx.guild)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(YouTubeWuWaTestPreview(bot))

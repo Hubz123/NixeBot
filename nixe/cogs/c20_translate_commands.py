@@ -214,179 +214,6 @@ def _squash_blank_lines(s: str, max_consecutive: int = 2) -> str:
     return s.strip()
 
 
-
-def _split_text_chunks(text: str, max_chars: int = 2800) -> List[str]:
-    """Split long text into chunks (prefer paragraph / sentence boundaries)."""
-    t = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    if not t:
-        return []
-    if max_chars <= 0:
-        return [t]
-
-    # Fast path
-    if len(t) <= max_chars:
-        return [t]
-
-    paras = [p.strip() for p in re.split(r"\n\s*\n", t) if p.strip()]
-    chunks: List[str] = []
-    cur = ""
-
-    def _flush():
-        nonlocal cur
-        if cur.strip():
-            chunks.append(cur.strip())
-        cur = ""
-
-    for p in paras:
-        if not cur:
-            cur = p
-        elif len(cur) + 2 + len(p) <= max_chars:
-            cur = cur + "\n\n" + p
-        else:
-            _flush()
-            # If a single paragraph is still too large, split by sentences.
-            if len(p) > max_chars:
-                parts = re.split(r"(?<=[\.\!\?])\s+", p)
-                tmp = ""
-                for s in parts:
-                    if not s:
-                        continue
-                    if not tmp:
-                        tmp = s
-                    elif len(tmp) + 1 + len(s) <= max_chars:
-                        tmp = tmp + " " + s
-                    else:
-                        chunks.append(tmp.strip())
-                        tmp = s
-                if tmp.strip():
-                    chunks.append(tmp.strip())
-            else:
-                cur = p
-
-    _flush()
-    return [c for c in chunks if c.strip()]
-
-
-def _tile_image_bytes(image_bytes: bytes, tiles: int = 3, overlap: int = 80) -> List[bytes]:
-    """Optionally split a tall image into vertical tiles (overlapping) to improve OCR reliability.
-    Returns a list of PNG-encoded bytes. Falls back to [original] if Pillow is unavailable or on error.
-    """
-    try:
-        from PIL import Image  # type: ignore
-        from io import BytesIO
-    except Exception:
-        return [image_bytes]
-
-    try:
-        im = Image.open(BytesIO(image_bytes))
-        im.load()
-        w, h = im.size
-        if tiles <= 1 or h <= 0:
-            return [image_bytes]
-
-        # If the image is not tall, tiling is unnecessary.
-        if h < 1400:
-            return [image_bytes]
-
-        tiles = max(1, min(int(tiles), 6))
-        overlap = max(0, min(int(overlap), 400))
-
-        step = max(1, h // tiles)
-        out: List[bytes] = []
-        y0 = 0
-        for i in range(tiles):
-            y1 = h if i == tiles - 1 else min(h, y0 + step + overlap)
-            crop = im.crop((0, y0, w, y1))
-
-            buf = BytesIO()
-            crop.save(buf, format="PNG", optimize=True)
-            out.append(buf.getvalue())
-
-            # next start with overlap
-            y0 = max(0, min(h, y1 - overlap))
-            if y0 >= h:
-                break
-
-        return out or [image_bytes]
-    except Exception:
-        return [image_bytes]
-
-
-async def _gemini_ocr_image_text(image_bytes: bytes, model: str, key: str) -> Tuple[bool, str, str]:
-    """Gemini Vision OCR-only. Returns (ok, text, reason)."""
-    mime = _detect_image_mime(image_bytes)
-    prompt = (
-        "You are an OCR engine. Extract ALL readable text from the image.\n"
-        "Rules:\n"
-        "- Do NOT summarize. Do NOT paraphrase.\n"
-        "- Preserve line breaks as best as possible.\n"
-        "- Return ONLY compact JSON: {\"text\":\"...\",\"reason\":\"...\"}. No prose.\n"
-        "- If no text, return {\"text\":\"\",\"reason\":\"no_text\"}."
-    )
-
-    try:
-        import aiohttp
-    except Exception as e:
-        return False, "", f"aiohttp missing: {e!r}"
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-    payload = {
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": mime, "data": base64.b64encode(image_bytes).decode("utf-8")}},
-            ],
-        }],
-        "generationConfig": {
-            "temperature": 0.0,
-            "maxOutputTokens": int(_env("TRANSLATE_VISION_MAX_TOKENS", "8192") or 8192),
-        },
-    }
-
-    timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "25"))
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
-            async with session.post(url, json=payload) as resp:
-                data = await resp.json(content_type=None)
-    except Exception as e:
-        return False, "", f"vision_ocr_error: {e!r}"
-
-    candidates = data.get("candidates") or []
-    parts: List[Dict[str, Any]] = []
-    if candidates:
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-
-    out = ""
-    for p in parts:
-        if isinstance(p, dict) and "text" in p:
-            out += str(p["text"])
-
-    out = _squash_blank_lines(_clean_output(out))
-    j: Dict[str, Any] | None = None
-    try:
-        j = json.loads(out)
-    except Exception:
-        j = None
-    if j is None:
-        m2 = re.search(r"\{.*\}", out, flags=re.DOTALL)
-        if m2:
-            try:
-                j = json.loads(m2.group(0))
-            except Exception:
-                j = None
-
-    if not isinstance(j, dict):
-        # best-effort: treat raw output as text
-        return True, out.strip(), "non_json_output"
-
-    txt = _squash_blank_lines(str(j.get("text", "") or ""))
-    reason = str(j.get("reason", "") or "ok")
-    return True, txt, reason
-
-
-
-
 def _normalize_for_compare(s: str) -> str:
     s = re.sub(r"https?://\S+", " ", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -1285,87 +1112,166 @@ async def _gemini_translate_text_zh_multi(text: str) -> Tuple[bool, Dict[str, st
         }
 
 
-async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
-    """OCR an image with Gemini Vision, then translate the extracted text with the standard text translator.
+def _split_image_vertical_tiles(image_bytes: bytes, n_tiles: int, overlap_px: int) -> List[bytes]:
+    '''Split a tall image into vertical tiles (with overlap) to improve OCR recall.
+    Falls back to returning the original image if Pillow isn't available or on error.
+    '''
+    try:
+        if n_tiles <= 1:
+            return [image_bytes]
+        from PIL import Image  # type: ignore
+        import io
+        im = Image.open(io.BytesIO(image_bytes))
+        im.load()
+        w, h = im.size
+        if h < 300:
+            return [image_bytes]
 
-    Rationale:
-    - Vision OCR on long, text-heavy images is more reliable when we do OCR-only (no translation in the same call).
-    - For tall screenshots (e.g., story/notes), we optionally tile vertically to avoid missing lower paragraphs.
-    - Translation is chunked to avoid truncation.
-    """
+        overlap_px = max(0, int(overlap_px))
+        n_tiles = max(1, int(n_tiles))
+
+        # target tile height (ensure full coverage, allow overlap)
+        base = max(1, (h + (n_tiles - 1) * overlap_px) // n_tiles)
+
+        tiles: List[bytes] = []
+        y = 0
+        for i in range(n_tiles):
+            y0 = max(0, y - (overlap_px if i > 0 else 0))
+            y1 = min(h, y0 + base + (overlap_px if i < n_tiles - 1 else 0))
+            if y1 <= y0:
+                break
+            crop = im.crop((0, y0, w, y1))
+            buf = io.BytesIO()
+
+            fmt = (getattr(im, "format", None) or "PNG").upper()
+            save_fmt = "PNG" if fmt not in ("PNG", "JPEG", "JPG", "WEBP") else ("JPEG" if fmt in ("JPEG", "JPG") else "PNG")
+            crop.save(buf, format=save_fmt)
+            tiles.append(buf.getvalue())
+
+            y = y0 + base
+            if y >= h:
+                break
+
+        return tiles or [image_bytes]
+    except Exception:
+        return [image_bytes]
+
+
+async def _gemini_vision_ocr(image_bytes: bytes) -> Tuple[bool, str, str]:
+    '''OCR-only via Gemini Vision REST API. Returns (ok, text, reason).'''
     key = _pick_gemini_key()
     if not key:
-        return False, "", "", "missing TRANSLATE_GEMINI_API_KEY"
+        return False, "", "missing TRANSLATE_GEMINI_API_KEY"
 
     model = _env("TRANSLATE_IMAGE_MODEL", _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash"))
-    target = (target_lang or "").strip()
+    prompt = _env(
+        "TRANSLATE_IMAGE_OCR_PROMPT",
+        "You are an OCR engine. Extract ALL readable text from the image.\\n"
+        "Return ONLY the extracted text (no translation, no commentary). Preserve line breaks.\\n"
+        "If no text, return an empty string."
+    )
 
+    mime = _detect_image_mime(image_bytes)
+
+    try:
+        import aiohttp
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {
+                        "mime_type": mime,
+                        "data": base64.b64encode(image_bytes).decode("utf-8"),
+                    }},
+                ],
+            }],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": int(_env("TRANSLATE_VISION_OCR_MAX_TOKENS", _env("TRANSLATE_VISION_MAX_TOKENS", "8192")) or 8192),
+            },
+        }
+        timeout_s = float(_env("TRANSLATE_VISION_TIMEOUT_SEC", "18"))
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_s)) as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json(content_type=None)
+
+        candidates = data.get("candidates") or []
+        parts: List[Dict[str, Any]] = []
+        if candidates:
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+
+        out = ""
+        for p in parts:
+            if isinstance(p, dict) and "text" in p:
+                out += str(p["text"])
+
+        out = _squash_blank_lines(_clean_output(out)).strip()
+        return True, out, "ok"
+    except Exception as e:
+        return False, "", f"vision_ocr_failed:{e!r}"
+
+async def _translate_image_gemini(image_bytes: bytes, target_lang: str) -> Tuple[bool, str, str, str]:
+    '''Translate an image by OCR-first (Gemini Vision) then text-translate (Gemini text).
+    This improves recall for long screenshots and avoids 1-shot vision truncation.
+    Returns (ok, detected_text, translated_text, reason).
+    '''
     # 1) OCR (optionally tiled)
-    detected_all: List[str] = []
-    reason_all: List[str] = []
-    tiles_enable = _as_bool("TRANSLATE_IMAGE_TILE_ENABLE", True)
-    tiles_n = int(_env("TRANSLATE_IMAGE_TILE_N", "3") or 3)
-    tiles_overlap = int(_env("TRANSLATE_IMAGE_TILE_OVERLAP", "80") or 80)
+    tile_enable = _as_bool("TRANSLATE_IMAGE_TILE_ENABLE", True)
+    n_tiles = int(_env("TRANSLATE_IMAGE_TILE_N", "3") or 3)
+    overlap = int(_env("TRANSLATE_IMAGE_TILE_OVERLAP", "80") or 80)
 
-    tile_bytes_list = _tile_image_bytes(image_bytes, tiles=tiles_n, overlap=tiles_overlap) if tiles_enable else [image_bytes]
+    tiles = _split_image_vertical_tiles(image_bytes, n_tiles, overlap) if tile_enable else [image_bytes]
 
-    for tb in tile_bytes_list:
-        ok_ocr, detected, reason = await _gemini_ocr_image_text(tb, model=model, key=key)
-        if ok_ocr and (detected or "").strip():
-            detected_all.append(detected.strip())
-        if reason:
-            reason_all.append(reason)
+    detected_parts: List[str] = []
+    for t in tiles:
+        ok_ocr, txt, _ = await _gemini_vision_ocr(t)
+        if ok_ocr and (txt or "").strip():
+            detected_parts.append(txt.strip())
 
-    # Merge OCR text; remove obvious duplicate adjacent lines from overlaps.
-    detected_text = "\n\n".join([d for d in detected_all if d.strip()]).strip()
-    if detected_text:
-        lines = [ln.rstrip() for ln in detected_text.splitlines()]
-        deduped: List[str] = []
-        last = None
-        for ln in lines:
-            if not ln.strip():
-                # keep single blank lines only
-                if deduped and deduped[-1] == "":
-                    continue
-                deduped.append("")
-                last = ""
-                continue
-            if last is not None and ln.strip() == last.strip():
-                continue
-            deduped.append(ln)
-            last = ln
-        detected_text = _squash_blank_lines("\n".join(deduped)).strip()
-
-    if not detected_text:
+    detected = _squash_blank_lines("\n\n".join(detected_parts)).strip()
+    if not detected:
         return True, "", "", "no_text"
 
-    # 2) Translate (chunked)
+    # 2) Translate detected text (chunked)
     chunk_chars = int(_env("TRANSLATE_IMAGE_TEXT_CHUNK_CHARS", "2800") or 2800)
-    chunks = _split_text_chunks(detected_text, max_chars=chunk_chars) or [detected_text]
-    translated_parts: List[str] = []
+    chunks = _chunk_text(detected, max(400, chunk_chars))
+
+    translated_chunks: List[str] = []
+    any_fail = False
     for ch in chunks:
-        ok_t, out = await _gemini_translate_text(ch, target)
-        if not ok_t:
-            return False, detected_text, "", f"translate_error: {out}"
-        translated_parts.append(out.strip())
+        ok_t, out = await _gemini_translate_text(ch, target_lang)
+        if ok_t and (out or "").strip():
+            translated_chunks.append(out.strip())
+        else:
+            any_fail = True
+            translated_chunks.append(out.strip() if out else "")
 
-    translated_text = _squash_blank_lines("\n\n".join([p for p in translated_parts if p])).strip()
+    translated = _squash_blank_lines("\n\n".join([x for x in translated_chunks if x is not None])).strip()
 
-    # 3) Optional QC+post-edit via Groq for image->ID (only for modest length to avoid timeouts)
+    reason = "ok"
+    if any_fail:
+        reason = "partial_translate"
+    if tile_enable and len(tiles) > 1:
+        reason = f"{reason};tiled={len(tiles)}"
+
+    # 3) Optional Groq QC post-edit (ID only)
     try:
         if _as_bool("TRANSLATE_IMAGE_GROQ_QC_ENABLE", True):
-            tgt = (target or "").strip().lower()
+            tgt = (target_lang or "").strip().lower()
             if tgt in ("id", "indonesian", "bahasa indonesia", "indo"):
-                if len(detected_text) <= 2500 and len(translated_text) <= 2500:
-                    ok_qc, fixed_id, qc_reason = await _groq_qc_and_fix_id(detected_text, translated_text)
+                if (detected or "").strip() and (translated or "").strip():
+                    ok_qc, fixed_id, qc_reason = await _groq_qc_and_fix_id(detected, translated)
                     if ok_qc and (fixed_id or "").strip():
-                        translated_text = fixed_id.strip()
-                        return True, detected_text, translated_text, f"ok_qc:{qc_reason}"
+                        translated = _squash_blank_lines(fixed_id)
+                    if qc_reason:
+                        reason = f"{reason};qc:{qc_reason}"
     except Exception:
         pass
 
-    r = ",".join([x for x in reason_all if x])[:200]
-    return True, detected_text, translated_text, (r or "ok")
+    return True, detected, translated, reason
+
 
 class TranslateCommands(commands.Cog):
     def __init__(self, bot: commands.Bot):

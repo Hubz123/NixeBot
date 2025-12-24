@@ -1782,69 +1782,48 @@ class TranslateCommands(commands.Cog):
         embed = discord.Embed(title="Translation")
 
         # 3a) Proses gambar-gambar (prioritas)
+        # Catatan penting:
+        # Jangan pernah menaruh hasil translate gambar ke embed field langsung, karena
+        # Discord membatasi value field max 1024 karakter -> hasil pasti kepotong.
+        # Kita kumpulkan hasil FULL ke `image_blocks`, lalu dipacking ke description
+        # (dan/atau fields tambahan) via `_pack_text_into_embed()` di akhir.
         image_any_ok = False
         image_blocks: List[str] = []
         for idx, img_bytes in enumerate(image_entries, 1):
             ok_img, detected, translated_img, reason = await _translate_image_gemini(img_bytes, target)
-            field_name = f"🖼 Gambar #{idx}"
+            label = f"🖼 Gambar #{idx}"
+
             if not ok_img:
                 # Gagal untuk gambar ini saja; lanjut ke gambar berikutnya / chat.
                 try:
-                    image_blocks.append(f"**{field_name}**\nGagal menerjemahkan gambar ini: {reason}")
+                    image_blocks.append(f"**{label}**\nGagal menerjemahkan gambar ini: {reason}".strip())
                 except Exception:
                     pass
-                embed.add_field(
-                    name=field_name,
-                    value=(f"Gagal menerjemahkan gambar ini: {reason}"[:1024] or "(error)"),
-                    inline=False,
-                )
                 continue
 
             show_detected = _as_bool("TRANSLATE_IMAGE_SHOW_DETECTED", False)
 
-            # We keep TWO versions:
-            # - val_field: short (<=1024) for per-image embed field (Discord limit)
-            # - val_full: full text for unified packing + optional .txt attachment
-            val_field = ""
-            val_full = ""
-
+            # val_full disimpan FULL (tidak dipotong); nanti akan dipacking ke embed.
             if (detected or "").strip() and show_detected:
-                # debug mode: show detected + translated (field is trimmed; full kept for attachment)
                 val_full = (
                     "**Detected text:**\n"
                     f"{(detected or '(empty)')}\n\n"
                     f"**Translated → {target_display}:**\n"
                     f"{(translated_img or '(empty)')}"
                 )
-                value_lines = []
-                value_lines.append("**Detected text:**")
-                value_lines.append((detected or "(empty)")[:600])
-                value_lines.append("")
-                value_lines.append(f"**Translated → {target_display}:**")
-                value_lines.append((translated_img or "(empty)")[:600])
-                val_field = "\n".join(value_lines)
             else:
-                # default: show translation only
                 if (translated_img or "").strip():
-                    val_full = f"Translated → {target_display}:\n{(translated_img or '(empty)')}"
-                    val_field = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')[:1024]}"
+                    val_full = f"**Translated → {target_display}:**\n{(translated_img or '(empty)')}"
                 else:
                     val_full = "_Tidak ada teks terbaca di gambar ini._"
-                    val_field = "_Tidak ada teks terbaca di gambar ini._"
 
-            # Build a text block for unified embed packing later (FULL, not truncated).
             try:
-                image_blocks.append(f"**{field_name}**\n{val_full}".strip())
+                image_blocks.append(f"**{label}**\n{val_full}".strip())
             except Exception:
                 pass
-
-            # Per-image field (trimmed to Discord field limit).
-            embed.add_field(name=field_name, value=((val_field or val_full)[:1024] or "(empty)"), inline=False)
             image_any_ok = True
 
-
-
-        # 3b) Proses chat user (jika ada text_for_chat)
+# 3b) Proses chat user (jika ada text_for_chat)
         provider = _pick_provider()
         translated_chat = ""
         chat_val: str | None = None
@@ -1864,6 +1843,8 @@ class TranslateCommands(commands.Cog):
         dual_formal = ""
         dual_casual = ""
         dual_romaji = ""
+        dual_fields_to_add: List[Tuple[str, str]] = []
+
 
         if text_for_chat:
             # chunking seperti sebelumnya
@@ -1945,7 +1926,9 @@ class TranslateCommands(commands.Cog):
             src_preview = text_for_chat[:600]
 
             if dual_kind and (dual_formal or dual_casual or dual_romaji):
-                # Untuk JA/KR/ZH, tampilkan 2 gaya + romanisasi sebagai field terpisah tanpa blok Source
+                # Untuk JA/KR/ZH, tampilkan 2 gaya + romanisasi sebagai field terpisah.
+                # Simpan dulu ke list; nanti ditambahkan ke embed SETELAH `_pack_text_into_embed()`
+                # agar hasil translate gambar tidak pernah kepotong oleh limit field 1024.
                 if dual_kind == "ja":
                     lang_label = "JA"
                     romaji_label = "🔤 Romaji"
@@ -1957,23 +1940,12 @@ class TranslateCommands(commands.Cog):
                     romaji_label = "🔤 Pinyin"
 
                 if dual_formal:
-                    embed.add_field(
-                        name=f"💬 {lang_label} (formal / polite)",
-                        value=(dual_formal[:1024] or "(empty)"),
-                        inline=False,
-                    )
+                    dual_fields_to_add.append((f"💬 {lang_label} (formal / polite)", dual_formal))
                 if dual_casual:
-                    embed.add_field(
-                        name=f"💬 {lang_label} (casual / daily chat)",
-                        value=(dual_casual[:1024] or "(empty)"),
-                        inline=False,
-                    )
+                    dual_fields_to_add.append((f"💬 {lang_label} (casual / daily chat)", dual_casual))
                 if dual_romaji:
-                    embed.add_field(
-                        name=romaji_label,
-                        value=(dual_romaji[:1024] or "(empty)"),
-                        inline=False,
-                    )
+                    dual_fields_to_add.append((romaji_label, dual_romaji))
+
                 chat_val = None  # jangan buat field gabungan lagi
             else:
                 if translated_chat and translated_chat.strip() != text_for_chat.strip():
@@ -2016,18 +1988,38 @@ class TranslateCommands(commands.Cog):
             )
             return
 
-        # Pack sampai 4800 karakter tampil (4096 desc + 1 field), overflow => attach .txt
-        embed, files = _pack_text_into_embed(
-            embed,
+        # Bangun embed final dari nol supaya:
+        # - hasil translate gambar tidak dipotong limit field 1024
+        # - tidak ada field sisa dari proses sebelumnya (compat discord.py lama)
+        final_embed = discord.Embed(title="Translation")
+
+        # Pack sampai 4800 karakter tampil (4096 desc + fields tambahan), overflow => attach .txt
+        final_embed, files = _pack_text_into_embed(
+            final_embed,
             full_text,
             max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
         )
+
+        # Tambahkan field multi-style (JA/KR/ZH) SETELAH packing.
+        # Kalau panjang, kita split ke beberapa field supaya tidak kepotong.
+        if dual_fields_to_add:
+            for fname, fval in dual_fields_to_add:
+                v = (fval or "").strip() or "(empty)"
+                chunks = [v[i:i+1024] for i in range(0, len(v), 1024)] or ["(empty)"]
+                for ci, chunk in enumerate(chunks):
+                    name = fname if ci == 0 else "\u200b"
+                    try:
+                        final_embed.add_field(name=name, value=chunk, inline=False)
+                    except Exception:
+                        # best-effort; jangan fail kalau embed penuh
+                        break
+
         # Optional debug footer (default OFF)
         if _as_bool("TRANSLATE_DEBUG_FOOTER", False):
             footer_bits = [f"text={provider}", "image=gemini", f"target={target}"]
-            embed.set_footer(text=" • ".join(footer_bits))
+            final_embed.set_footer(text=" • ".join(footer_bits))
 
-        await _safe_followup_send(interaction, embed=embed, files=files, ephemeral=ephemeral)
+        await _safe_followup_send(interaction, embed=final_embed, files=files, ephemeral=ephemeral)
 
 
     @commands.Cog.listener()

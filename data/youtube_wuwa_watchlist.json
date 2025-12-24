@@ -250,6 +250,34 @@
       "handle": "@shizukinia",
       "channel_id": "",
       "url": "https://www.youtube.com/@shizukinia"
+    },
+    {
+      "name": "@KOKO__virtual",
+      "query": "KOKO__virtual",
+      "handle": "@KOKO__virtual",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@KOKO__virtual"
+    },
+    {
+      "name": "@mafel.v.p",
+      "query": "mafel.v.p",
+      "handle": "@mafel.v.p",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@mafel.v.p"
+    },
+    {
+      "name": "@nanagisamahalo",
+      "query": "nanagisamahalo",
+      "handle": "@nanagisamahalo",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@nanagisamahalo"
+    },
+    {
+      "name": "@nanomaemuki",
+      "query": "nanomaemuki",
+      "handle": "@nanomaemuki",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@nanomaemuki"
     }
   ]
 }

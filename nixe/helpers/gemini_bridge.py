@@ -72,7 +72,7 @@ def _build_sys_prompt() -> str:
     fixed_neg = [
         "event", "version", "banner", "promo", "announcement", "福利", "版本", "活动",
         "免费", "领取", "时装", "套装", "抽+", "抽", "换装", "skin", "costume",
-        "reward", "login bonus", "patch notes"
+        "reward", "login bonus", "patch notes",
         "rescue merit", "available rewards", "guaranteed", "only once", "obtain", "not owned", "reward list", "reward select", "claim reward", "exchange", "shop", "store", "purchase", "selector", "currency", "merit", "redeem",
     ]
     neg = fixed_neg + _load_neg_text()
@@ -84,9 +84,14 @@ def _build_sys_prompt() -> str:
         "or **NOT** (promotional banner/event notice/inventory/loadout/etc).\n\n"
         "Return ONLY compact JSON: {\"lucky\": <true|false>, \"score\": 0..1, \"reason\": \"...\"}.\n\n"
         "Strong LUCKY cues (need 2+ at the SAME time):\n"
-        "- Exactly ~10 result tiles in a 2x5 grid (common 10-pull),\n"
-        "- Each tile is a character/weapon/gear ICON with STAR rarity markers beneath (★ etc),\n"
-        "- Result UI buttons like Confirm/Skip/Continue and currency change bar.\n\n"
+        "Multi-result (10-pull) screens:\n"
+        "- ~8–12 result tiles (often 10) in a grid/row layout,\n"
+        "- Each tile is a character/weapon/gear icon with STAR rarity markers (★ etc) and/or rarity color frames,\n"
+        "- Result UI buttons like Confirm/Skip/Continue plus a currency/progress bar.\n"
+        "Single-result (1-pull) acquisition screens:\n"
+        "- One large character/card illustration presented as a newly obtained result (often has a 'NEW' badge),\n"
+        "- A clear rarity indicator near the nameplate (row of ★ stars, rarity badge),\n"
+        "- Result-style UI (tap/confirm/continue) rather than full character-detail menus.\n\n"
         "Strong NOT_LUCKY cues:\n"
         "- Promotional/event banners or announcements with BIG headline text,\n"
         "- Collage of multiple character arts without in-game result grid/UI,\n"

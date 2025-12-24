@@ -65,7 +65,7 @@ def classify_lucky_pull_bytes(img_bytes: bytes):
             "- Management UI (tabs, lock icons on slots, deck editors).\n\n"
             "Rules:\n"
             "- Be conservative: if mixed or unsure, prefer not_lucky (confidence <= 0.4).\n"
-            "- If it clearly shows 10-pull grid with stars/New badges -> lucky with high confidence (>=0.9)."
+            "- If it clearly shows a 10-pull grid OR a single-pull acquisition screen with stars/New badges -> lucky with high confidence (>=0.9)."
         )
         neg = _load_neg_text()
         if neg:

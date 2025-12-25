@@ -1970,10 +1970,11 @@ class TranslateCommands(commands.Cog):
                 translated_chat = ""
                 dual_kind = None
                 dual_formal = dual_casual = dual_romaji = ""
-
             # Susun field chat user
-            src_preview = text_for_chat[:600]
-
+            # Default: jangan tampilkan teks sumber agar embed tidak "dobel" dan lebih rapi.
+            # Bisa diaktifkan dengan env TRANSLATE_SHOW_SOURCE_PREVIEW=1 jika dibutuhkan.
+            show_src_preview = _as_bool("TRANSLATE_SHOW_SOURCE_PREVIEW", False)
+            src_preview = text_for_chat[:600] if show_src_preview else ""
             if dual_kind and (dual_formal or dual_casual or dual_romaji):
                 # Untuk JA/KR/ZH, tampilkan 2 gaya + romanisasi sebagai field terpisah.
                 # Simpan dulu ke list; nanti ditambahkan ke embed SETELAH `_pack_text_into_embed()`
@@ -2001,8 +2002,9 @@ class TranslateCommands(commands.Cog):
                     # ada hasil terjemahan berbeda
                     value_lines = []
                     value_lines.append("")
-                    value_lines.append(src_preview)
-                    value_lines.append("")
+                    if src_preview:
+                        value_lines.append(src_preview)
+                        value_lines.append("")
                     value_lines.append(f"**Translated → {target_display}:**")
                     value_lines.append(translated_chat)
                     chat_val = "\n".join(value_lines)
@@ -2013,8 +2015,9 @@ class TranslateCommands(commands.Cog):
                     if not (image_any_ok and target_code == "id"):
                         value_lines = []
                         value_lines.append("")
-                        value_lines.append(src_preview)
-                        value_lines.append("")
+                        if src_preview:
+                            value_lines.append(src_preview)
+                            value_lines.append("")
                         value_lines.append(f"_Teks sudah dalam bahasa target ({target_display}) atau tidak perlu diterjemahkan._")
                         chat_val = "\n".join(value_lines)
         # Gabungkan hasil (gambar dulu, lalu chat) ke 1 embed.

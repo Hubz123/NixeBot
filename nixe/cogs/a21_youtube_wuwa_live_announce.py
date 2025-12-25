@@ -34,6 +34,13 @@ ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES"
 WATCHLIST_PATH = os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json"
 STATE_PATH = os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json").strip() or "data/youtube_wuwa_state.json"
 
+# Watchlist via Discord thread (optional, but enabled by default when parent channel id is set)
+WATCHLIST_PARENT_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID", "1431178130155896882") or "1431178130155896882")
+WATCHLIST_THREAD_NAME = os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_NAME", "YT_WATCHLIST").strip() or "YT_WATCHLIST"
+WATCHLIST_THREAD_ID_OVERRIDE = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_ID", "0") or "0")
+WATCHLIST_THREAD_SCAN_LIMIT = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_SCAN_LIMIT", "200") or "200")
+
+
 ENV_REGEX_OVERRIDE = os.getenv("NIXE_YT_WUWA_TITLE_REGEX", "").strip()
 ENV_TEMPLATE_OVERRIDE = os.getenv("NIXE_YT_WUWA_MESSAGE_TEMPLATE", "").strip()
 
@@ -96,17 +103,96 @@ def _write_json_best_effort(p: str, data: Dict[str, Any]) -> None:
 # ----------------------------
 # YouTube parsing
 # ----------------------------
-_YTIPR_RE = re.compile(r"ytInitialPlayerResponse\s*=\s*(\{.*?\});", re.DOTALL)
-_YTINITDATA_RE = re.compile(r"ytInitialData\s*=\s*(\{.*?\});", re.DOTALL)
+# ----------------------------
+# YouTube parsing
+# ----------------------------
+# YouTube pages embed large JSON blobs (ytInitialPlayerResponse / ytInitialData).
+# A naive regex like (\{.*?\}) frequently fails because the JSON contains nested braces.
+# We therefore locate the assignment and extract a balanced JSON object.
+_YTIPR_RE = re.compile(r"ytInitialPlayerResponse\s*=\s*", re.DOTALL)
+_YTINITDATA_RE = re.compile(r"ytInitialData\s*=\s*", re.DOTALL)
 
 def _extract_json_blob(html: str, rx: re.Pattern) -> Optional[Dict[str, Any]]:
     m = rx.search(html)
     if not m:
         return None
-    try:
-        return json.loads(m.group(1))
-    except Exception:
+
+    i = m.end()
+    n = len(html)
+
+    # skip whitespace
+    while i < n and html[i] in " \t\r\n":
+        i += 1
+
+    # Some variants embed JSON via JSON.parse("...") (rare, but handle it).
+    if html.startswith("JSON.parse", i):
+        j = html.find("(", i)
+        if j == -1:
+            return None
+        j += 1
+        while j < n and html[j] in " \t\r\n":
+            j += 1
+        if j >= n or html[j] not in "\"'":
+            return None
+        q = html[j]
+        j += 1
+        buf = []
+        esc = False
+        while j < n:
+            c = html[j]
+            if esc:
+                buf.append(c)
+                esc = False
+            elif c == "\\":
+                buf.append(c)
+                esc = True
+            elif c == q:
+                break
+            else:
+                buf.append(c)
+            j += 1
+        try:
+            inner = "".join(buf)
+            json_text = json.loads(q + inner + q)  # unescape
+            return json.loads(json_text)
+        except Exception:
+            return None
+
+    # Find first '{' and extract balanced braces, ignoring braces inside strings.
+    while i < n and html[i] != "{":
+        i += 1
+    if i >= n:
         return None
+
+    start = i
+    depth = 0
+    in_str = False
+    esc = False
+
+    while i < n:
+        c = html[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "\"":
+                in_str = False
+        else:
+            if c == "\"":
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    blob = html[start:i + 1]
+                    try:
+                        return json.loads(blob)
+                    except Exception:
+                        return None
+        i += 1
+    return None
 
 def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool, Optional[datetime]]:
     """
@@ -231,6 +317,9 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         self.sem = asyncio.Semaphore(max(1, CONCURRENCY))
         self.boot_time = datetime.now(timezone.utc)
 
+        self.watchlist_thread_id: int = 0
+        self.watchlist_thread: Optional[discord.Thread] = None
+
         self.state: Dict[str, Any] = _read_json_any(STATE_PATH) or {}
         self.state.setdefault("announced", {})   # key -> last video_id
         self.state.setdefault("announced_vids", {})  # video_id -> unix_ts
@@ -289,6 +378,304 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     url=str(t.get("url") or ""),
                 ))
         self.targets = out
+
+
+    @staticmethod
+    def _extract_watchlist_tokens(text: str) -> List[str]:
+        """Extract youtube channel handles/urls from free-form text."""
+        if not text:
+            return []
+        toks: List[str] = []
+
+        # normalize fullwidth symbols
+        s = unicodedata.normalize("NFKC", text)
+
+        # common URL forms
+        url_rx = re.compile(r"https?://(?:www\.)?youtube\.com/[^\s>]+", re.IGNORECASE)
+        for m in url_rx.finditer(s):
+            u = m.group(0).strip().rstrip(').,;]')
+            toks.append(u)
+
+        # youtu.be is usually video; keep but will be filtered later
+        youtu_rx = re.compile(r"https?://youtu\.be/[^\s>]+", re.IGNORECASE)
+        for m in youtu_rx.finditer(s):
+            u = m.group(0).strip().rstrip(').,;]')
+            toks.append(u)
+
+        # bare handles
+        handle_rx = re.compile(r"(?<![\w@])@([A-Za-z0-9_\.\-]{3,})", re.IGNORECASE)
+        for m in handle_rx.finditer(s):
+            toks.append("@" + m.group(1))
+
+        # de-dup while keeping order
+        out: List[str] = []
+        for t in toks:
+            if t and t not in out:
+                out.append(t)
+        return out
+
+    @classmethod
+    def _token_to_target(cls, token: str) -> Optional[Dict[str, str]]:
+        """Convert a token into a watchlist target dict compatible with youtube_wuwa_watchlist.json."""
+        if not token:
+            return None
+        t = token.strip()
+
+        handle = ""
+        url = ""
+        channel_id = ""
+
+        # handle
+        if t.startswith("@"):
+            handle = t
+            url = f"https://www.youtube.com/{handle}"
+        elif "youtube.com" in t.lower():
+            url = t.split("?")[0].rstrip("/")
+            low = url.lower()
+
+            # channel id
+            m = re.search(r"/channel/(UC[0-9A-Za-z_\-]+)", url, re.IGNORECASE)
+            if m:
+                channel_id = m.group(1)
+
+            # handle url
+            m = re.search(r"/(@[0-9A-Za-z_\.\-]+)$", url, re.IGNORECASE)
+            if m:
+                handle = m.group(1)
+
+            # accept only likely channel URLs
+            if not ("/channel/" in low or "/@" in low or "/c/" in low or "/user/" in low):
+                return None
+        elif "youtu.be" in t.lower():
+            # likely a video URL; skip (we only track channels)
+            return None
+        else:
+            return None
+
+        name = handle or channel_id or url
+        query = handle or channel_id or name
+
+        return {
+            "name": name,
+            "query": query,
+            "handle": handle,
+            "channel_id": channel_id,
+            "url": url,
+        }
+
+    @classmethod
+    def _merge_targets(cls, existing: List[Any], new_targets: List[Dict[str, str]]) -> Tuple[List[Any], int]:
+        """Merge target dicts into existing targets list (skip dupes)."""
+        def norm_handle(h: str) -> str:
+            return (h or "").strip().lower()
+
+        def norm_url(u: str) -> str:
+            return (u or "").strip().rstrip("/").lower()
+
+        def norm_cid(c: str) -> str:
+            return (c or "").strip()
+
+        seen_h = set()
+        seen_u = set()
+        seen_c = set()
+
+        for item in existing or []:
+            if isinstance(item, dict):
+                seen_h.add(norm_handle(str(item.get("handle") or "")))
+                seen_u.add(norm_url(str(item.get("url") or "")))
+                seen_c.add(norm_cid(str(item.get("channel_id") or "")))
+            elif isinstance(item, str):
+                s = item.strip()
+                if s.startswith("@"):
+                    seen_h.add(norm_handle(s))
+                elif "youtube.com" in s.lower():
+                    seen_u.add(norm_url(s))
+
+        merged = list(existing or [])
+        added = 0
+        for t in new_targets:
+            h = norm_handle(t.get("handle", ""))
+            u = norm_url(t.get("url", ""))
+            c = norm_cid(t.get("channel_id", ""))
+
+            is_dupe = False
+            if h and h in seen_h:
+                is_dupe = True
+            if u and u in seen_u:
+                is_dupe = True
+            if c and c in seen_c:
+                is_dupe = True
+
+            if is_dupe:
+                continue
+
+            merged.append(t)
+            added += 1
+            if h:
+                seen_h.add(h)
+            if u:
+                seen_u.add(u)
+            if c:
+                seen_c.add(c)
+
+        return merged, added
+
+    async def _ensure_watchlist_thread(self) -> Optional[discord.Thread]:
+        """Ensure a public thread exists under WATCHLIST_PARENT_CHANNEL_ID and return it."""
+        # If overridden, just fetch it.
+        if WATCHLIST_THREAD_ID_OVERRIDE:
+            try:
+                ch = self.bot.get_channel(WATCHLIST_THREAD_ID_OVERRIDE) or await self.bot.fetch_channel(WATCHLIST_THREAD_ID_OVERRIDE)
+                if isinstance(ch, discord.Thread):
+                    self.watchlist_thread_id = ch.id
+                    self.watchlist_thread = ch
+                    return ch
+            except Exception:
+                pass
+
+        if not WATCHLIST_PARENT_CHANNEL_ID:
+            return None
+
+        # Fetch parent channel
+        parent = self.bot.get_channel(WATCHLIST_PARENT_CHANNEL_ID)
+        if parent is None:
+            try:
+                parent = await self.bot.fetch_channel(WATCHLIST_PARENT_CHANNEL_ID)
+            except Exception:
+                parent = None
+
+        if not isinstance(parent, discord.TextChannel):
+            return None
+
+        target_name = WATCHLIST_THREAD_NAME.strip()
+
+        # Search active threads
+        try:
+            for th in getattr(parent, "threads", []) or []:
+                if isinstance(th, discord.Thread) and th.name == target_name:
+                    try:
+                        if th.archived:
+                            await th.edit(archived=False, locked=False)
+                    except Exception:
+                        pass
+                    self.watchlist_thread_id = th.id
+                    self.watchlist_thread = th
+                    return th
+        except Exception:
+            pass
+
+        # Search archived public threads (best-effort)
+        try:
+            async for th in parent.archived_threads(limit=50, private=False):
+                if isinstance(th, discord.Thread) and th.name == target_name:
+                    try:
+                        await th.edit(archived=False, locked=False)
+                    except Exception:
+                        pass
+                    self.watchlist_thread_id = th.id
+                    self.watchlist_thread = th
+                    return th
+        except Exception:
+            pass
+
+        # Create a new thread by creating a starter message
+        try:
+            starter = await parent.send(
+                "[yt-wuwa] Watchlist thread auto-created. Paste YouTube channel links/handles here (e.g., @handle or https://www.youtube.com/@handle).",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            th = await starter.create_thread(
+                name=target_name,
+                auto_archive_duration=10080,  # 7 days
+                reason="yt-wuwa watchlist",
+            )
+            self.watchlist_thread_id = th.id
+            self.watchlist_thread = th
+            return th
+        except Exception as e:
+            log.warning("[yt-wuwa] failed to create watchlist thread: %r", e)
+            return None
+
+    async def _bootstrap_watchlist_from_thread(self):
+        """Scan recent messages in the watchlist thread and merge into local watchlist json."""
+        th = await self._ensure_watchlist_thread()
+        if not th:
+            return
+
+        cfg = _read_json_any(WATCHLIST_PATH) or {}
+        existing_targets = cfg.get("targets") or []
+        new_targets: List[Dict[str, str]] = []
+
+        try:
+            async for msg in th.history(limit=max(10, WATCHLIST_THREAD_SCAN_LIMIT), oldest_first=True):
+                if not msg or not getattr(msg, "content", ""):
+                    continue
+                if msg.author and msg.author.bot:
+                    continue
+                for tok in self._extract_watchlist_tokens(msg.content):
+                    td = self._token_to_target(tok)
+                    if td:
+                        new_targets.append(td)
+        except Exception as e:
+            log.warning("[yt-wuwa] watchlist thread history scan failed: %r", e)
+            return
+
+        merged, added = self._merge_targets(existing_targets, new_targets)
+        if added > 0:
+            cfg.setdefault("enabled", True)
+            cfg["targets"] = merged
+            _write_json_best_effort(WATCHLIST_PATH, cfg)
+            log.info("[yt-wuwa] watchlist updated from thread: +%d targets", added)
+
+        # Reload in-memory list
+        self._reload_watchlist()
+
+    async def _ingest_watchlist_message(self, text: str) -> int:
+        """Parse a single message and merge any new targets."""
+        toks = self._extract_watchlist_tokens(text)
+        if not toks:
+            return 0
+        new_targets: List[Dict[str, str]] = []
+        for tok in toks:
+            td = self._token_to_target(tok)
+            if td:
+                new_targets.append(td)
+        if not new_targets:
+            return 0
+
+        cfg = _read_json_any(WATCHLIST_PATH) or {}
+        existing_targets = cfg.get("targets") or []
+        merged, added = self._merge_targets(existing_targets, new_targets)
+        if added <= 0:
+            return 0
+
+        cfg.setdefault("enabled", True)
+        cfg["targets"] = merged
+        _write_json_best_effort(WATCHLIST_PATH, cfg)
+        self._reload_watchlist()
+        return added
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # auto-ingest watchlist additions from the dedicated thread
+        try:
+            if not message or not getattr(message, "channel", None):
+                return
+            if message.author and message.author.bot:
+                return
+            if not self.watchlist_thread_id:
+                return
+            if getattr(message.channel, "id", 0) != self.watchlist_thread_id:
+                return
+            if not getattr(message, "content", ""):
+                return
+
+            added = await self._ingest_watchlist_message(message.content)
+            if added > 0:
+                log.info("[yt-wuwa] watchlist ingest: +%d targets (thread=%s)", added, self.watchlist_thread_id)
+        except Exception as e:
+            log.warning("[yt-wuwa] watchlist ingest failed: %r", e)
+
 
     async def _ensure_session(self):
         if self.session and not self.session.closed:
@@ -490,6 +877,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
     async def before_loop(self):
         await self.bot.wait_until_ready()
         await self._ensure_session()
+        try:
+            await self._bootstrap_watchlist_from_thread()
+        except Exception as e:
+            log.warning("[yt-wuwa] watchlist bootstrap failed: %r", e)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(YouTubeWuWaLiveAnnouncer(bot))

@@ -294,6 +294,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         self.watchlist_thread_id: int = 0
         self.watchlist_thread: Optional[discord.Thread] = None
 
+
+        # Pre-seed thread id so on_message can work even before _ensure_watchlist_thread() runs.
+        if WATCHLIST_THREAD_ID_OVERRIDE:
+            self.watchlist_thread_id = int(WATCHLIST_THREAD_ID_OVERRIDE)
         self.state: Dict[str, Any] = _read_json_any(STATE_PATH) or {}
         self.state.setdefault("announced", {})   # key -> last video_id
         self.state.setdefault("announced_vids", {})  # video_id -> unix_ts
@@ -611,16 +615,6 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Reload in-memory list
         self._reload_watchlist()
 
-# Ensure the canonical store embed exists/updated even on boot (so users immediately see the merged list)
-        try:
-            # Use the already-resolved thread
-            await self._sync_watchlist_store_message(th)
-            store_mid = int(self.state.get("watchlist_store_mid") or 0)
-            if store_mid:
-                await self._cleanup_watchlist_thread(th, store_mid)
-        except Exception:
-            pass
-
     def _brief_target(self, t: Dict[str, str]) -> str:
         name = (t.get("name") or t.get("channel_name") or "").strip()
         handle = (t.get("handle") or "").strip()
@@ -864,7 +858,11 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 return
 
             if not self.watchlist_thread_id:
-                return
+                # Fallback to configured override if not yet cached
+                if WATCHLIST_THREAD_ID_OVERRIDE:
+                    self.watchlist_thread_id = int(WATCHLIST_THREAD_ID_OVERRIDE)
+                else:
+                    return
             if getattr(message.channel, "id", 0) != self.watchlist_thread_id:
                 return
 
@@ -1133,6 +1131,18 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             await self._bootstrap_watchlist_from_thread()
         except Exception as e:
             log.warning("[yt-wuwa] watchlist bootstrap failed: %r", e)
+
+
+        # Ensure the canonical watchlist embed exists immediately after boot, without waiting for a new message.
+        try:
+            th = await self._ensure_watchlist_thread()
+            if th:
+                await self._sync_watchlist_store_message(th)
+                store_mid = int(self.state.get("watchlist_store_mid") or 0)
+                if store_mid:
+                    await self._cleanup_watchlist_thread(th, store_mid)
+        except Exception as e:
+            log.warning("[yt-wuwa] watchlist store sync failed: %r", e)
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(YouTubeWuWaLiveAnnouncer(bot))

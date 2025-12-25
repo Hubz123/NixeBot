@@ -7,7 +7,7 @@ a22_youtube_wuwa_test_preview.py
 Text-trigger test command for YouTube LIVE status, aligned with the "nixe ..." translate-style pattern.
 
 Triggers (message content):
-- "nixe ytwtest" [here|announce] [count]
+- "nixe ytwpreview" [here|announce] [count]
 - "nixe yt test" [here|announce] [count]
 
 Behavior:
@@ -117,7 +117,7 @@ def load_watchlist() -> Tuple[bool, str, list[Target]]:
                     return False, f"watchlist empty in {cand}", []
                 return True, f"{cand}", targets
         except Exception as e:
-            log.warning("[ytwtest] failed read json %s: %r", cand, e)
+            log.warning("[ytwpreview] failed read json %s: %r", cand, e)
             continue
     return False, f"watchlist not found. env NIXE_YT_WUWA_WATCHLIST_PATH={watchlist_path}", []
 
@@ -190,7 +190,7 @@ class YouTubeWuWaTestPreview(commands.Cog):
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=25),
             headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NixeBot/ytwtest",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NixeBot/ytwpreview",
                 "Accept-Language": "en-US,en;q=0.9",
             },
         )
@@ -230,7 +230,7 @@ class YouTubeWuWaTestPreview(commands.Cog):
             async with self._session.get(url, allow_redirects=True) as resp:
                 html = await resp.text(errors="ignore")
         except Exception as e:
-            log.warning("[ytwtest] fetch failed %s: %r", url, e)
+            log.warning("[ytwpreview] fetch failed %s: %r", url, e)
             return False, "", ""
 
         player = _extract_json_object(html, "ytInitialPlayerResponse")
@@ -245,9 +245,9 @@ class YouTubeWuWaTestPreview(commands.Cog):
             await channel.send(embed=embed, view=view)
             return
         except discord.Forbidden:
-            log.warning("[ytwtest] Forbidden: cannot send to channel=%s", self._ch_label(channel))
+            log.warning("[ytwpreview] Forbidden: cannot send to channel=%s", self._ch_label(channel))
         except Exception as e:
-            log.warning("[ytwtest] send failed: %r", e)
+            log.warning("[ytwpreview] send failed: %r", e)
 
     def _build_view(self, label: str, url: str) -> discord.ui.View:
         v = discord.ui.View()
@@ -266,7 +266,7 @@ class YouTubeWuWaTestPreview(commands.Cog):
     async def _run(self, where: str, count: int, invoke_channel: discord.abc.Messageable, guild: Optional[discord.Guild]) -> None:
         ok, wl_path, targets = load_watchlist()
         if not ok:
-            emb = discord.Embed(title="ytwtest error", description=wl_path)
+            emb = discord.Embed(title="ytwpreview error", description=wl_path)
             await self._safe_send(invoke_channel, embed=emb)
             return
 
@@ -278,7 +278,7 @@ class YouTubeWuWaTestPreview(commands.Cog):
                 await self._safe_send(
                     invoke_channel,
                     embed=discord.Embed(
-                        title="ytwtest announce not configured",
+                        title="ytwpreview announce not configured",
                         description="Set env NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID to a channel ID, or use 'here'.",
                     ),
                 )
@@ -293,7 +293,7 @@ class YouTubeWuWaTestPreview(commands.Cog):
                     await self._safe_send(
                         invoke_channel,
                         embed=discord.Embed(
-                            title="ytwtest announce channel not found",
+                            title="ytwpreview announce channel not found",
                             description=f"NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID={ann} could not be resolved. Posting to the invoke channel instead.",
                         ),
                     )
@@ -320,12 +320,12 @@ class YouTubeWuWaTestPreview(commands.Cog):
             try:
                 await dest.send(content=content or None, embed=emb, view=view)
             except discord.Forbidden:
-                log.warning("[ytwtest] Forbidden: cannot send to channel=%s", self._ch_label(dest))
+                log.warning("[ytwpreview] Forbidden: cannot send to channel=%s", self._ch_label(dest))
                 # try fallback to invoke_channel
                 await self._safe_send(invoke_channel, embed=emb, view=view)
             except Exception as e:
-                log.warning("[ytwtest] post failed: %r", e)
-                await self._safe_send(invoke_channel, embed=discord.Embed(title="ytwtest send error", description=str(e)))
+                log.warning("[ytwpreview] post failed: %r", e)
+                await self._safe_send(invoke_channel, embed=discord.Embed(title="ytwpreview send error", description=str(e)))
 
             await asyncio.sleep(0.6)
 
@@ -341,21 +341,21 @@ class YouTubeWuWaTestPreview(commands.Cog):
             return
         low = content.lower().strip()
 
-        # Accept: "nixe ytwtest ..." and "nixe yt test ..."
-        if not (low.startswith("nixe ytwtest") or low.startswith("nixe yt test")):
+        # Accept: "nixe ytwpreview ..." and "nixe yt test ..."
+        if not (low.startswith("nixe ytwpreview") or low.startswith("nixe yt test")):
             return
 
         uid = getattr(message.author, "id", 0) or 0
         if uid and self._rate_limited(uid, cooldown_s=5.0):
             return
 
-        # tokens minimal: ["nixe","ytwtest"] or ["nixe","yt","test"]
+        # tokens minimal: ["nixe","ytwpreview"] or ["nixe","yt","test"]
         parts = content.split()
         where = "here"
         count = 1
 
-        if low.startswith("nixe ytwtest"):
-            # nixe ytwtest [announce|here] [count]
+        if low.startswith("nixe ytwpreview"):
+            # nixe ytwpreview [announce|here] [count]
             if len(parts) >= 3 and parts[2].lower() in ("announce", "here"):
                 where = parts[2].lower()
             if len(parts) >= 4:
@@ -374,25 +374,25 @@ class YouTubeWuWaTestPreview(commands.Cog):
                     count = 1
 
         count = max(1, min(int(count), 3))
-        log.info("[ytwtest] invoke uid=%s ch=%s where=%s count=%s guild=%s", uid, self._ch_label(message.channel), where, count, getattr(message.guild, "id", "0"))
+        log.info("[ytwpreview] invoke uid=%s ch=%s where=%s count=%s guild=%s", uid, self._ch_label(message.channel), where, count, getattr(message.guild, "id", "0"))
 
         try:
             await self._run(where, count, message.channel, message.guild)
         except Exception as e:
-            log.exception("[ytwtest] run failed: %r", e)
+            log.exception("[ytwpreview] run failed: %r", e)
             try:
-                await message.reply(f"❌ ytwtest internal error: {e}", mention_author=False)
+                await message.reply(f"❌ ytwpreview internal error: {e}", mention_author=False)
             except Exception:
                 pass
 
-    # Optional prefix fallback (does not affect the on_message trigger path)
-    @commands.command(name="ytwpreview", aliases=["ytwtest_preview"])
+    # Optional prefix fallback (does not affect the on_message path)
+    @commands.command(name="ytwpreview")
     async def cmd_ytwpreview(self, ctx: commands.Context, where: str = "here", count: int = 1):
         where = (where or "here").lower()
         if where not in ("here", "announce"):
             where = "here"
         count = max(1, min(int(count), 3))
-        await ctx.reply("✅ ytwtest running…", mention_author=False)
+        await ctx.reply("✅ ytwpreview running…", mention_author=False)
         await self._run(where, count, ctx.channel, ctx.guild)
 
 

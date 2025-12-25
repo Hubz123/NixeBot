@@ -611,6 +611,16 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Reload in-memory list
         self._reload_watchlist()
 
+# Ensure the canonical store embed exists/updated even on boot (so users immediately see the merged list)
+        try:
+            # Use the already-resolved thread
+            await self._sync_watchlist_store_message(th)
+            store_mid = int(self.state.get("watchlist_store_mid") or 0)
+            if store_mid:
+                await self._cleanup_watchlist_thread(th, store_mid)
+        except Exception:
+            pass
+
     def _brief_target(self, t: Dict[str, str]) -> str:
         name = (t.get("name") or t.get("channel_name") or "").strip()
         handle = (t.get("handle") or "").strip()

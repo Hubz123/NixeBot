@@ -385,9 +385,9 @@ class YouTubeWuWaTestPreview(commands.Cog):
             except Exception:
                 pass
 
-    # Optional prefix fallback (does not affect the on_message path)
-    @commands.command(name="ytwtest")
-    async def cmd_ytwtest(self, ctx: commands.Context, where: str = "here", count: int = 1):
+    # Optional prefix fallback (does not affect the on_message trigger path)
+    @commands.command(name="ytwpreview", aliases=["ytwtest_preview"])
+    async def cmd_ytwpreview(self, ctx: commands.Context, where: str = "here", count: int = 1):
         where = (where or "here").lower()
         if where not in ("here", "announce"):
             where = "here"

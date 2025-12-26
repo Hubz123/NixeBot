@@ -24,15 +24,20 @@ log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 # ----------------------------
 ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
 ANNOUNCE_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "1453036422465585283") or "1453036422465585283")
-POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "90") or "90")
-CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "4") or "4")
+POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "20") or "20")
+CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "8") or "8")
 
-ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "1").strip() == "1"
+ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
 BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
 ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", "0") or "0")
+DEBUG = os.getenv("NIXE_YT_WUWA_DEBUG", "0").strip() == "1"
 
-WATCHLIST_PATH = os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json"
-STATE_PATH = os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json").strip() or "data/youtube_wuwa_state.json"
+# Optional YouTube Data API v3 key (recommended to reduce scrape flakiness)
+YOUTUBE_API_KEY = (os.getenv("NIXE_YT_WUWA_YT_API_KEY", "").strip() or os.getenv("NIXE_YT_YT_API_KEY", "").strip())
+YOUTUBE_API_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+
+WATCHLIST_PATH = (os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json")
+STATE_PATH = (os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json").strip() or "data/youtube_wuwa_state.json")
 
 # Watchlist via Discord thread (optional, but enabled by default when parent channel id is set)
 WATCHLIST_PARENT_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID", "1431178130155896882") or "1431178130155896882")
@@ -61,6 +66,21 @@ def _normalize_title(s: str) -> str:
     # normalize hashtag variants
     s = s.replace("＃", "#")
     return s
+
+def _parse_iso_utc(ts: Any) -> Optional[datetime]:
+    """Parse ISO8601 timestamps used by YouTube API into timezone-aware datetime (UTC)."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        s = ts
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc)
+    except Exception:
+        return None
 
 
 USER_AGENT = "Mozilla/5.0 (compatible; NixeBot/1.0; +https://github.com/Hubz123/NixeBot)"
@@ -949,10 +969,72 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             try:
                 async with self.session.get(url, allow_redirects=True) as r:
                     if r.status != 200:
+                        if DEBUG:
+                            try:
+                                body = await r.text()
+                            except Exception:
+                                body = ''
+                            log.warning('[yt-wuwa] http %s %s status=%s body=%s', r.method, url, r.status, body[:200])
                         return None
                     return await r.text()
             except Exception:
                 return None
+
+    async def _yt_api_videos(self, video_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Fetch video metadata via YouTube Data API v3 (videos.list). Returns id->item."""
+        if not YOUTUBE_API_KEY:
+            return {}
+        ids = [vid for vid in (video_ids or []) if isinstance(vid, str) and len(vid) == 11]
+        if not ids:
+            return {}
+        # videos.list supports up to 50 ids per request.
+        out: Dict[str, Dict[str, Any]] = {}
+        await self._ensure_session()
+        assert self.session is not None
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i+50]
+            params = {
+                "part": "snippet,liveStreamingDetails",
+                "id": ",".join(chunk),
+                "key": YOUTUBE_API_KEY,
+            }
+            try:
+                async with self.sem:
+                    async with self.session.get(YOUTUBE_API_VIDEOS_URL, params=params) as r:
+                        txt = await r.text()
+                        if r.status != 200:
+                            if DEBUG:
+                                log.warning("[yt-wuwa] yt-api videos.list status=%s body=%s", r.status, txt[:300])
+                            continue
+                        data = json.loads(txt)
+                        for item in (data.get("items") or []):
+                            vid = str(item.get("id") or "")
+                            if vid:
+                                out[vid] = item
+            except Exception as e:
+                if DEBUG:
+                    log.warning("[yt-wuwa] yt-api videos.list error: %r", e)
+                continue
+        return out
+
+    def _extract_video_id_fallback(self, html: str) -> Optional[str]:
+        """Best-effort extraction of a videoId from a /live page HTML when JSON parsing fails."""
+        if not html:
+            return None
+        # Try to find a videoId near isLiveNow/hlsManifestUrl markers.
+        markers = ['"isLiveNow":true', '"hlsManifestUrl"', '"isLiveContent":true']
+        for mk in markers:
+            pos = html.find(mk)
+            if pos != -1:
+                window = html[max(0, pos-5000):pos+500]
+                vids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', window)
+                if vids:
+                    return vids[-1]
+        # Fallback: first videoId in document.
+        m = re.search(r'"videoId":"([A-Za-z0-9_-]{11})"', html)
+        if m:
+            return m.group(1)
+        return None
 
     async def _resolve_channel(self, t: Target) -> Target:
         if t.channel_id or t.url or t.handle:
@@ -1007,13 +1089,33 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         html = await self._http_get_text(live_url)
         if not html:
             return None
-        player = _extract_yt_var_json(html, 'ytInitialPlayerResponse') or _extract_json_blob(html, _YTIPR_RE)
-        if not player:
-            return None
 
-        vid, title, is_live_now, start_ts = _yt_live_info(player)
-        if not (vid and title and is_live_now):
-            return None
+        # Fast path: parse ytInitialPlayerResponse (scrape)
+        player = _extract_yt_var_json(html, 'ytInitialPlayerResponse') or _extract_json_blob(html, _YTIPR_RE)
+        if player:
+            vid, title, is_live_now, start_ts = _yt_live_info(player)
+            if not (vid and title and is_live_now):
+                return None
+        else:
+            # Fallback path: extract videoId from HTML, then verify via YouTube Data API (low quota, 1 unit).
+            vid = self._extract_video_id_fallback(html)
+            if not vid:
+                return None
+            api_map = await self._yt_api_videos([vid])
+            item = api_map.get(vid) if isinstance(api_map, dict) else None
+            if not item:
+                return None
+            snippet = item.get("snippet") or {}
+            lsd = item.get("liveStreamingDetails") or {}
+            title = str(snippet.get("title") or "")
+            # Determine live-now from liveStreamingDetails
+            actual_start = lsd.get("actualStartTime")
+            actual_end = lsd.get("actualEndTime")
+            is_live_now = bool(actual_start) and not bool(actual_end)
+            start_ts = _parse_iso_utc(actual_start) if actual_start else None
+            if not (title and is_live_now):
+                return None
+
         if not (self.title_rx.search(title) or self.title_rx.search(_normalize_title(title))):
             return None
         return t, vid, title, start_ts
@@ -1023,6 +1125,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         msg = msg.replace("{creator.name}", creator_name)
         msg = msg.replace("{video.link}", video_link)
         return msg
+
 
     async def _post(self, channel: discord.TextChannel, creator_name: str, title: str, video_id: str):
         video_link = f"https://youtu.be/{video_id}"
@@ -1035,12 +1138,18 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Watch", url=video_link))
 
-        await channel.send(
-            content=content,
-            embed=embed,
-            view=view,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        try:
+            await channel.send(
+                content=content,
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as e:
+            # Never let the announce loop die due to a send error.
+            if DEBUG:
+                log.warning("[yt-wuwa] send failed: %r", e)
+            raise
 
     @tasks.loop(seconds=POLL_SECONDS)
     async def loop(self):
@@ -1054,6 +1163,11 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return
 
         ch = self.bot.get_channel(ANNOUNCE_CHANNEL_ID)
+        if not isinstance(ch, discord.TextChannel):
+            try:
+                ch = await self.bot.fetch_channel(ANNOUNCE_CHANNEL_ID)
+            except Exception:
+                return
         if not isinstance(ch, discord.TextChannel):
             return
 
@@ -1119,7 +1233,16 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     ann_map[k] = vid
                 ann_vids[str(vid)] = int(datetime.now(timezone.utc).timestamp())
                 _write_json_best_effort(STATE_PATH, self.state)
-                log.info("[yt-wuwa] announced live: %s vid=%s", t.name, vid)
+                delay_min = None
+                if start_ts is not None:
+                    try:
+                        delay_min = int((now - start_ts).total_seconds() // 60)
+                    except Exception:
+                        delay_min = None
+                if delay_min is None:
+                    log.info("[yt-wuwa] announced live: %s vid=%s", t.name, vid)
+                else:
+                    log.info("[yt-wuwa] announced live: %s vid=%s delay_min=%s", t.name, vid, delay_min)
             except Exception as e:
                 log.warning("[yt-wuwa] post failed (%s): %r", t.name, e)
 
@@ -1132,8 +1255,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception as e:
             log.warning("[yt-wuwa] watchlist bootstrap failed: %r", e)
 
-
-        # Ensure the canonical watchlist embed exists immediately after boot, without waiting for a new message.
+        # Ensure the canonical watchlist embed exists immediately after boot.
         try:
             th = await self._ensure_watchlist_thread()
             if th:
@@ -1143,6 +1265,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     await self._cleanup_watchlist_thread(th, store_mid)
         except Exception as e:
             log.warning("[yt-wuwa] watchlist store sync failed: %r", e)
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(YouTubeWuWaLiveAnnouncer(bot))

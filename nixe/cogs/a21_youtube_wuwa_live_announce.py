@@ -25,13 +25,17 @@ log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 # ----------------------------
 ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
 ANNOUNCE_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "1453036422465585283") or "1453036422465585283")
-POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "90") or "90")
-CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "4") or "4")
+POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "20") or "90")
+CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "8") or "4")
 
-ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "1").strip() == "1"
+ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
 BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
 ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", "0") or "0")
 DEBUG = os.getenv("NIXE_YT_WUWA_DEBUG", "0").strip() == "1"
+
+# If enabled, let Discord generate the native YouTube embed (play button overlay).
+# When disabled, Nixe uses a custom embed with a static thumbnail + "Watch" button.
+ANNOUNCE_NATIVE_EMBED = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
 
 # Optional YouTube Data API v3 key (recommended to reduce scrape flakiness)
 YOUTUBE_API_KEY = (os.getenv("NIXE_YT_WUWA_YT_API_KEY", "").strip() or os.getenv("NIXE_YT_YT_API_KEY", "").strip())
@@ -877,12 +881,33 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 # discord.py 2.x supports replacing attachments via Message.edit(attachments=[...])
                 await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
             except TypeError:
-                # Fallback: cannot edit attachments; create a new store message and delete the old one best-effort.
+                # Fallback: cannot edit attachments; create a new store message (do NOT delete the old one).
                 m2 = await th.send(WATCHLIST_STORE_MARKER, embed=emb, file=file, allowed_mentions=discord.AllowedMentions.none())
                 self.state["watchlist_store_mid"] = m2.id
                 _write_json_best_effort(STATE_PATH, self.state)
+
+                # Archive the previous store message in-place (keep it for safety; never delete thread history).
                 try:
-                    await store.delete()
+                    await store.edit(
+                        content=f"{WATCHLIST_STORE_MARKER} (archived; superseded by {m2.id})",
+                        embed=None,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except TypeError:
+                    try:
+                        await store.edit(
+                            content=f"{WATCHLIST_STORE_MARKER} (archived; superseded by {m2.id})",
+                            embeds=[],
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                # Best-effort: pin the new canonical store message so it is easy to find.
+                try:
+                    await m2.pin(reason="watchlist store (canonical)")
                 except Exception:
                     pass
         except Exception as e:
@@ -937,23 +962,36 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             return
 
-    async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
-        # Best-effort: delete everything except the store embed message, so the thread stays clean.
-        if not WATCHLIST_CLEAN_THREAD:
-            return
-        if not th or not keep_mid:
-            return
-        try:
-            async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
-                if not m or m.id == keep_mid:
-                    continue
-                try:
-                    await m.delete()
-                except Exception:
-                    # No perms / too old / etc. Best-effort only.
-                    pass
-        except Exception:
-            pass
+    
+async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
+    # Best-effort: keep the store message (memory) intact.
+    # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
+    if not WATCHLIST_CLEAN_THREAD:
+        return
+    if not th or not keep_mid:
+        return
+    try:
+        async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
+            if not m or m.id == keep_mid:
+                continue
+            if getattr(m, "pinned", False):
+                continue
+            # Never delete our own messages (safest).
+            if m.author and self.bot.user and m.author.id == self.bot.user.id:
+                continue
+            txt = (getattr(m, "content", "") or "").strip()
+            if not txt:
+                continue
+            low = txt.lower()
+            looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
+            if not looks_like_add:
+                continue
+            try:
+                await m.delete()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     async def _ingest_watchlist_message(self, text: str) -> Tuple[int, List[Dict[str, str]]]:
         """Parse a single message and merge any new targets."""
@@ -1253,9 +1291,25 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
 
     async def _post(self, channel: discord.TextChannel, creator_name: str, title: str, video_id: str):
-        video_link = f"https://youtu.be/{video_id}"
+        # Use the canonical watch URL so Discord is more likely to render the native YouTube player-style embed.
+        video_link = f"https://www.youtube.com/watch?v={video_id}"
         content = self._render_template(creator_name, video_link)
 
+        # Native embed mode: do NOT attach a custom embed/image; let Discord unfurl the YouTube link.
+        if ANNOUNCE_NATIVE_EMBED:
+            try:
+                await channel.send(
+                    content=content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception as e:
+                # Never let the announce loop die due to a send error.
+                if DEBUG:
+                    log.warning("[yt-wuwa] send failed (native): %r", e)
+                raise
+            return
+
+        # Custom embed mode (legacy): static thumbnail + link button.
         embed = discord.Embed(title=title, url=video_link)
         embed.set_author(name=creator_name)
         embed.set_image(url=f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
@@ -1275,6 +1329,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if DEBUG:
                 log.warning("[yt-wuwa] send failed: %r", e)
             raise
+
 
     @tasks.loop(seconds=POLL_SECONDS)
     async def loop(self):
@@ -1296,7 +1351,60 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         if not isinstance(ch, discord.TextChannel):
             return
 
-        results = await asyncio.gather(*(self._check_live(t) for t in list(self.targets)), return_exceptions=True)
+        # Run checks with per-target timeout and a hard loop deadline to avoid multi-minute stalls.
+
+        async def _run_one(tt):
+
+            try:
+
+                return await asyncio.wait_for(self._check_live(tt), timeout=CHECK_TIMEOUT_SECONDS)
+
+            except Exception as e:
+
+                if DEBUG:
+
+                    try:
+
+                        q = tt.get('query') if isinstance(tt, dict) else 'unknown'
+
+                    except Exception:
+
+                        q = 'unknown'
+
+                    log.info('[yt-wuwa] check timeout/err for %s: %r', q, e)
+
+                return None
+
+
+        tasks_list = [asyncio.create_task(_run_one(t)) for t in list(self.targets)]
+
+        done, pending = await asyncio.wait(tasks_list, timeout=LOOP_DEADLINE_SECONDS)
+
+        for p in pending:
+
+            p.cancel()
+
+
+        results = []
+
+        for d in done:
+
+            if d.cancelled():
+
+                continue
+
+            try:
+
+                r = d.result()
+
+            except Exception:
+
+                continue
+
+            if r:
+
+                results.append(r)
+
         for res in results:
             if not res or isinstance(res, Exception):
                 continue

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -24,10 +25,10 @@ log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 # ----------------------------
 ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
 ANNOUNCE_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "1453036422465585283") or "1453036422465585283")
-POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "20") or "20")
-CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "8") or "8")
+POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "90") or "90")
+CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "4") or "4")
 
-ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
+ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "1").strip() == "1"
 BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
 ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", "0") or "0")
 DEBUG = os.getenv("NIXE_YT_WUWA_DEBUG", "0").strip() == "1"
@@ -47,6 +48,7 @@ WATCHLIST_THREAD_SCAN_LIMIT = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_SCAN_
 
 # Watchlist thread store message (keeps thread clean)
 WATCHLIST_STORE_MARKER = "[yt-wuwa-watchlist]"
+WATCHLIST_STORE_ATTACHMENT_NAME = "youtube_wuwa_watchlist.json"
 WATCHLIST_CLEAN_THREAD = os.getenv("NIXE_YT_WUWA_WATCHLIST_CLEAN_THREAD", "1").strip() == "1"
 WATCHLIST_STORE_MAX_HISTORY_SCAN = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_STORE_MAX_HISTORY_SCAN", "50") or "50")
 
@@ -608,6 +610,22 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return
 
         cfg = _read_json_any(WATCHLIST_PATH) or {}
+
+        # Prefer canonical store attachment (survives restarts even if local disk is wiped).
+        store_cfg: Optional[Dict[str, Any]] = None
+        try:
+            store_cfg = await self._load_watchlist_from_store_attachment(th)
+        except Exception:
+            store_cfg = None
+        if isinstance(store_cfg, dict) and store_cfg.get("targets"):
+            try:
+                merged, _, _ = self._merge_targets(cfg.get("targets") or [], store_cfg.get("targets") or [])
+                cfg["targets"] = merged
+                _write_json_best_effort(WATCHLIST_PATH, cfg)
+                self._reload_watchlist()
+            except Exception:
+                pass
+
         existing_targets = cfg.get("targets") or []
         new_targets: List[Dict[str, str]] = []
 
@@ -700,6 +718,87 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         emb.set_footer(text=f"{len(targets)} channel(s) • Auto-synced from thread")
         return emb
 
+
+    def _build_watchlist_attachment_bytes(self, cfg: Dict[str, Any]) -> bytes:
+        """Serialize watchlist cfg to bytes for Discord attachment (persistent across restarts)."""
+        try:
+            payload = json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8")
+            return payload
+        except Exception:
+            try:
+                return b"{}"
+            except Exception:
+                return b"{}"
+
+    async def _load_watchlist_from_store_attachment(self, th: discord.Thread) -> Optional[Dict[str, Any]]:
+        """Best-effort: read canonical watchlist cfg from the bot store message attachment."""
+        try:
+            mid = int(self.state.get("watchlist_store_mid") or 0)
+            msg: Optional[discord.Message] = None
+            if mid:
+                try:
+                    msg = await th.fetch_message(mid)
+                except Exception:
+                    msg = None
+
+            # Fallback: scan recent messages for the marker
+            if msg is None:
+                async for m in th.history(limit=max(20, WATCHLIST_STORE_MAX_HISTORY_SCAN), oldest_first=False):
+                    if not m or not (m.author and self.bot.user and m.author.id == self.bot.user.id):
+                        continue
+                    if (m.content or "").strip().startswith(WATCHLIST_STORE_MARKER):
+                        msg = m
+                        self.state["watchlist_store_mid"] = m.id
+                        _write_json_best_effort(STATE_PATH, self.state)
+                        break
+
+            if msg is None:
+                return None
+
+            # Prefer JSON attachment if present
+            atts = list(getattr(msg, "attachments", []) or [])
+            for a in atts:
+                try:
+                    if (a.filename or "").lower() == WATCHLIST_STORE_ATTACHMENT_NAME.lower():
+                        raw = await a.read()
+                        obj = json.loads(raw.decode("utf-8", errors="replace"))
+                        if isinstance(obj, dict):
+                            return obj
+                except Exception:
+                    continue
+
+            # Fallback: try parse embed description (non-authoritative, but better than nothing)
+            try:
+                if msg.embeds:
+                    desc = (msg.embeds[0].description or "")
+                    targets: List[Dict[str, str]] = []
+                    for line in desc.splitlines():
+                        line = line.strip()
+                        if not line or not re.match(r"^\d+\.", line):
+                            continue
+                        # "1. Name — @handle" / "1. Name — url"
+                        line = re.sub(r"^\d+\.\s*", "", line)
+                        parts = [p.strip() for p in line.split("—", 1)]
+                        name = parts[0].strip() if parts else ""
+                        ident = parts[1].strip() if len(parts) > 1 else ""
+                        t: Dict[str, str] = {"name": name, "query": name}
+                        if ident.startswith("@"):
+                            t["handle"] = ident
+                            t["url"] = f"https://www.youtube.com/{ident}"
+                        elif ident.startswith("http"):
+                            t["url"] = ident
+                        targets.append(t)
+                    if targets:
+                        cfg = _read_json_any(WATCHLIST_PATH) or {}
+                        cfg["targets"] = targets
+                        return cfg
+            except Exception:
+                pass
+
+            return None
+        except Exception:
+            return None
+
     async def _find_or_create_watchlist_store_message(self, th: discord.Thread) -> Optional[discord.Message]:
         if not th:
             return None
@@ -730,7 +829,11 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Create new store message
         try:
             emb = self._build_watchlist_embed(self.watch.get("targets") or [])
-            m = await th.send(WATCHLIST_STORE_MARKER, embed=emb, allowed_mentions=discord.AllowedMentions.none())
+            cfg = _read_json_any(WATCHLIST_PATH) or {}
+            payload = self._build_watchlist_attachment_bytes(cfg)
+            fp = io.BytesIO(payload)
+            file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
+            m = await th.send(WATCHLIST_STORE_MARKER, embed=emb, file=file, allowed_mentions=discord.AllowedMentions.none())
             self.state["watchlist_store_mid"] = m.id
             _write_json_best_effort(STATE_PATH, self.state)
             return m
@@ -759,7 +862,29 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if not store:
                 return
             emb = self._build_watchlist_embed(targets)
-            await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, allowed_mentions=discord.AllowedMentions.none())
+
+            # Persist canonical watchlist into the store message attachment so it survives restarts / ephemeral disk.
+            try:
+                cfg_out = dict(cfg)
+                cfg_out["targets"] = list(targets)
+            except Exception:
+                cfg_out = {"targets": list(targets)}
+            payload = self._build_watchlist_attachment_bytes(cfg_out)
+            fp = io.BytesIO(payload)
+            file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
+
+            try:
+                # discord.py 2.x supports replacing attachments via Message.edit(attachments=[...])
+                await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
+            except TypeError:
+                # Fallback: cannot edit attachments; create a new store message and delete the old one best-effort.
+                m2 = await th.send(WATCHLIST_STORE_MARKER, embed=emb, file=file, allowed_mentions=discord.AllowedMentions.none())
+                self.state["watchlist_store_mid"] = m2.id
+                _write_json_best_effort(STATE_PATH, self.state)
+                try:
+                    await store.delete()
+                except Exception:
+                    pass
         except Exception as e:
             log.warning("[yt-wuwa] watchlist store sync failed: %r", e)
 
@@ -1250,6 +1375,17 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
     async def before_loop(self):
         await self.bot.wait_until_ready()
         await self._ensure_session()
+
+        # Seed local watchlist from the persistent store message attachment before doing any cleanup.
+        try:
+            th0 = await self._ensure_watchlist_thread()
+            if th0:
+                sc0 = await self._load_watchlist_from_store_attachment(th0)
+                if isinstance(sc0, dict) and sc0.get("targets"):
+                    _write_json_best_effort(WATCHLIST_PATH, sc0)
+                    self._reload_watchlist()
+        except Exception:
+            pass
         try:
             await self._bootstrap_watchlist_from_thread()
         except Exception as e:

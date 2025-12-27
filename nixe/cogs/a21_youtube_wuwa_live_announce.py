@@ -39,6 +39,18 @@ CHECK_TIMEOUT_SECONDS = _env_float("NIXE_YT_WUWA_CHECK_TIMEOUT_SECONDS", 15.0)
 _DEFAULT_LOOP_DEADLINE = max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))
 LOOP_DEADLINE_SECONDS = _env_float("NIXE_YT_WUWA_LOOP_DEADLINE_SECONDS", _DEFAULT_LOOP_DEADLINE)
 
+# Hard guard: ensure these globals exist even if parts of the module are hot-reloaded or edited.
+try:
+    CHECK_TIMEOUT_SECONDS
+except Exception:
+    CHECK_TIMEOUT_SECONDS = _env_float("NIXE_YT_WUWA_CHECK_TIMEOUT_SECONDS", 15.0)
+
+try:
+    LOOP_DEADLINE_SECONDS
+except Exception:
+    _DEFAULT_LOOP_DEADLINE = max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))
+    LOOP_DEADLINE_SECONDS = _env_float("NIXE_YT_WUWA_LOOP_DEADLINE_SECONDS", _DEFAULT_LOOP_DEADLINE)
+
 
 ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
 BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
@@ -975,35 +987,35 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return
 
     
-async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
-    # Best-effort: keep the store message (memory) intact.
-    # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
-    if not WATCHLIST_CLEAN_THREAD:
-        return
-    if not th or not keep_mid:
-        return
-    try:
-        async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
-            if not m or m.id == keep_mid:
-                continue
-            if getattr(m, "pinned", False):
-                continue
-            # Never delete our own messages (safest).
-            if m.author and self.bot.user and m.author.id == self.bot.user.id:
-                continue
-            txt = (getattr(m, "content", "") or "").strip()
-            if not txt:
-                continue
-            low = txt.lower()
-            looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
-            if not looks_like_add:
-                continue
-            try:
-                await m.delete()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
+        # Best-effort: keep the store message (memory) intact.
+        # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
+        if not WATCHLIST_CLEAN_THREAD:
+            return
+        if not th or not keep_mid:
+            return
+        try:
+            async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
+                if not m or m.id == keep_mid:
+                    continue
+                if getattr(m, "pinned", False):
+                    continue
+                # Never delete our own messages (safest).
+                if m.author and self.bot.user and m.author.id == self.bot.user.id:
+                    continue
+                txt = (getattr(m, "content", "") or "").strip()
+                if not txt:
+                    continue
+                low = txt.lower()
+                looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
+                if not looks_like_add:
+                    continue
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def _ingest_watchlist_message(self, text: str) -> Tuple[int, List[Dict[str, str]]]:
         """Parse a single message and merge any new targets."""
@@ -1252,7 +1264,7 @@ async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> 
         _write_json_best_effort(STATE_PATH, self.state)
         return t
 
-    async def _check_live(self, t: Target) -> Optional[Tuple[Target, str, str]]:
+    async def _check_live(self, t: Target) -> Optional[Tuple[Target, str, str, Optional[datetime]]]:
         """
         Returns (target, video_id, title) if live now and matches whitelist.
         """
@@ -1369,7 +1381,7 @@ async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> 
 
             try:
 
-                timeout = CHECK_TIMEOUT_SECONDS
+                timeout = float(globals().get("CHECK_TIMEOUT_SECONDS", 15.0))
                 return await asyncio.wait_for(self._check_live(tt), timeout=timeout)
 
             except Exception as e:
@@ -1378,7 +1390,7 @@ async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> 
 
                     try:
 
-                        q = tt.get('query') if isinstance(tt, dict) else 'unknown'
+                        q = (tt.get('query') if isinstance(tt, dict) else (getattr(tt, 'query', None) or getattr(tt, 'name', None) or 'unknown'))
 
                     except Exception:
 
@@ -1391,7 +1403,8 @@ async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> 
 
         tasks_list = [asyncio.create_task(_run_one(t)) for t in list(self.targets)]
 
-        done, pending = await asyncio.wait(tasks_list, timeout=LOOP_DEADLINE_SECONDS)
+        deadline = float(globals().get("LOOP_DEADLINE_SECONDS", max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))))
+        done, pending = await asyncio.wait(tasks_list, timeout=deadline)
 
         for p in pending:
 

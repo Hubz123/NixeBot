@@ -963,35 +963,35 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return
 
     
-async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
-    # Best-effort: keep the store message (memory) intact.
-    # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
-    if not WATCHLIST_CLEAN_THREAD:
-        return
-    if not th or not keep_mid:
-        return
-    try:
-        async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
-            if not m or m.id == keep_mid:
-                continue
-            if getattr(m, "pinned", False):
-                continue
-            # Never delete our own messages (safest).
-            if m.author and self.bot.user and m.author.id == self.bot.user.id:
-                continue
-            txt = (getattr(m, "content", "") or "").strip()
-            if not txt:
-                continue
-            low = txt.lower()
-            looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
-            if not looks_like_add:
-                continue
-            try:
-                await m.delete()
-            except Exception:
-                pass
-    except Exception:
-        pass
+    async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
+        # Best-effort: keep the store message (memory) intact.
+        # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
+        if not WATCHLIST_CLEAN_THREAD:
+            return
+        if not th or not keep_mid:
+            return
+        try:
+            async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
+                if not m or m.id == keep_mid:
+                    continue
+                if getattr(m, "pinned", False):
+                    continue
+                # Never delete our own messages (safest).
+                if m.author and self.bot.user and m.author.id == self.bot.user.id:
+                    continue
+                txt = (getattr(m, "content", "") or "").strip()
+                if not txt:
+                    continue
+                low = txt.lower()
+                looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
+                if not looks_like_add:
+                    continue
+                try:
+                    await m.delete()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     async def _ingest_watchlist_message(self, text: str) -> Tuple[int, List[Dict[str, str]]]:
         """Parse a single message and merge any new targets."""

@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import unicodedata
+import html as _html
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,26 +31,21 @@ CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "8") or "4")
 
 def _env_float(key: str, default: float) -> float:
     try:
-        return float(os.getenv(key, str(default)) or str(default))
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            return float(default)
+        return float(raw)
     except Exception:
         return float(default)
 
-# Per-target check timeout and overall loop deadline (to avoid multi-minute stalls)
+# Per-target check timeout and overall loop deadline (seconds)
 CHECK_TIMEOUT_SECONDS = _env_float("NIXE_YT_WUWA_CHECK_TIMEOUT_SECONDS", 15.0)
-_DEFAULT_LOOP_DEADLINE = max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))
-LOOP_DEADLINE_SECONDS = _env_float("NIXE_YT_WUWA_LOOP_DEADLINE_SECONDS", _DEFAULT_LOOP_DEADLINE)
+# Default deadline: just under the poll interval, but never less than 5 seconds.
+LOOP_DEADLINE_SECONDS = _env_float(
+    "NIXE_YT_WUWA_LOOP_DEADLINE_SECONDS",
+    max(5.0, float(POLL_SECONDS) - 2.0),
+)
 
-# Hard guard: ensure these globals exist even if parts of the module are hot-reloaded or edited.
-try:
-    CHECK_TIMEOUT_SECONDS
-except Exception:
-    CHECK_TIMEOUT_SECONDS = _env_float("NIXE_YT_WUWA_CHECK_TIMEOUT_SECONDS", 15.0)
-
-try:
-    LOOP_DEADLINE_SECONDS
-except Exception:
-    _DEFAULT_LOOP_DEADLINE = max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))
-    LOOP_DEADLINE_SECONDS = _env_float("NIXE_YT_WUWA_LOOP_DEADLINE_SECONDS", _DEFAULT_LOOP_DEADLINE)
 
 
 ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
@@ -96,6 +92,36 @@ def _normalize_title(s: str) -> str:
     # normalize hashtag variants
     s = s.replace("＃", "#")
     return s
+
+def _strip_youtube_suffix(s: str) -> str:
+    s = (s or "").strip()
+    # Most channel pages set <title> "<Channel Name> - YouTube"
+    if s.lower().endswith(" - youtube"):
+        s = s[:-10].rstrip()
+    return s
+
+_OG_TITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"', re.IGNORECASE)
+_META_TITLE_RE = re.compile(r'<meta\s+name="title"\s+content="([^"]+)"', re.IGNORECASE)
+_TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_CHANNEL_ID_RE = re.compile(r'"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{20,})"')
+
+def _extract_channel_title_from_html(html: str) -> Optional[str]:
+    if not html:
+        return None
+    m = _OG_TITLE_RE.search(html) or _META_TITLE_RE.search(html)
+    if m:
+        return _strip_youtube_suffix(_html.unescape(m.group(1)))
+    m2 = _TITLE_TAG_RE.search(html)
+    if m2:
+        txt = re.sub(r"\s+", " ", _html.unescape(m2.group(1))).strip()
+        return _strip_youtube_suffix(txt)
+    return None
+
+def _extract_channel_id_from_html(html: str) -> Optional[str]:
+    if not html:
+        return None
+    m = _CHANNEL_ID_RE.search(html)
+    return m.group(1) if m else None
 
 def _parse_iso_utc(ts: Any) -> Optional[datetime]:
     """Parse ISO8601 timestamps used by YouTube API into timezone-aware datetime (UTC)."""
@@ -986,7 +1012,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             return
 
-    
+
     async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
         # Best-effort: keep the store message (memory) intact.
         # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
@@ -1224,10 +1250,11 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         return None
 
     async def _resolve_channel(self, t: Target) -> Target:
-        if t.channel_id or t.url or t.handle:
+        if t.channel_id or t.url:
             return t
 
-        cached = self.state.get("resolved", {}).get(t.query) or self.state.get("resolved", {}).get(t.name)
+        res = self.state.get("resolved", {})
+        cached = (res.get(t.handle) if t.handle else None) or (res.get(t.url) if t.url else None) or res.get(t.channel_id) or res.get(t.query) or res.get(t.name)
         if isinstance(cached, dict):
             cid = str(cached.get("channel_id") or "")
             title = str(cached.get("title") or t.name)
@@ -1266,12 +1293,41 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
     async def _check_live(self, t: Target) -> Optional[Tuple[Target, str, str, Optional[datetime]]]:
         """
-        Returns (target, video_id, title) if live now and matches whitelist.
+        Returns (target, video_id, title, start_ts_utc) if live now and matches whitelist.
         """
         t = await self._resolve_channel(t)
         base = t.base_url()
         if not base:
             return None
+        # Best-effort: resolve the real channel display name for this target so announces use the
+        # YouTube channel display name (not the @handle token). Must never block announcing.
+        try:
+            need_name = (t.name or "").strip().startswith(("@", "＠")) or (
+                (t.handle or "").strip() and (t.name or "").strip() == (t.handle or "").strip()
+            )
+            if need_name:
+                res = self.state.setdefault("resolved", {})
+                cached = None
+                if t.handle:
+                    cached = res.get(t.handle)
+                if not cached and t.query:
+                    cached = res.get(t.query)
+                if not cached:
+                    cached = res.get(t.name)
+                nm = None
+                if isinstance(cached, dict):
+                    nm = (cached.get("title") or "").strip() or None
+                if not nm:
+                    nm = await self._try_fetch_channel_name_oembed(base)
+                if nm:
+                    t.name = nm
+                    if t.handle:
+                        res[t.handle] = {"channel_id": t.channel_id, "title": t.name, "url": (t.url or base)}
+                    if t.query:
+                        res.setdefault(t.query, {"channel_id": t.channel_id, "title": t.name, "url": (t.url or base)})
+                    _write_json_best_effort(STATE_PATH, self.state)
+        except Exception:
+            pass
         live_url = base.rstrip("/") + "/live"
         html = await self._http_get_text(live_url)
         if not html:
@@ -1302,6 +1358,39 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             start_ts = _parse_iso_utc(actual_start) if actual_start else None
             if not (title and is_live_now):
                 return None
+
+
+        # Ensure creator display name is the YouTube channel name (not @handle).
+        # Resolve using oEmbed on the live video watch URL (most reliable). Must never block announcing.
+        try:
+            need_name2 = (t.name or "").strip().startswith(("@", "＠")) or (
+                (t.handle or "").strip() and (t.name or "").strip() == (t.handle or "").strip()
+            )
+            if need_name2:
+                res = self.state.setdefault("resolved", {})
+                cached = None
+                if t.handle:
+                    cached = res.get(t.handle)
+                if not cached and t.query:
+                    cached = res.get(t.query)
+                nm = None
+                if isinstance(cached, dict):
+                    nm = (cached.get("title") or "").strip() or None
+                if not nm and vid:
+                    watch_url = f"https://www.youtube.com/watch?v={vid}"
+                    try:
+                        nm = await asyncio.wait_for(self._try_fetch_channel_name_oembed(watch_url), timeout=3.0)
+                    except Exception:
+                        nm = None
+                if nm:
+                    t.name = nm
+                    if t.handle:
+                        res[t.handle] = {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url())}
+                    if t.query:
+                        res.setdefault(t.query, {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url())})
+                    _write_json_best_effort(STATE_PATH, self.state)
+        except Exception:
+            pass
 
         if not (self.title_rx.search(title) or self.title_rx.search(_normalize_title(title))):
             return None
@@ -1381,16 +1470,16 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             try:
 
-                timeout = float(globals().get("CHECK_TIMEOUT_SECONDS", 15.0))
-                return await asyncio.wait_for(self._check_live(tt), timeout=timeout)
+                timeout = CHECK_TIMEOUT_SECONDS
 
+                return await asyncio.wait_for(self._check_live(tt), timeout=timeout)
             except Exception as e:
 
                 if DEBUG:
 
                     try:
 
-                        q = (tt.get('query') if isinstance(tt, dict) else (getattr(tt, 'query', None) or getattr(tt, 'name', None) or 'unknown'))
+                        q = tt.get('query') if isinstance(tt, dict) else 'unknown'
 
                     except Exception:
 
@@ -1403,9 +1492,9 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
         tasks_list = [asyncio.create_task(_run_one(t)) for t in list(self.targets)]
 
-        deadline = float(globals().get("LOOP_DEADLINE_SECONDS", max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))))
-        done, pending = await asyncio.wait(tasks_list, timeout=deadline)
+        deadline = LOOP_DEADLINE_SECONDS
 
+        done, pending = await asyncio.wait(tasks_list, timeout=deadline)
         for p in pending:
 
             p.cancel()

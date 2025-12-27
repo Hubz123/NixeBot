@@ -291,7 +291,7 @@
   "NIXE_YT_WUWA_MESSAGE_TEMPLATE": "",
   "NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT": "0",
   "NIXE_YT_WUWA_STATE_PATH": "data/youtube_wuwa_state.json",
-  "NIXE_YT_WUWA_TITLE_REGEX": "#?\\s*鳴潮",
+  "NIXE_YT_WUWA_TITLE_REGEX": "(?:#\\s*)?(?:鳴潮|鸣潮)|Wuthering\\s*Waves|WuWa|Wuwa|wuwa",
   "NIXE_YT_WUWA_WATCHLIST_PATH": "data/youtube_wuwa_watchlist.json",
   "NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID": "1431178130155896882",
   "NIXE_YT_WUWA_WATCHLIST_THREAD_NAME": "YT_WATCHLIST",

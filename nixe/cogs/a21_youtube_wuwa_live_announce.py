@@ -28,6 +28,18 @@ ANNOUNCE_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "1453036
 POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "20") or "90")
 CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "8") or "4")
 
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)) or str(default))
+    except Exception:
+        return float(default)
+
+# Per-target check timeout and overall loop deadline (to avoid multi-minute stalls)
+CHECK_TIMEOUT_SECONDS = _env_float("NIXE_YT_WUWA_CHECK_TIMEOUT_SECONDS", 15.0)
+_DEFAULT_LOOP_DEADLINE = max(10.0, min(float(POLL_SECONDS) - 1.0, 55.0))
+LOOP_DEADLINE_SECONDS = _env_float("NIXE_YT_WUWA_LOOP_DEADLINE_SECONDS", _DEFAULT_LOOP_DEADLINE)
+
+
 ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
 BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
 ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", "0") or "0")
@@ -963,35 +975,35 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return
 
     
-    async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
-        # Best-effort: keep the store message (memory) intact.
-        # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
-        if not WATCHLIST_CLEAN_THREAD:
-            return
-        if not th or not keep_mid:
-            return
-        try:
-            async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
-                if not m or m.id == keep_mid:
-                    continue
-                if getattr(m, "pinned", False):
-                    continue
-                # Never delete our own messages (safest).
-                if m.author and self.bot.user and m.author.id == self.bot.user.id:
-                    continue
-                txt = (getattr(m, "content", "") or "").strip()
-                if not txt:
-                    continue
-                low = txt.lower()
-                looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
-                if not looks_like_add:
-                    continue
-                try:
-                    await m.delete()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
+    # Best-effort: keep the store message (memory) intact.
+    # Only delete moderator "add" messages (youtube links / handles). Never delete the store message.
+    if not WATCHLIST_CLEAN_THREAD:
+        return
+    if not th or not keep_mid:
+        return
+    try:
+        async for m in th.history(limit=WATCHLIST_THREAD_SCAN_LIMIT, oldest_first=False):
+            if not m or m.id == keep_mid:
+                continue
+            if getattr(m, "pinned", False):
+                continue
+            # Never delete our own messages (safest).
+            if m.author and self.bot.user and m.author.id == self.bot.user.id:
+                continue
+            txt = (getattr(m, "content", "") or "").strip()
+            if not txt:
+                continue
+            low = txt.lower()
+            looks_like_add = ("youtube.com" in low) or ("youtu.be" in low) or ("/@" in low) or txt.startswith("@")
+            if not looks_like_add:
+                continue
+            try:
+                await m.delete()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     async def _ingest_watchlist_message(self, text: str) -> Tuple[int, List[Dict[str, str]]]:
         """Parse a single message and merge any new targets."""
@@ -1357,7 +1369,8 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             try:
 
-                return await asyncio.wait_for(self._check_live(tt), timeout=CHECK_TIMEOUT_SECONDS)
+                timeout = CHECK_TIMEOUT_SECONDS
+                return await asyncio.wait_for(self._check_live(tt), timeout=timeout)
 
             except Exception as e:
 

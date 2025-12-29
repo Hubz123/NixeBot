@@ -100,6 +100,7 @@ def _yt_player_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
 # Search resolve (name -> channelId) fallback
 # ----------------------------
 _YTINITDATA_RE = re.compile(r"ytInitialData\s*=\s*(\{.*?\});", re.DOTALL)
+_UC_ID_LIKE_RE = re.compile(r"^UC[0-9A-Za-z_-]{20,}$")
 
 def _score_channel_hit(query: str, title: str) -> int:
     q = (query or "").lower()
@@ -160,6 +161,13 @@ class Target:
         return None
 
 class YouTubeWuWaTestCommand(commands.Cog):
+    def _safe_creator_name(self, name: str) -> str:
+        nm = (name or "").strip()
+        if (not nm) or nm.startswith(("@", "＠")) or re.match(r"^UC[0-9A-Za-z_-]{20,}$", nm):
+            return "UNRESOLVED_CHANNEL_NAME"
+        return nm
+
+
     """
     Prefix command:
       nixe ytwtest [here|announce] [count=N]
@@ -229,6 +237,56 @@ class YouTubeWuWaTestCommand(commands.Cog):
         except Exception:
             return None
 
+    async def _try_fetch_channel_name_oembed(self, url: str) -> Optional[str]:
+        """Resolve YouTube channel display name using oEmbed (author_name).
+
+        Best-effort: returns None on any failure. Must never break test command.
+        """
+        try:
+            await self._ensure_session()
+            assert self.session is not None
+            oembed_url = f"https://www.youtube.com/oembed?url={quote_plus(url)}&format=json"
+            async with self.session.get(oembed_url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                author = (data.get("author_name") or "").strip()
+                if not author:
+                    return None
+                # Avoid returning obvious handles / IDs.
+                if author.startswith(("@", "＠")):
+                    return None
+                if _UC_ID_LIKE_RE.match(author):
+                    return None
+                return author
+        except Exception:
+            return None
+
+    async def _try_fetch_channel_name_from_channel_page(self, url: str) -> Optional[str]:
+        """Fallback: fetch channel page and parse <title> '<Channel> - YouTube'."""
+        try:
+            html = await self._http_get_text(url)
+            if not html:
+                return None
+            # Very small parse (avoid heavy deps)
+            m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+            if not m:
+                return None
+            title = re.sub(r"\s+", " ", m.group(1)).strip()
+            # strip suffix
+            if title.lower().endswith(" - youtube"):
+                title = title[: -len(" - youtube")].strip()
+            if not title:
+                return None
+            if title.startswith(("@", "＠")):
+                return None
+            if _UC_ID_LIKE_RE.match(title):
+                return None
+            return title
+        except Exception:
+            return None
+
+
     async def _resolve_channel_id(self, t: Target) -> Target:
         # If already resolvable, keep.
         if t.channel_id or t.url or t.handle:
@@ -257,7 +315,7 @@ class YouTubeWuWaTestCommand(commands.Cog):
 
     def _render_template(self, creator_name: str, video_link: str) -> str:
         msg = self.template
-        msg = msg.replace("{creator.name}", creator_name)
+        msg = msg.replace("{creator.name}", self._safe_creator_name(creator_name))
         msg = msg.replace("{video.link}", video_link)
         return msg
 
@@ -298,6 +356,33 @@ class YouTubeWuWaTestCommand(commands.Cog):
             status_str = "LIVE"
         elif is_live_now is False:
             status_str = "NOT LIVE"
+
+
+        # Ensure creator display name is the channel name (not UC... / @handle).
+        try:
+            nm_current = (t.name or "").strip()
+            need = (not nm_current) or nm_current.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(nm_current)
+            if (t.handle or "").strip() and nm_current and nm_current == (t.handle or "").strip():
+                need = True
+            if need:
+                nm = None
+                if vid:
+                    watch_url = f"https://www.youtube.com/watch?v={vid}"
+                    try:
+                        nm = await asyncio.wait_for(self._try_fetch_channel_name_oembed(watch_url), timeout=3.0)
+                    except Exception:
+                        nm = None
+                if not nm:
+                    base2 = (t.url or t.base_url() or "").strip()
+                    if base2:
+                        try:
+                            nm = await asyncio.wait_for(self._try_fetch_channel_name_from_channel_page(base2), timeout=4.0)
+                        except Exception:
+                            nm = None
+                if nm:
+                    t.name = nm
+        except Exception:
+            pass
 
         content = self._render_template(t.name, video_link)
         content = f"[TEST] {content}"

@@ -21,14 +21,30 @@ from discord.ext import commands, tasks
 
 log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 
+
+def _env_int(name: str, default: int) -> int:
+    """Parse integer env var robustly.
+    - Missing or empty => default
+    - Non-integer => default
+    """
+    try:
+        v = os.getenv(name)
+        if v is None:
+            return int(default)
+        v = str(v).strip()
+        if not v:
+            return int(default)
+        return int(v)
+    except Exception:
+        return int(default)
+
 # ----------------------------
 # Runtime toggles (runtime_env.json -> os.environ via env overlay)
 # ----------------------------
 ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
-ANNOUNCE_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", "1453036422465585283") or "1453036422465585283")
-POLL_SECONDS = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", "20") or "90")
-CONCURRENCY = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", "8") or "4")
-
+ANNOUNCE_CHANNEL_ID = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", 1453036422465585283)
+POLL_SECONDS = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", 20)
+CONCURRENCY = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", 8)
 def _env_float(key: str, default: float) -> float:
     try:
         raw = os.getenv(key, "").strip()
@@ -49,32 +65,30 @@ LOOP_DEADLINE_SECONDS = _env_float(
 
 
 ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
-BOOT_GRACE_SECONDS = int(os.getenv("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", "30") or "30")
-ANNOUNCE_MAX_AGE_MINUTES = int(os.getenv("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", "0") or "0")
+BOOT_GRACE_SECONDS = _env_int("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", 30)
+ANNOUNCE_MAX_AGE_MINUTES = _env_int("NIXE_YT_WUWA_ANNOUNCE_MAX_AGE_MINUTES", 0)
 DEBUG = os.getenv("NIXE_YT_WUWA_DEBUG", "0").strip() == "1"
 
 # If enabled, let Discord generate the native YouTube embed (play button overlay).
 # When disabled, Nixe uses a custom embed with a static thumbnail + "Watch" button.
 ANNOUNCE_NATIVE_EMBED = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
 
-# Optional YouTube Data API v3 key (recommended to reduce scrape flakiness)
-YOUTUBE_API_KEY = (os.getenv("NIXE_YT_WUWA_YT_API_KEY", "").strip() or os.getenv("NIXE_YT_YT_API_KEY", "").strip())
-YOUTUBE_API_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
-
+# Optional YouTube API v3 key (recommended to reduce scrape flakiness)
+YOUTUBE_API_KEY = ""  # hard-disabled: do not use YouTube API
 WATCHLIST_PATH = (os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json")
 STATE_PATH = (os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json").strip() or "data/youtube_wuwa_state.json")
 
 # Watchlist via Discord thread (optional, but enabled by default when parent channel id is set)
-WATCHLIST_PARENT_CHANNEL_ID = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID", "1431178130155896882") or "1431178130155896882")
+WATCHLIST_PARENT_CHANNEL_ID = _env_int("NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID", 1431178130155896882)
 WATCHLIST_THREAD_NAME = os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_NAME", "YT_WATCHLIST").strip() or "YT_WATCHLIST"
-WATCHLIST_THREAD_ID_OVERRIDE = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_ID", "1453571893062926428") or "1453571893062926428")
-WATCHLIST_THREAD_SCAN_LIMIT = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_SCAN_LIMIT", "200") or "200")
+WATCHLIST_THREAD_ID_OVERRIDE = _env_int("NIXE_YT_WUWA_WATCHLIST_THREAD_ID", 1453571893062926428)
+WATCHLIST_THREAD_SCAN_LIMIT = _env_int("NIXE_YT_WUWA_WATCHLIST_THREAD_SCAN_LIMIT", 200)
 
 # Watchlist thread store message (keeps thread clean)
 WATCHLIST_STORE_MARKER = "[yt-wuwa-watchlist]"
 WATCHLIST_STORE_ATTACHMENT_NAME = "youtube_wuwa_watchlist.json"
 WATCHLIST_CLEAN_THREAD = os.getenv("NIXE_YT_WUWA_WATCHLIST_CLEAN_THREAD", "1").strip() == "1"
-WATCHLIST_STORE_MAX_HISTORY_SCAN = int(os.getenv("NIXE_YT_WUWA_WATCHLIST_STORE_MAX_HISTORY_SCAN", "50") or "50")
+WATCHLIST_STORE_MAX_HISTORY_SCAN = _env_int("NIXE_YT_WUWA_WATCHLIST_STORE_MAX_HISTORY_SCAN", 50)
 
 
 
@@ -104,6 +118,7 @@ _OG_TITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"', re
 _META_TITLE_RE = re.compile(r'<meta\s+name="title"\s+content="([^"]+)"', re.IGNORECASE)
 _TITLE_TAG_RE = re.compile(r"<title>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _CHANNEL_ID_RE = re.compile(r'"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{20,})"')
+_UC_ID_LIKE_RE = re.compile(r"^UC[0-9A-Za-z_-]{20,}$")
 
 def _extract_channel_title_from_html(html: str) -> Optional[str]:
     if not html:
@@ -115,6 +130,20 @@ def _extract_channel_title_from_html(html: str) -> Optional[str]:
     if m2:
         txt = re.sub(r"\s+", " ", _html.unescape(m2.group(1))).strip()
         return _strip_youtube_suffix(txt)
+
+    # Fallback: try to extract channel title from ytInitialData channelMetadataRenderer
+    try:
+        blob = _extract_yt_var_json(html, "ytInitialData") or _extract_json_blob(html, _YTID_RE)
+        if isinstance(blob, dict):
+            # Walk a few common paths
+            md = (blob.get("metadata") or {}).get("channelMetadataRenderer") if isinstance(blob.get("metadata"), dict) else None
+            if isinstance(md, dict):
+                t = (md.get("title") or "").strip()
+                t = _strip_youtube_suffix(t)
+                if t:
+                    return t
+    except Exception:
+        pass
     return None
 
 def _extract_channel_id_from_html(html: str) -> Optional[str]:
@@ -186,6 +215,7 @@ def _write_json_best_effort(p: str, data: Dict[str, Any]) -> None:
 # YouTube parsing
 # ----------------------------
 _YTIPR_RE = re.compile(r"ytInitialPlayerResponse\s*=\s*(\{.*?\});", re.DOTALL)
+_YTID_RE = re.compile(r"ytInitialData\s*=\s*(\{.*?\})\s*;\s*</script>", re.S)
 _YTINITDATA_RE = re.compile(r"ytInitialData\s*=\s*(\{.*?\});", re.DOTALL)
 
 
@@ -244,9 +274,9 @@ def _extract_json_blob(html: str, rx: re.Pattern) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool, Optional[datetime]]:
+def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], bool, Optional[datetime], Optional[str]]:
     """
-    Returns (video_id, title, is_live_now, start_ts_utc).
+    Returns (video_id, title, is_live_now, start_ts_utc, channel_name).
 
     Notes:
     - We prefer isLiveNow == True when available to avoid scheduled streams and VOD spam.
@@ -262,6 +292,18 @@ def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str],
     title = vd.get("title")
     micro = (player.get("microformat") or {}).get("playerMicroformatRenderer") or {}
     live = micro.get("liveBroadcastDetails") or {}
+
+    # Channel display name (prefer microformat ownerChannelName; fallback to videoDetails.author)
+    channel_name = None
+    try:
+        if isinstance(micro, dict):
+            channel_name = micro.get("ownerChannelName") or None
+        if not channel_name and isinstance(vd, dict):
+            channel_name = vd.get("author") or None
+        if isinstance(channel_name, str):
+            channel_name = channel_name.strip() or None
+    except Exception:
+        channel_name = None
 
     def _parse_ts(ts: Any) -> Optional[datetime]:
         if not ts or not isinstance(ts, str):
@@ -294,8 +336,7 @@ def _yt_live_info(player: Dict[str, Any]) -> Tuple[Optional[str], Optional[str],
         sd = player.get("streamingData") or {}
         is_live_now = bool(isinstance(sd, dict) and sd.get("hlsManifestUrl"))
 
-    return vid, title, is_live_now, start_ts
-
+    return vid, title, is_live_now, start_ts, channel_name
 # ----------------------------
 # Search resolve (name -> channelId)
 # ----------------------------
@@ -740,10 +781,38 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     return None
                 data = await resp.json(content_type=None)
                 author = (data.get("author_name") or "").strip()
-                return author or None
+                if not author:
+                    return None
+                # Reject handles or raw channel IDs; caller will fallback to other sources.
+                if author.startswith(("@", "＠")):
+                    return None
+                if _UC_ID_LIKE_RE.match(author):
+                    return None
+                return author
         except Exception:
             return None
 
+
+    
+    async def _try_fetch_channel_name_from_channel_page(self, url: str) -> Optional[str]:
+        """Best-effort display name resolution from a channel page HTML.
+
+        This is used as a fallback when oEmbed is blocked/unavailable.
+        """
+        try:
+            html = await self._http_get_text(url)
+            nm = _extract_channel_title_from_html(html or "")
+            nm = (nm or "").strip()
+            if not nm:
+                return None
+            # Avoid returning obvious handles or raw channel IDs.
+            if nm.startswith(("@", "＠")):
+                return None
+            if _UC_ID_LIKE_RE.match(nm):
+                return None
+            return nm
+        except Exception:
+            return None
 
     def _format_watchlist_entry(self, t: Dict[str, str]) -> str:
         name = (t.get("name") or t.get("channel_name") or "").strip()
@@ -757,21 +826,42 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         return name or ident or "unknown"
 
     def _build_watchlist_embed(self, targets: List[Dict[str, str]]) -> discord.Embed:
-        # Keep it in ONE embed as requested; truncate if somehow exceeds limits.
+        # Keep it in ONE embed; truncate if somehow exceeds limits.
         lines: List[str] = []
         for i, t in enumerate(targets, start=1):
             lines.append(f"{i}. {self._format_watchlist_entry(t)}")
         desc = "\n".join(lines)
         if len(desc) > 4000:
-            # Hard cap to keep Discord embed safe; still one embed.
             desc = desc[:3980] + "\n… (truncated)"
         emb = discord.Embed(
             title="YouTube WuWa Watchlist",
             description=desc or "(empty)",
         )
+
+        # Show config (must match the JSON attachment).
+        try:
+            enabled = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
+            poll_s = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", POLL_SECONDS)
+            conc = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", CONCURRENCY)
+            ch_id = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", ANNOUNCE_CHANNEL_ID)
+            native = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
+
+            emb.add_field(
+                name="Config",
+                value=(
+                    f"Enabled: {enabled}\n"
+                    f"Poll: {poll_s}s\n"
+                    f"Concurrency: {conc}\n"
+                    f"Channel: {ch_id}\n"
+                    f"Native Embed: {native}"
+                ),
+                inline=False,
+            )
+        except Exception:
+            pass
+
         emb.set_footer(text=f"{len(targets)} channel(s) • Auto-synced from thread")
         return emb
-
 
     def _build_watchlist_attachment_bytes(self, cfg: Dict[str, Any]) -> bytes:
         """Serialize watchlist cfg to bytes for Discord attachment (persistent across restarts)."""
@@ -882,9 +972,26 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
         # Create new store message
         try:
-            emb = self._build_watchlist_embed(self.watch.get("targets") or [])
+            targets = self.watch.get("targets") or []
+            emb = self._build_watchlist_embed(targets)
             cfg = _read_json_any(WATCHLIST_PATH) or {}
-            payload = self._build_watchlist_attachment_bytes(cfg)
+
+            try:
+                cfg_out = dict(cfg)
+            except Exception:
+                cfg_out = {}
+            cfg_out["targets"] = list(targets)
+
+            try:
+                cfg_out["enabled"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
+                cfg_out["poll_seconds"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", POLL_SECONDS)
+                cfg_out["concurrency"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", CONCURRENCY)
+                cfg_out["announce_channel_id"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", ANNOUNCE_CHANNEL_ID)
+                cfg_out["announce_native_embed"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
+            except Exception:
+                pass
+
+            payload = self._build_watchlist_attachment_bytes(cfg_out)
             fp = io.BytesIO(payload)
             file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
             m = await th.send(WATCHLIST_STORE_MARKER, embed=emb, file=file, allowed_mentions=discord.AllowedMentions.none())
@@ -920,9 +1027,20 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             # Persist canonical watchlist into the store message attachment so it survives restarts / ephemeral disk.
             try:
                 cfg_out = dict(cfg)
-                cfg_out["targets"] = list(targets)
             except Exception:
-                cfg_out = {"targets": list(targets)}
+                cfg_out = {}
+            cfg_out["targets"] = list(targets)
+
+            # Force cfg values to follow current runtime env (so thread JSON + embed stay consistent).
+            try:
+                cfg_out["enabled"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
+                cfg_out["poll_seconds"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", POLL_SECONDS)
+                cfg_out["concurrency"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", CONCURRENCY)
+                cfg_out["announce_channel_id"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", ANNOUNCE_CHANNEL_ID)
+                cfg_out["announce_native_embed"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
+            except Exception:
+                pass
+
             payload = self._build_watchlist_attachment_bytes(cfg_out)
             fp = io.BytesIO(payload)
             file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
@@ -977,40 +1095,62 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 return (x or "").strip().rstrip("/").lower()
 
             for it in items:
-                url = _norm(it.get("url") or "")
-                handle = (it.get("handle") or "").strip().lower()
+                url_norm = _norm(it.get("url") or "")
+                handle_norm = (it.get("handle") or "").strip().lower()
                 cid = (it.get("channel_id") or "").strip()
-                if not url and handle:
-                    url = _norm(f"https://www.youtube.com/{handle}")
-                if not url and cid:
-                    url = _norm(f"https://www.youtube.com/channel/{cid}")
+                if not url_norm and handle_norm:
+                    url_norm = _norm(f"https://www.youtube.com/{handle_norm}")
+                if not url_norm and cid:
+                    url_norm = _norm(f"https://www.youtube.com/channel/{cid}")
 
-                if not url:
+                if not url_norm:
                     continue
 
-                nm = await self._try_fetch_channel_name_oembed(url)
+                nm = await self._try_fetch_channel_name_oembed(url_norm)
+                if not nm:
+                    nm = await self._try_fetch_channel_name_from_channel_page(url_norm)
                 if not nm:
                     continue
 
                 for t in targets:
                     if not isinstance(t, dict):
                         continue
-                    t_url = _norm(t.get("url") or "")
-                    t_handle = (t.get("handle") or "").strip().lower()
+
+                    t_url_norm = _norm(t.get("url") or "")
+                    t_handle_norm = (t.get("handle") or "").strip().lower()
                     t_cid = (t.get("channel_id") or "").strip()
-                    if (url and t_url and url == t_url) or (handle and t_handle and handle == t_handle) or (cid and t_cid and cid == t_cid):
+
+                    if (url_norm and t_url_norm and url_norm == t_url_norm) or (handle_norm and t_handle_norm and handle_norm == t_handle_norm) or (cid and t_cid and cid == t_cid):
                         cur = (t.get("name") or "").strip()
-                        # Fill if missing or too generic
-                        if (not cur) or (handle and cur.strip().lower() == handle) or (cur.startswith("@") and cur.lower() == handle):
-                            t["name"] = nm
+                        cur_norm = _norm(cur)
+                        url_match_norm = _norm(t.get("url") or "")
+
+                        need = (
+                            (not cur)
+                            or (handle_norm and cur_norm == handle_norm)
+                            or (cur.startswith(("@", "＠")) and handle_norm and cur_norm == handle_norm)
+                            or (_UC_ID_LIKE_RE.match(cur) and t_cid and cur == t_cid)
+                            or (cur_norm.startswith("http"))
+                            or (url_match_norm and cur_norm == url_match_norm)
+                        )
+                        if not need:
+                            continue
+
+                        t["name"] = nm
+                        qcur = (t.get("query") or "").strip()
+                        qnorm = _norm(qcur)
+                        if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (handle_norm and qnorm == handle_norm):
                             t["query"] = nm
-                            changed = True
+
+                        changed = True
 
             if changed:
-                cfg["targets"] = targets
+                cfg["targets"] = list(targets)
                 _write_json_best_effort(WATCHLIST_PATH, cfg)
+                self._reload_watchlist()
         except Exception:
-            return
+            pass
+
 
 
     async def _cleanup_watchlist_thread(self, th: discord.Thread, keep_mid: int) -> None:
@@ -1063,18 +1203,54 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return 0, []
 
         cfg.setdefault("enabled", True)
-        # Best-effort: resolve channel name for new additions (for clearer logs/UI).
-        # This does not affect matching/dedup; it is purely informational.
+        # Best-effort: resolve channel name for new additions so logs + embed use the YouTube
+        # display name (not @handle/UC.../URL tokens). Must never block ingest.
         for t in added_items:
-            if isinstance(t, dict) and not (t.get("name") or t.get("channel_name")):
-                url = (t.get("url") or "").strip()
-                if not url and (t.get("handle") or "").strip().startswith("@"):
-                    url = f"https://www.youtube.com/{t.get('handle').strip()}"
+            if not isinstance(t, dict):
+                continue
+            cur = (t.get("name") or t.get("channel_name") or "").strip()
+            handle = (t.get("handle") or "").strip()
+            handle_norm = handle.strip().lower()
+            cid = (t.get("channel_id") or "").strip()
+            url = (t.get("url") or "").strip()
+
+            cur_norm = cur.strip().rstrip("/").lower()
+            url_norm = url.strip().rstrip("/").lower()
+
+            need = (
+                (not cur)
+                or (handle_norm and cur_norm == handle_norm)
+                or (cur.startswith(("@", "＠")) and handle_norm and cur_norm == handle_norm)
+                or (_UC_ID_LIKE_RE.match(cur) and cid and cur == cid)
+                or (cur_norm.startswith("http"))
+                or (url_norm and cur_norm == url_norm)
+            )
+            if not need:
+                continue
+
+            if not url and handle.strip().startswith("@"):
+                url = f"https://www.youtube.com/{handle.strip()}"
+            if not url and cid:
+                url = f"https://www.youtube.com/channel/{cid}"
+            if not url:
+                continue
+
+            try:
                 nm = await self._try_fetch_channel_name_oembed(url)
+                if not nm:
+                    nm = await self._try_fetch_channel_name_from_channel_page(url)
                 if nm:
                     t["name"] = nm
+                    qcur = (t.get("query") or "").strip()
+                    qnorm = qcur.strip().rstrip("/").lower()
+                    # Keep query stable unless it is also generic.
+                    if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (handle_norm and qnorm == handle_norm):
+                        t["query"] = nm
+            except Exception:
+                pass
 
         cfg["targets"] = merged
+
         _write_json_best_effort(WATCHLIST_PATH, cfg)
         self._reload_watchlist()
         return added, added_items
@@ -1193,43 +1369,6 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             except Exception:
                 return None
 
-    async def _yt_api_videos(self, video_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-        """Fetch video metadata via YouTube Data API v3 (videos.list). Returns id->item."""
-        if not YOUTUBE_API_KEY:
-            return {}
-        ids = [vid for vid in (video_ids or []) if isinstance(vid, str) and len(vid) == 11]
-        if not ids:
-            return {}
-        # videos.list supports up to 50 ids per request.
-        out: Dict[str, Dict[str, Any]] = {}
-        await self._ensure_session()
-        assert self.session is not None
-        for i in range(0, len(ids), 50):
-            chunk = ids[i:i+50]
-            params = {
-                "part": "snippet,liveStreamingDetails",
-                "id": ",".join(chunk),
-                "key": YOUTUBE_API_KEY,
-            }
-            try:
-                async with self.sem:
-                    async with self.session.get(YOUTUBE_API_VIDEOS_URL, params=params) as r:
-                        txt = await r.text()
-                        if r.status != 200:
-                            if DEBUG:
-                                log.warning("[yt-wuwa] yt-api videos.list status=%s body=%s", r.status, txt[:300])
-                            continue
-                        data = json.loads(txt)
-                        for item in (data.get("items") or []):
-                            vid = str(item.get("id") or "")
-                            if vid:
-                                out[vid] = item
-            except Exception as e:
-                if DEBUG:
-                    log.warning("[yt-wuwa] yt-api videos.list error: %r", e)
-                continue
-        return out
-
     def _extract_video_id_fallback(self, html: str) -> Optional[str]:
         """Best-effort extraction of a videoId from a /live page HTML when JSON parsing fails."""
         if not html:
@@ -1291,9 +1430,9 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         _write_json_best_effort(STATE_PATH, self.state)
         return t
 
-    async def _check_live(self, t: Target) -> Optional[Tuple[Target, str, str, Optional[datetime]]]:
+    async def _check_live(self, t: Target) -> Optional[Tuple[Target, str, str, Optional[datetime], str]]:
         """
-        Returns (target, video_id, title, start_ts_utc) if live now and matches whitelist.
+        Returns (target, video_id, title, start_ts_utc, creator_name) if live now and matches whitelist.
         """
         t = await self._resolve_channel(t)
         base = t.base_url()
@@ -1336,66 +1475,178 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Fast path: parse ytInitialPlayerResponse (scrape)
         player = _extract_yt_var_json(html, 'ytInitialPlayerResponse') or _extract_json_blob(html, _YTIPR_RE)
         if player:
-            vid, title, is_live_now, start_ts = _yt_live_info(player)
+            vid, title, is_live_now, start_ts, ch_name = _yt_live_info(player)
+            # Prefer channel display name from the player response (no extra HTTP, works even if oEmbed is blocked).
+            try:
+                nm0 = (ch_name or "").strip()
+                if nm0 and (not nm0.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm0)):
+                    t.name = nm0
+                    # cache resolved name for stability across restarts
+                    res = self.state.setdefault("resolved", {})
+                    for kk in [t.channel_id, t.url or t.base_url() or "", t.handle, t.query, t.name]:
+                        if kk:
+                            res.setdefault(str(kk), {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url() or "")})
+                    _write_json_best_effort(STATE_PATH, self.state)
+            except Exception:
+                pass
             if not (vid and title and is_live_now):
                 return None
         else:
-            # Fallback path: extract videoId from HTML, then verify via YouTube Data API (low quota, 1 unit).
+            # Fallback path (NO YouTube API):
+            # - Extract a probable live videoId from the /live page HTML.
+            # - Fetch the canonical watch page and parse ytInitialPlayerResponse there.
             vid = self._extract_video_id_fallback(html)
             if not vid:
                 return None
-            api_map = await self._yt_api_videos([vid])
-            item = api_map.get(vid) if isinstance(api_map, dict) else None
-            if not item:
+
+            watch_url = f"https://www.youtube.com/watch?v={vid}"
+            watch_html = await self._http_get_text(watch_url)
+            if not watch_html:
                 return None
-            snippet = item.get("snippet") or {}
-            lsd = item.get("liveStreamingDetails") or {}
-            title = str(snippet.get("title") or "")
-            # Determine live-now from liveStreamingDetails
-            actual_start = lsd.get("actualStartTime")
-            actual_end = lsd.get("actualEndTime")
-            is_live_now = bool(actual_start) and not bool(actual_end)
-            start_ts = _parse_iso_utc(actual_start) if actual_start else None
-            if not (title and is_live_now):
+
+            player2 = _extract_yt_var_json(watch_html, 'ytInitialPlayerResponse') or _extract_json_blob(watch_html, _YTIPR_RE)
+            player = player2
+            if not player2:
                 return None
+
+            vid2, title2, is_live_now2, start_ts2, ch_name2 = _yt_live_info(player2)
+            if not (vid2 and title2 and is_live_now2):
+                return None
+
+            vid, title, is_live_now, start_ts = vid2, title2, is_live_now2, start_ts2
+
+            # Prefer channel display name from the player response.
+            try:
+                nm0 = (ch_name2 or "").strip()
+                if nm0 and (not nm0.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm0)):
+                    t.name = nm0
+                    res = self.state.setdefault("resolved", {})
+                    for kk in [t.channel_id, t.url or t.base_url() or "", t.handle, t.query, t.name]:
+                        if kk:
+                            res[str(kk)] = nm0
+                    res.setdefault("url_to_name", {})[str(t.base_url() or t.url or "")] = nm0
+                    _write_json_best_effort(STATE_PATH, self.state)
+            except Exception:
+                pass
+
 
 
         # Ensure creator display name is the YouTube channel name (not @handle).
         # Resolve using oEmbed on the live video watch URL (most reliable). Must never block announcing.
         try:
-            need_name2 = (t.name or "").strip().startswith(("@", "＠")) or (
-                (t.handle or "").strip() and (t.name or "").strip() == (t.handle or "").strip()
-            )
+            need_name2 = False
+            nm_current = (t.name or "").strip()
+            if (not nm_current) or nm_current.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(nm_current):
+                need_name2 = True
+            if (t.handle or "").strip() and nm_current and nm_current == (t.handle or "").strip():
+                need_name2 = True
+
             if need_name2:
                 res = self.state.setdefault("resolved", {})
-                cached = None
-                if t.handle:
-                    cached = res.get(t.handle)
-                if not cached and t.query:
-                    cached = res.get(t.query)
-                nm = None
-                if isinstance(cached, dict):
-                    nm = (cached.get("title") or "").strip() or None
+
+                def _pick_cached(keys):
+                    for kk in keys:
+                        if not kk:
+                            continue
+                        cc = res.get(str(kk))
+                        if isinstance(cc, dict):
+                            cand = (cc.get("title") or "").strip()
+                            if cand and (not cand.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(cand)):
+                                return cand
+                    return None
+
+                base_url = (t.url or t.base_url() or "").strip()
+                nm = _pick_cached([t.channel_id, base_url, t.handle, t.query, t.name])
+
+                # Most reliable: oEmbed on the exact watch URL for the video we are about to announce.
                 if not nm and vid:
                     watch_url = f"https://www.youtube.com/watch?v={vid}"
                     try:
                         nm = await asyncio.wait_for(self._try_fetch_channel_name_oembed(watch_url), timeout=3.0)
                     except Exception:
                         nm = None
+
+                # Fallback: parse the channel page title ("<Channel> - YouTube").
+                if not nm and base_url:
+                    try:
+                        nm = await asyncio.wait_for(self._try_fetch_channel_name_from_channel_page(base_url), timeout=4.0)
+                    except Exception:
+                        nm = None
+
                 if nm:
                     t.name = nm
-                    if t.handle:
-                        res[t.handle] = {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url())}
-                    if t.query:
-                        res.setdefault(t.query, {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url())})
-                    _write_json_best_effort(STATE_PATH, self.state)
+                    # Cache under stable identifiers so we avoid repeated fetches.
+                    try:
+                        for kk in {t.channel_id, base_url, t.handle, t.query}:
+                            if kk:
+                                res[str(kk)] = {"channel_id": t.channel_id, "title": t.name, "url": base_url}
+                        _write_json_best_effort(STATE_PATH, self.state)
+                    except Exception:
+                        pass
+
         except Exception:
             pass
 
         if not (self.title_rx.search(title) or self.title_rx.search(_normalize_title(title))):
             return None
-        return t, vid, title, start_ts
+        # Final creator display name: must be YouTube channel display name (not UC id / handle).
+        creator_name = (t.name or "").strip()
+        # If still looks like UC id or @handle, fall back to the best channel name we already parsed.
+        try:
+            if (not creator_name) or creator_name.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(creator_name):
+                # Try from player response first (no extra HTTP).
+                if 'player' in locals() and isinstance(player, dict):
+                    try:
+                        _, _, _, _, ch_name2 = _yt_live_info(player)
+                        nm2 = (ch_name2 or "").strip()
+                        if nm2 and (not nm2.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm2)):
+                            creator_name = nm2
+                    except Exception:
+                        pass
+                # If API snippet exists, use channelTitle.
+                if (not creator_name) or creator_name.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(creator_name):
+                    if 'snippet' in locals() and isinstance(snippet, dict):
+                        try:
+                            nm3 = (snippet.get("channelTitle") or "").strip()
+                            if nm3 and (not nm3.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm3)):
+                                creator_name = nm3
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # If still invalid, try cached channel display name (survives restarts via STATE_PATH).
+        try:
+            cid_cache_key = (getattr(t, "channel_id", None) or getattr(t, "base_id", None) or "").strip()
+            if cid_cache_key:
+                ccache = self.state.get("yt_channel_name_cache", {})
+                if (creator_name.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(creator_name)) and isinstance(ccache, dict):
+                    cached_nm = (ccache.get(cid_cache_key) or "").strip()
+                    if cached_nm and (not cached_nm.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(cached_nm)):
+                        creator_name = cached_nm
+        except Exception:
+            pass
 
+        # Update cache when we have a good resolved name.
+        try:
+            cid_cache_key = (getattr(t, "channel_id", None) or getattr(t, "base_id", None) or "").strip()
+            if cid_cache_key and creator_name and (not creator_name.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(creator_name)):
+                ccache = self.state.setdefault("yt_channel_name_cache", {})
+                if isinstance(ccache, dict) and ccache.get(cid_cache_key) != creator_name:
+                    ccache[cid_cache_key] = creator_name
+                    _write_json_best_effort(STATE_PATH, self.state)
+        except Exception:
+            pass
+
+        # Final sanitize: never allow UC ids / handles to be used as the channel display name.
+        if creator_name.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(creator_name):
+            creator_name = ""
+
+        # Absolute last resort: DO NOT announce if we still don't have a valid channel display name.
+        if not creator_name:
+            cand_nm = (t.name or t.query or "").strip()
+            if cand_nm and (not cand_nm.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(cand_nm)):
+                creator_name = cand_nm
+        return t, vid, title, start_ts, creator_name
     def _render_template(self, creator_name: str, video_link: str) -> str:
         msg = self.template
         msg = msg.replace("{creator.name}", creator_name)
@@ -1479,7 +1730,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
                     try:
 
-                        q = tt.get('query') if isinstance(tt, dict) else 'unknown'
+                        q = getattr(tt, "query", None) if isinstance(tt, dict) else 'unknown'
 
                     except Exception:
 
@@ -1523,7 +1774,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         for res in results:
             if not res or isinstance(res, Exception):
                 continue
-            t, vid, title, start_ts = res
+            t, vid, title, start_ts, creator_name = res
 
             # Build stable keys to avoid duplicate posts when resolution improves (query->channel_id).
             keys: List[str] = []
@@ -1573,7 +1824,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     log.info("[yt-wuwa] suppress stale-live: %s vid=%s age_min=%s", t.name, vid, age_min)
                     continue
             try:
-                await self._post(ch, t.name, title, vid)
+                if not creator_name:
+                    log.warning("[yt-wuwa] cannot resolve channel display name (target=%s vid=%s). Set NIXE_YT_WUWA_YT_API_KEY (YouTube API v3) or set an explicit display name in watchlist.", getattr(t, "name", "unknown"), vid)
+                    continue
+                await self._post(ch, creator_name, title, vid)
                 # write to all keys to prevent key-change dupes after restart/resolve
                 ann_map = self.state.setdefault("announced", {})
                 ann_vids = self.state.setdefault("announced_vids", {})

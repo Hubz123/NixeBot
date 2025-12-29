@@ -26,6 +26,9 @@ import logging
 import os
 import random
 import re
+from urllib.parse import quote_plus
+
+_UC_ID_LIKE_RE = re.compile(r"^UC[0-9A-Za-z_-]{20,}$")
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -195,6 +198,75 @@ class YouTubeWuWaTestPreview(commands.Cog):
             },
         )
 
+    
+    async def _try_fetch_channel_name_oembed(self, url: str) -> Optional[str]:
+        try:
+            if not self._session or self._session.closed:
+                return None
+            oembed_url = f"https://www.youtube.com/oembed?url={quote_plus(url)}&format=json"
+            async with self._session.get(oembed_url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+                author = (data.get("author_name") or "").strip()
+                if not author:
+                    return None
+                if author.startswith(("@", "＠")):
+                    return None
+                if _UC_ID_LIKE_RE.match(author):
+                    return None
+                return author
+        except Exception:
+            return None
+
+    async def _try_fetch_channel_name_from_channel_page(self, url: str) -> Optional[str]:
+        try:
+            if not self._session or self._session.closed:
+                return None
+            async with self._session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
+            m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+            if not m:
+                return None
+            title = re.sub(r"\s+", " ", m.group(1)).strip()
+            if title.lower().endswith(" - youtube"):
+                title = title[: -len(" - youtube")].strip()
+            if not title:
+                return None
+            if title.startswith(("@", "＠")):
+                return None
+            if _UC_ID_LIKE_RE.match(title):
+                return None
+            return title
+        except Exception:
+            return None
+
+    async def _resolve_creator_name(self, t: Target, vid: Optional[str]) -> str:
+        nm_current = (t.name or "").strip()
+        need = (not nm_current) or nm_current.startswith(("@", "＠")) or _UC_ID_LIKE_RE.match(nm_current)
+        if need:
+            nm = None
+            if vid:
+                try:
+                    nm = await asyncio.wait_for(self._try_fetch_channel_name_oembed(f"https://www.youtube.com/watch?v={vid}"), timeout=3.0)
+                except Exception:
+                    nm = None
+            if not nm:
+                base = (t.channel_url() or "").strip()
+                if base:
+                    try:
+                        nm = await asyncio.wait_for(self._try_fetch_channel_name_from_channel_page(base), timeout=4.0)
+                    except Exception:
+                        nm = None
+            if nm:
+                t.name = nm
+                return nm
+        if nm_current and (not nm_current.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm_current)):
+            return nm_current
+        return "UNRESOLVED_CHANNEL_NAME"
+
     async def cog_unload(self):
         if self._session and not self._session.closed:
             await self._session.close()
@@ -306,13 +378,15 @@ class YouTubeWuWaTestPreview(commands.Cog):
             is_live, vid, title = await self._fetch_live(t)
             if is_live and vid:
                 video_url = f"https://youtu.be/{vid}"
-                emb = discord.Embed(title=f"🔴 LIVE NOW: {t.name}", description=title or "Live")
+                creator_name = await self._resolve_creator_name(t, vid)
+                emb = discord.Embed(title=f"🔴 LIVE NOW: {creator_name}", description=title or "Live")
                 emb.add_field(name="Channel", value=t.channel_url(), inline=False)
                 emb.add_field(name="Watch", value=video_url, inline=False)
                 view = self._build_view("Watch", video_url)
             else:
                 video_url = t.channel_url()
-                emb = discord.Embed(title=f"⚪ NOT LIVE (test): {t.name}", description="No live stream detected right now.")
+                creator_name = await self._resolve_creator_name(t, None)
+                emb = discord.Embed(title=f"⚪ NOT LIVE (test): {creator_name}", description="No live stream detected right now.")
                 emb.add_field(name="Channel", value=t.channel_url(), inline=False)
                 view = self._build_view("Open Channel", t.channel_url())
 

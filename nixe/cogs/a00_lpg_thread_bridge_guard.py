@@ -114,17 +114,77 @@ def _phash64_bytes(img_bytes: bytes) -> Optional[int]:
         return None
 
 
+
+def _prepare_status_embed_image(image_bytes: bytes, max_bytes: int) -> tuple[bytes | None, str]:
+    """Prepare image bytes for posting inside the LPG status/cache embed.
+
+    Returns (bytes, filename). If bytes is None, caller should skip attaching.
+    """
+    if not isinstance(image_bytes, (bytes, bytearray)) or not image_bytes:
+        return None, ""
+    b = bytes(image_bytes)
+
+    fmt = _sniff_fmt(b)
+    # Prefer original extension when possible.
+    if fmt == "png":
+        filename = "lpg_lucky.png"
+    else:
+        filename = "lpg_lucky.jpg"
+
+    # Already within limits → keep original.
+    if len(b) <= int(max_bytes):
+        return b, filename
+
+    # Best-effort compress using PIL if available.
+    if Image is None:
+        return b, filename  # will be tried; caller should gracefully fallback on send failure
+
+    try:
+        im = Image.open(BytesIO(b))
+        im = im.convert("RGB")
+    except Exception:
+        return b, filename
+
+    # Try quality ladder first, then downscale.
+    target = int(max_bytes)
+    quality_steps = [85, 75, 65, 55, 45, 35, 30]
+    scale = 1.0
+    for _ in range(6):
+        w, h = im.size
+        if scale < 0.999:
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            try:
+                im2 = im.resize((nw, nh))
+            except Exception:
+                im2 = im
+        else:
+            im2 = im
+
+        for q in quality_steps:
+            out = BytesIO()
+            try:
+                im2.save(out, format="JPEG", quality=q, optimize=True)
+                buf = out.getvalue()
+                if len(buf) <= target:
+                    return buf, "lpg_lucky.jpg"
+            except Exception:
+                continue
+
+        # If still too big, downscale further and retry.
+        scale *= 0.85
+
+    # Give up: return the best attempt (smallest found) if any, else original.
+    return b, filename
+
+
 async def _post_status_embed(
-    bot, *, title: str, fields: List[Tuple[str, str, bool]], color: int = 0x2B6CB0
+    bot, *, title: str, fields: List[Tuple[str, str, bool]], color: int = 0x2B6CB0,
+    image_bytes: bytes | None = None,
+    footer_text: str | None = None,
 ):
-    tid = None
-    for k in ("LPG_STATUS_THREAD_ID", "NIXE_STATUS_THREAD_ID"):
-        v = os.getenv(k, "")
-        if v.isdigit():
-            tid = int(v)
-            break
-    if tid is None:
-        tid = 1435924665615908965
+    # Hardcoded permanent-memory thread
+    tid = 1435924665615908965
     try:
         ch = bot.get_channel(tid) or await bot.fetch_channel(tid)
         if ch:
@@ -133,9 +193,34 @@ async def _post_status_embed(
             emb = discord.Embed(title=title, color=color)
             for name, value, inline in fields:
                 emb.add_field(name=name, value=value, inline=inline)
-            await ch.send(embed=emb)
+            if footer_text:
+                try:
+                    emb.set_footer(text=str(footer_text))
+                except Exception:
+                    pass
+
+            # Attach preview image only when provided (LUCKY-only).
+            if image_bytes:
+                maxb = _env_int("LPG_EMBED_IMAGE_MAX_BYTES", 7500000)
+                buf, fname = _prepare_status_embed_image(image_bytes, maxb)
+                try:
+                    if buf and fname:
+                        fobj = discord.File(BytesIO(buf), filename=fname)
+                        emb.set_image(url=f"attachment://{fname}")
+                        await ch.send(embed=emb, file=fobj)
+                    else:
+                        await ch.send(embed=emb)
+                except Exception:
+                    # Fallback: do not fail status logging just because attachment failed.
+                    try:
+                        await ch.send(embed=emb)
+                    except Exception:
+                        pass
+            else:
+                await ch.send(embed=emb)
     except Exception:
         pass
+
 
 
 def _cache_path(thread_id: int) -> Path:
@@ -868,40 +953,9 @@ class LPGThreadBridgeGuard(commands.Cog):
             )
             provider_hint = (provider or "").lower()
 
-        # Post classification result to status thread (always)
-        try:
-            # Compute pHash for logging/status embed.
-            # We prefer the local ph_val computed earlier in on_message to avoid
-            # relying on discord.py dynamic attributes (most models use __slots__).
-            ph = ph_val
-            if not isinstance(ph, int) and isinstance(raw_bytes, (bytes, bytearray)):
-                try:
-                    ph = _phash64_bytes(raw_bytes)
-                except Exception as e:
-                    log.warning(
-                        "[lpg-thread-bridge] _phash64_bytes failed in status embed: %r",
-                        e,
-                    )
-                    ph = None
-
-            ph_str = f"{int(ph):016X}" if isinstance(ph, int) else "-"
-            fields = [
-                ("Result", "✅ LUCKY" if lucky else "❌ NOT LUCKY", True),
-                ("Score", f"{float(score or 0.0):.3f}", True),
-                ("Provider", provider or "-", True),
-                ("Reason", reason or "-", False),
-                ("Message ID", str(message.id), True),
-                ("Channel", f"<#{getattr(message.channel, 'id', 0)}>", True),
-                ("pHash", ph_str, True),
-            ]
-            await _post_status_embed(
-                self.bot,
-                title="Lucky Pull Classification",
-                fields=fields,
-                color=(0x22C55E if lucky else 0xEF4444),
-            )
-        except Exception:
-            pass
+                # Permanent thread memory policy:
+        # - Only LUCKY entries are posted into the memory thread (ID hardcoded).
+        # - NOT LUCKY is intentionally not posted (prevents log spam; supports delete=unlearn semantics).
 
         # Assume-lucky on fallback timeouts if explicitly enabled
         if not lucky:
@@ -919,6 +973,51 @@ class LPGThreadBridgeGuard(commands.Cog):
                     return
             except Exception:
                 return
+
+        # Post LUCKY classification result to permanent memory thread (pHash + image + footer sha1/ahash)
+        try:
+            # Compute pHash for status embed.
+            ph = ph_val
+            if not isinstance(ph, int) and isinstance(raw_bytes, (bytes, bytearray)):
+                try:
+                    ph = _phash64_bytes(raw_bytes)
+                except Exception as e:
+                    log.warning("[lpg-thread-bridge] _phash64_bytes failed in status embed: %r", e)
+                    ph = None
+
+            ph_str = f"{int(ph):016X}" if isinstance(ph, int) else "-"
+            fields = [
+                ("Result", "✅ LUCKY", True),
+                ("Score", f"{float(score or 0.0):.3f}", True),
+                ("Provider", provider or "-", True),
+                ("Reason", reason or "-", False),
+                ("Message ID", str(message.id), True),
+                ("Channel", f"<#{getattr(message.channel, 'id', 0)}>", True),
+                ("pHash", ph_str, True),
+            ]
+
+            footer_text = None
+            if isinstance(raw_bytes, (bytes, bytearray)):
+                try:
+                    from nixe.helpers import lpg_cache_memory as _cache
+                    ent = _cache.put(bytes(raw_bytes), True, float(score or 0.0), str(provider or "-"), str(reason or "-"))
+                    sha1 = str(ent.get("sha1") or "")
+                    ah = str(ent.get("ahash") or "")
+                    if sha1 and ah:
+                        footer_text = f"lpgmem sha1={sha1} ahash={ah}"
+                except Exception:
+                    footer_text = None
+
+            await _post_status_embed(
+                self.bot,
+                title="Lucky Pull Classification",
+                fields=fields,
+                color=0x22C55E,
+                image_bytes=(bytes(raw_bytes) if isinstance(raw_bytes, (bytes, bytearray)) else None),
+                footer_text=footer_text,
+            )
+        except Exception:
+            pass
 
         log.info(
             "[lpg-thread-bridge] STRICT_ON_GUARD delete | ch=%s parent=%s type=%s",

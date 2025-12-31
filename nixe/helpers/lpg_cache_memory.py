@@ -156,6 +156,13 @@ def remove_sha1(sha1: str) -> None:
         _index_remove(sha1, ah)
 
 
+
+def fingerprint_bytes(image_bytes: bytes) -> tuple[str, str, tuple[int,int]]:
+    """Compute (sha1, ahash, (w,h)) without mutating cache."""
+    sha1 = hashlib.sha1(image_bytes).hexdigest()
+    ah, wh = _to_ahash_bytes(image_bytes)
+    return sha1, ah, (int(wh[0]), int(wh[1]))
+
 def put(image_bytes: bytes, ok: bool, score: float, via: str, reason: str) -> dict:
     sha1 = hashlib.sha1(image_bytes).hexdigest()
     ah, wh = _to_ahash_bytes(image_bytes)

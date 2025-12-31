@@ -124,7 +124,7 @@ class LPGCachePersistence(commands.Cog):
 
 
         # Map for delete=unlearn
-        self._msgid_to_sha1: Dict[int, str] = {}
+        self._msgid_to_fp: Dict[int, tuple[str, str]] = {}
 
         self.thread: Optional[discord.Thread] = None
 
@@ -148,6 +148,13 @@ class LPGCachePersistence(commands.Cog):
         # Run bootstrap once per process; tasks.loop will handle weekly maintenance
         if self.thread is None:
             await self._bind_thread()
+            # Load denylist once per boot (used to suppress known false-positives)
+            try:
+                from nixe.helpers import lpg_denylist as deny
+                loaded = await deny.load_from_thread(self.bot)
+                log.warning('[lpgmem] denylist loaded=%s', loaded)
+            except Exception as e:
+                log.warning('[lpgmem] denylist load failed: %r', e)
             await self._purge_nonlucky_in_thread()
             await self._bootstrap_from_thread()
             if self.weekly_maintenance and self.minipc and not self._weekly.is_running():
@@ -269,7 +276,7 @@ class LPGCachePersistence(commands.Cog):
                                 "ts": float(msg.created_at.timestamp()) if getattr(msg, "created_at", None) else 0.0,
                             }
                         )
-                        self._msgid_to_sha1[int(msg.id)] = sha1
+                        self._msgid_to_fp[int(msg.id)] = (sha1, ah)
                         loaded += 1
                     except Exception:
                         continue
@@ -296,7 +303,7 @@ class LPGCachePersistence(commands.Cog):
                     sha1 = str(ent.get("sha1") or "")
                     ah = str(ent.get("ahash") or "")
                     if sha1:
-                        self._msgid_to_sha1[int(msg.id)] = sha1
+                        self._msgid_to_fp[int(msg.id)] = (sha1, ah)
                         loaded += 1
                     backfilled += 1
 
@@ -331,12 +338,21 @@ class LPGCachePersistence(commands.Cog):
             if int(getattr(payload, "channel_id", 0) or 0) != int(MEMORY_THREAD_ID):
                 return
             mid = int(getattr(payload, "message_id", 0) or 0)
-            sha1 = self._msgid_to_sha1.pop(mid, None)
+            fp = self._msgid_to_fp.pop(mid, None)
+            sha1 = fp[0] if fp else None
+            ah = fp[1] if fp else ""
             if not sha1:
                 return
             from nixe.helpers import lpg_cache_memory as cache
             cache.remove_sha1(sha1)
-            log.warning("[lpgmem] unlearn mid=%s sha1=%s", mid, sha1[:8])
+            # delete=banish: add to denylist persistent store
+            try:
+                from nixe.helpers import lpg_denylist as deny
+                deny.add(str(sha1), str(ah or ""))
+                await deny.persist_to_thread(self.bot, str(sha1), str(ah or ""))
+            except Exception:
+                pass
+            log.warning("[lpgmem] unlearn+banish mid=%s sha1=%s", mid, sha1[:8])
         except Exception:
             return
 

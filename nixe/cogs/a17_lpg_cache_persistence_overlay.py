@@ -116,6 +116,13 @@ class LPGCachePersistence(commands.Cog):
         # Weekly maintenance only on minipc (default ON there; OFF on render)
         self.weekly_maintenance = _env_bool("LPG_CACHE_WEEKLY_MAINTENANCE", False if self.render else True)
 
+        # Purge policy: keep memory thread clean (LUCKY-only).
+        # Default ON to match 'thread = memory' semantics.
+        self.purge_nonlucky_on_boot = os.getenv('LPG_CACHE_PURGE_NONLUCKY_ON_BOOT', '1') == '1'
+        self.purge_limit = _env_int('LPG_CACHE_PURGE_LIMIT', 0)  # 0 = use boot_scan_limit/unlimited
+        self.purge_sleep_ms = _env_int('LPG_CACHE_PURGE_SLEEP_MS', 350)
+
+
         # Map for delete=unlearn
         self._msgid_to_sha1: Dict[int, str] = {}
 
@@ -141,6 +148,7 @@ class LPGCachePersistence(commands.Cog):
         # Run bootstrap once per process; tasks.loop will handle weekly maintenance
         if self.thread is None:
             await self._bind_thread()
+            await self._purge_nonlucky_in_thread()
             await self._bootstrap_from_thread()
             if self.weekly_maintenance and self.minipc and not self._weekly.is_running():
                 self._weekly.start()
@@ -157,6 +165,60 @@ class LPGCachePersistence(commands.Cog):
         except Exception as e:
             self.thread = None
             log.warning("[lpgmem] bind thread failed: %r", e)
+
+
+    async def _purge_nonlucky_in_thread(self):
+        """Delete NOT LUCKY log messages from the permanent memory thread (bot-authored only)."""
+        if not self.thread or not getattr(self.bot, 'user', None):
+            return
+        if not self.purge_nonlucky_on_boot:
+            return
+        # Decide scan limit
+        limit = None
+        try:
+            if self.purge_limit and self.purge_limit > 0:
+                limit = int(self.purge_limit)
+            elif self.boot_scan_limit and self.boot_scan_limit > 0:
+                limit = int(self.boot_scan_limit)
+            else:
+                limit = None
+        except Exception:
+            limit = None
+        sleep_s = max(0.1, float(self.purge_sleep_ms or 0) / 1000.0)
+        scanned = 0
+        deleted = 0
+        try:
+            async for msg in self.thread.history(limit=limit, oldest_first=False):
+                scanned += 1
+                try:
+                    if getattr(msg, 'author', None) and msg.author.id != self.bot.user.id:
+                        continue
+                except Exception:
+                    pass
+                emb = (msg.embeds[0] if getattr(msg, 'embeds', None) else None)
+                if not emb:
+                    continue
+                is_not_lucky = False
+                try:
+                    for f in getattr(emb, 'fields', []) or []:
+                        if str(getattr(f, 'name', '')).strip().lower() == 'result':
+                            vv = str(getattr(f, 'value', '') or '').lower()
+                            if ('not lucky' in vv) or ('❌' in str(getattr(f, 'value', '') or '')):
+                                is_not_lucky = True
+                            break
+                except Exception:
+                    is_not_lucky = False
+                if not is_not_lucky:
+                    continue
+                try:
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(sleep_s)
+                except Exception as e:
+                    log.warning('[lpgmem] purge delete failed mid=%s: %r', getattr(msg,'id','?'), e)
+        except Exception as e:
+            log.warning('[lpgmem] purge scan failed: %r', e)
+        log.info('[lpgmem] purge_nonlucky scanned=%d deleted=%d limit=%s', scanned, deleted, str(limit))
 
     async def _bootstrap_from_thread(self):
         if not self.thread:

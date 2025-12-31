@@ -188,6 +188,19 @@ async def _post_status_embed(
     try:
         ch = bot.get_channel(tid) or await bot.fetch_channel(tid)
         if ch:
+            # Guard: memory thread must only store LUCKY entries
+            try:
+                _is_lucky = True
+                for _n, _v, _inl in (fields or []):
+                    if str(_n).strip().lower() == 'result':
+                        vv = str(_v or '').lower()
+                        if ('not lucky' in vv) or ('❌' in str(_v or '')):
+                            _is_lucky = False
+                        break
+                if not _is_lucky:
+                    return
+            except Exception:
+                pass
             import discord
 
             emb = discord.Embed(title=title, color=color)
@@ -195,7 +208,7 @@ async def _post_status_embed(
                 emb.add_field(name=name, value=value, inline=inline)
             if footer_text:
                 try:
-                    emb.set_footer(text=str(footer_text))
+                    emb.set_footer(text=footer_text)
                 except Exception:
                     pass
 

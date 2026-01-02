@@ -26,6 +26,8 @@ from typing import Dict, Optional, Tuple
 import discord
 from discord.ext import commands, tasks
 
+from nixe.helpers.safe_delete import safe_delete
+
 log = logging.getLogger(__name__)
 
 # Hardcoded permanent-memory thread (per user requirement)
@@ -99,6 +101,9 @@ class LPGCachePersistence(commands.Cog):
         # - Render Free: bounded (default 5000)
         # - minipc: unbounded by default (0 means unlimited), user will maintain weekly
         self.cache_max_entries = _env_int("LPG_CACHE_MAX_ENTRIES", 5000 if self.render else 0)
+        # Safety: never allow unbounded cache on Render Free (avoids OOM)
+        if self.render and (not self.cache_max_entries or int(self.cache_max_entries) <= 0):
+            self.cache_max_entries = 5000
 
         # Boot scan limit (messages):
         # - Render Free: limit scan to avoid spikes
@@ -120,7 +125,7 @@ class LPGCachePersistence(commands.Cog):
         # Default ON to match 'thread = memory' semantics.
         self.purge_nonlucky_on_boot = os.getenv('LPG_CACHE_PURGE_NONLUCKY_ON_BOOT', '1') == '1'
         self.purge_limit = _env_int('LPG_CACHE_PURGE_LIMIT', 0)  # 0 = use boot_scan_limit/unlimited
-        self.purge_sleep_ms = _env_int('LPG_CACHE_PURGE_SLEEP_MS', 350)
+        self.purge_sleep_ms = _env_int('LPG_CACHE_PURGE_SLEEP_MS', 750 if self.render else 350)
 
 
         # Map for delete=unlearn
@@ -203,6 +208,33 @@ class LPGCachePersistence(commands.Cog):
                 except Exception:
                     pass
                 emb = (msg.embeds[0] if getattr(msg, 'embeds', None) else None)
+
+                # Also purge bot-authored JSON log entries that are NOT OK / NOT LUCKY.
+                try:
+                    content = str(getattr(msg, "content", "") or "").strip()
+                    if content:
+                        raw = content
+                        if raw.startswith("```"):
+                            # Strip code fences (```json ... ```)
+                            try:
+                                raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+                            except Exception:
+                                raw = ""
+                            if raw.endswith("```"):
+                                raw = raw[:-3]
+                        raw = raw.strip()
+                        if raw.startswith("{") and raw.endswith("}"):
+                            import json as _json
+                            obj = _json.loads(raw)
+                            okv = obj.get("ok", True)
+                            if okv is False:
+                                await safe_delete(msg, label='lpgmem-purge-json')
+                                deleted += 1
+                                await asyncio.sleep(sleep_s)
+                                continue
+                except Exception:
+                    pass
+
                 if not emb:
                     continue
                 is_not_lucky = False
@@ -218,7 +250,7 @@ class LPGCachePersistence(commands.Cog):
                 if not is_not_lucky:
                     continue
                 try:
-                    await msg.delete()
+                    await safe_delete(msg, label='lpgmem-purge')
                     deleted += 1
                     await asyncio.sleep(sleep_s)
                 except Exception as e:

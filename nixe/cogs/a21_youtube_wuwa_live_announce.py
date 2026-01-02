@@ -1177,7 +1177,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 if not looks_like_add:
                     continue
                 try:
-                    await m.delete()
+                    await safe_delete(m, label='a21_youtube_wuwa_live_announce')
                 except Exception:
                     pass
         except Exception:
@@ -1299,7 +1299,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if not texts:
                 # still try to delete to keep thread clean
                 try:
-                    await message.delete()
+                    await safe_delete(message, label='a21_youtube_wuwa_live_announce')
                 except Exception:
                     pass
                 return
@@ -1331,7 +1331,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             # Finally delete the moderator message so the thread only keeps the store embed
             try:
-                await message.delete()
+                await safe_delete(message, label='a21_youtube_wuwa_live_announce')
             except Exception:
                 pass
 

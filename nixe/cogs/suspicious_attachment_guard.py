@@ -5,6 +5,8 @@ import os, re, asyncio, logging, urllib.parse
 from typing import Tuple, Optional, List
 import discord
 from discord.ext import commands
+
+from nixe.helpers.safe_delete import safe_delete
 from nixe.shared import bus
 
 log = logging.getLogger("nixe.cogs.suspicious_attachment_guard")  # tag: [sus-attach]
@@ -302,7 +304,7 @@ class SuspiciousAttachmentGuard(commands.Cog):
 
         if total_score >= self.delete_threshold:
             try:
-                await message.delete()
+                await safe_delete(message, label='sus-attach')
                 log.warning("[sus-attach] deleted in %s (score=%s reasons=%s)", message.channel.id, total_score, ";".join(reasons))
             except Exception as e:
                 log.warning("[sus-attach] delete failed: %r", e)

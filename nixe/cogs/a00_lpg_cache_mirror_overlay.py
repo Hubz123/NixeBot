@@ -88,6 +88,11 @@ class LPGCacheMirror(commands.Cog):
             n = len(data) if isinstance(data, list) else 0
             if n > self._last_len:
                 for it in data[self._last_len:n]:
+                    try:
+                        if isinstance(it, dict) and it.get('ok', True) is False:
+                            continue
+                    except Exception:
+                        pass
                     await self._post(it)
                 self._last_len = n
         except Exception as e:

@@ -3,6 +3,7 @@ import os, json, asyncio, discord
 from discord.ext import commands, tasks
 from discord import AllowedMentions
 from nixe.helpers import img_hashing
+from nixe.helpers.safe_delete import safe_delete
 
 PHASH_DB_MARKER = os.getenv("PHASH_DB_MARKER", "NIXE_PHASH_DB_V1").strip()
 DB_MSG_ID = int(os.getenv("PHASH_DB_MESSAGE_ID", "0") or "0")
@@ -213,7 +214,7 @@ class PhashAutoReseedPort(commands.Cog):
                 m = await parent.send(embed=emb, allowed_mentions=AllowedMentions.none())
                 if LOG_TTL_SECONDS > 0:
                     await asyncio.sleep(LOG_TTL_SECONDS)
-                    await m.delete()
+                    await safe_delete(m, label="delete")
             except Exception:
                 pass
 

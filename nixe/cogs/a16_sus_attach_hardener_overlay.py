@@ -5,6 +5,8 @@ from typing import Tuple, Optional, List
 import discord
 from discord.ext import commands
 
+from nixe.helpers.safe_delete import safe_delete
+
 log = logging.getLogger("nixe.cogs.a16_sus_attach_hardener_overlay")
 
 _IMG_EXT = {".png",".jpg",".jpeg",".gif",".bmp",".webp",".jfif",".pjpeg",".pjp",".tif",".tiff"}
@@ -271,7 +273,7 @@ class SusAttachHardener(commands.Cog):
 
         if total_score >= self.delete_threshold:
             try:
-                await message.delete()
+                await safe_delete(message, label='a16_sus_attach_hardener_overlay')
                 log.warning("[sus-hard] deleted in %s (score=%s reasons=%s)", message.channel.id, total_score, ";".join(reasons))
             except Exception as e:
                 log.warning("[sus-hard] delete failed: %r", e)

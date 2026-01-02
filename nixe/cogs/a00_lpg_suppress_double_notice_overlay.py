@@ -12,6 +12,8 @@ import os
 import logging
 from discord.ext import commands
 
+from nixe.helpers.safe_delete import safe_delete
+
 PHRASES = (
     "kontenmu melenceng dari tema. sudah dihapus. gunakan kanal yang tepat.",
 )
@@ -62,7 +64,7 @@ class LpgSuppressDoubleNotice(commands.Cog):
             if (os.getenv('PERSONA_NAME','').lower().find('yandere') >= 0) or (os.getenv('PERSONA_PROFILE','').lower().find('yandere') >= 0):
                 return
             try:
-                await message.delete()
+                await safe_delete(message, label='a00_lpg_suppress_double_notice_overlay')
                 self.log.info("[lpg-suppress] deleted generic notice to avoid double message")
             except Exception as e:
                 self.log.warning("[lpg-suppress] failed to delete generic notice: %r", e)

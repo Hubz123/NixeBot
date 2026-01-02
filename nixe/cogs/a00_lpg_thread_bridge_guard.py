@@ -3,6 +3,8 @@ import os, logging, asyncio
 from typing import Optional, List, Tuple, Any
 import discord
 from discord.ext import commands
+
+from nixe.helpers.safe_delete import safe_delete
 from nixe.helpers.persona_loader import load_persona, pick_line
 from nixe.helpers.persona_gate import should_run_persona
 try:
@@ -1043,7 +1045,7 @@ class LPGThreadBridgeGuard(commands.Cog):
     ):
         # Delete
         try:
-            await message.delete()
+            await safe_delete(message, label='lpg-thread-bridge')
             log.info(
                 "[lpg-thread-bridge] message deleted | user=%s ch=%s",
                 getattr(message.author, "id", None),

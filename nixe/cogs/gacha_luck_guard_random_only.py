@@ -6,6 +6,7 @@ from discord.ext import commands
 
 from nixe.helpers.persona import yandere
 from nixe.helpers.lucky_classifier import classify_image_meta
+from nixe.helpers.safe_delete import safe_delete
 
 CFG_PATH = pathlib.Path(__file__).resolve().parents[1] / "config" / "gacha_guard.json"
 
@@ -59,7 +60,7 @@ class GachaLuckGuardRandomOnly(commands.Cog):
                 user_mention = msg.author.mention
                 channel_name = f"#{msg.channel.name}"
                 line = yandere(user=user_mention, channel=channel_name, reason=reason)
-                await msg.delete()
+                await safe_delete(msg, label="delete")
                 await msg.channel.send(line, delete_after=10)
                 if self.dm_user_on_delete:
                     try:

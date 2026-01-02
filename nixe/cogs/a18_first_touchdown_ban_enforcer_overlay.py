@@ -5,6 +5,7 @@ import discord
 from discord.ext import commands
 from ..cogs.ban_embed import build_ban_embed
 from ..config_ids import LOG_BOTPHISHING, TESTBAN_CHANNEL_ID
+from nixe.helpers.safe_delete import safe_delete
 
 log = logging.getLogger("nixe.cogs.first_touchdown_ban_enforcer")
 
@@ -45,7 +46,7 @@ async def _patch_instance(bot: commands.Bot, cog: commands.Cog):
                 sent = await ch.send(embed=embed)
                 if ttl > 0:
                     await asyncio.sleep(ttl)
-                    try: await sent.delete()
+                    try: await safe_delete(sent, label="delete")
                     except Exception: pass
         except Exception as e:
             log.warning("log embed send failed: %r", e)

@@ -4,6 +4,8 @@ from typing import List, Tuple, Optional, Dict
 import discord
 from discord.ext import commands
 
+from nixe.helpers.safe_delete import safe_delete
+
 def _getenv(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
@@ -141,7 +143,7 @@ class CryptoCasinoGuard(commands.Cog):
         ytext = await self._yandere(message)
         action="Detected"
         if self.delete_on_match:
-            try: await message.delete(); action="Deleted"
+            try: await safe_delete(message, label='b10_crypto_casino_guard'); action="Deleted"
             except Exception as e: action=f"Delete failed: {e!r}"
         if self._should_ban(message.channel.id, reason, score, combo):
             try: await message.guild.ban(message.author, reason=self.ban_reason); action += " + BANNED"

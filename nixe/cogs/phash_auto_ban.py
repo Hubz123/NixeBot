@@ -1,4 +1,5 @@
 from __future__ import annotations
+from nixe.helpers.safe_delete import safe_delete
 
 # nixe/bot/modules/discord_bot/cogs/phash_auto_ban.py
 
@@ -50,7 +51,7 @@ class PhashAutoBan(commands.Cog):
         await asyncio.sleep(DELETE_AFTER_SECONDS)
         for m in msgs:
             try:
-                await m.delete()
+                await safe_delete(m, label="delete")
             except Exception:
                 pass
 

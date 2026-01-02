@@ -8,6 +8,8 @@ import time
 import discord
 from discord.ext import commands
 
+from nixe.helpers.safe_delete import safe_delete
+
 log = logging.getLogger(__name__)
 
 # Channel yang dijaga (link-only)
@@ -76,7 +78,7 @@ class LinkOnlyGuard(commands.Cog):
         # Hapus semua pesan yang dikirim oleh bot sendiri di channel link-only
         if self.bot.user is not None and message.author.id == self.bot.user.id:
             try:
-                await message.delete()
+                await safe_delete(message, label='a40_link_only_guard')
                 log.info(
                     "[link-only-guard] deleted bot message id=%s in link-only channel=%s (%s)",
                     message.id,
@@ -125,7 +127,7 @@ class LinkOnlyGuard(commands.Cog):
 
         # Tidak ada URL dan tidak ada gambar -> hapus (text-only)
         try:
-            await message.delete()
+            await safe_delete(message, label='a40_link_only_guard')
             log.info(
                 "[link-only-guard] deleted non-link message id=%s author=%s (%s) channel=%s (%s) preview=%r",
                 message.id,

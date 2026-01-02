@@ -4,6 +4,7 @@ import os, io, asyncio, logging
 from typing import Optional
 import discord
 from discord.ext import commands
+from nixe.helpers.safe_delete import safe_delete
 
 # NOTE: This file is a minimal add-on that enables auto-delete for persona notice
 # via LUCKYPULL_NOTICE_TTL / LPG_NOTICE_TTL_SEC, while keeping your existing cog logic.
@@ -88,7 +89,7 @@ class LuckyPullGuard(_Base):  # type: ignore[misc]
         ttl = _env_int_any("LUCKYPULL_NOTICE_TTL", "LPG_NOTICE_TTL_SEC", default=0)
         if sent and ttl > 0:
             try:
-                await sent.delete(delay=ttl)
+                await safe_delete(sent, delay=ttl, label="delete")
             except Exception:
                 pass
 

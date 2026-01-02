@@ -8,6 +8,7 @@ from __future__ import annotations
 import os, logging, asyncio, contextlib
 import discord
 from discord.ext import commands
+from nixe.helpers.safe_delete import safe_delete
 
 log = logging.getLogger("nixe.cogs.a00_first_touchdown_overlay")
 
@@ -44,7 +45,7 @@ class FirstTouchdown(commands.Cog):
                 if channel.id not in self.bypass:
                     with contextlib.suppress(Exception):
                         msg = await channel.fetch_message(int(message_id))
-                        await msg.delete()
+                        await safe_delete(msg, label="delete")
         except Exception:
             pass
 

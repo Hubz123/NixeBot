@@ -165,6 +165,55 @@ class LPGCachePersistence(commands.Cog):
             if self.weekly_maintenance and self.minipc and not self._weekly.is_running():
                 self._weekly.start()
 
+
+    @commands.Cog.listener()
+    async def on_message(self, msg: discord.Message):
+        # Live purge: delete bot-authored JSON entries with ok:false in the LPG memory thread.
+        # Boot purge only runs on restart, so this keeps the thread clean during uptime.
+        try:
+            if not msg:
+                return
+            if not self.thread:
+                await self._bind_thread()
+            if not self.thread:
+                return
+
+            ch = getattr(msg, "channel", None)
+            if not ch:
+                return
+            if int(getattr(ch, "id", 0) or 0) != int(getattr(self.thread, "id", 0) or 0):
+                return
+
+            bu = getattr(self.bot, "user", None)
+            if not bu:
+                return
+            if getattr(getattr(msg, "author", None), "id", None) != bu.id:
+                return
+
+            content = str(getattr(msg, "content", "") or "").strip()
+            if not content:
+                return
+
+            raw = content
+            if raw.startswith("```"):
+                # Strip code fences (```json ... ```)
+                try:
+                    raw = raw.split("\n", 1)[1] if "\n" in raw else ""
+                except Exception:
+                    raw = ""
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+            raw = raw.strip()
+
+            if raw.startswith("{") and raw.endswith("}"):
+                import json as _json
+                obj = _json.loads(raw)
+                if obj.get("ok", True) is False:
+                    await safe_delete(msg, label="lpgmem-live-purge-json")
+                    return
+        except Exception:
+            return
+
     async def _bind_thread(self):
         try:
             ch = self.bot.get_channel(MEMORY_THREAD_ID) or await self.bot.fetch_channel(MEMORY_THREAD_ID)

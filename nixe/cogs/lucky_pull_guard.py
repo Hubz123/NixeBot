@@ -4,7 +4,6 @@ import os
 import asyncio
 import logging
 from typing import Set
-from nixe.helpers.safe_delete import safe_delete
 
 try:
     import discord
@@ -156,7 +155,7 @@ class LuckyPullGuard(commands.Cog):
                 async def _del_after(msg, sec):
                     try:
                         await asyncio.sleep(int(sec))
-                        await safe_delete(msg, label="delete")
+                        await msg.delete()
                     except Exception:
                         pass
                 asyncio.create_task(_del_after(sent, self.notice_ttl))

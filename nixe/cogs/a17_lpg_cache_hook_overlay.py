@@ -37,9 +37,6 @@ class LPGCacheHook(commands.Cog):
         self.sim_nok_recheck = _env("LPG_CACHE_ACCEPT_SIM_NOK_RECHECK", "1") == "1"
         # by default, we DO NOT store pure error/timeout/http_error/no_result results
         self.store_error_results = _env("LPG_CACHE_STORE_ERROR_RESULTS", "0") == "1"
-        # If "1", also persist non-OK results to the permanent memory thread.
-        # Default OFF to prevent thread pollution / OOM on Render.
-        self.store_non_ok_results = _env("LPG_CACHE_STORE_NON_OK_RESULTS", "0") == "1"
         # if True, cache is only used as fallback when provider errors/timeouts
         self.fallback_on_error_only = _env("LPG_CACHE_FALLBACK_ON_ERROR_ONLY", "1") == "1"
 
@@ -137,21 +134,15 @@ class LPGCacheHook(commands.Cog):
                 entry = None
                 if cacheable:
                     entry = cache.put(image_bytes, ok, score, via, reason)
-
-                    # Only persist OK (LUCKY) results to the permanent thread by default.
-                    # Non-OK results can be persisted only if explicitly enabled.
-                    persistable = bool(entry and entry.get("ok")) or bool(self.store_non_ok_results)
-
-                    if persistable:
-                        # fire-and-forget persist to cache thread
-                        try:
-                            from nixe.cogs.a17_lpg_cache_persistence_overlay import LPGCachePersistence  # noqa
-                            cog = self.bot.get_cog("LPGCachePersistence")
-                            if cog and hasattr(cog, "persist"):
-                                import asyncio as _asyncio
-                                _asyncio.create_task(cog.persist(entry))
-                        except Exception:
-                            pass
+                    # fire-and-forget persist to cache thread
+                    try:
+                        from nixe.cogs.a17_lpg_cache_persistence_overlay import LPGCachePersistence  # noqa
+                        cog = self.bot.get_cog("LPGCachePersistence")
+                        if cog:
+                            import asyncio as _asyncio
+                            _asyncio.create_task(cog.persist(entry))
+                    except Exception:
+                        pass
 
                 # Also remember strong LUCKY (for memory board / Upstash)
                 try:

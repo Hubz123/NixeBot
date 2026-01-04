@@ -26,8 +26,6 @@ from typing import Dict, Optional, Tuple
 import discord
 from discord.ext import commands, tasks
 
-from nixe.helpers.safe_delete import safe_delete
-
 log = logging.getLogger(__name__)
 
 # Hardcoded permanent-memory thread (per user requirement)
@@ -101,9 +99,6 @@ class LPGCachePersistence(commands.Cog):
         # - Render Free: bounded (default 5000)
         # - minipc: unbounded by default (0 means unlimited), user will maintain weekly
         self.cache_max_entries = _env_int("LPG_CACHE_MAX_ENTRIES", 5000 if self.render else 0)
-        # Safety: never allow unbounded cache on Render Free (avoids OOM)
-        if self.render and (not self.cache_max_entries or int(self.cache_max_entries) <= 0):
-            self.cache_max_entries = 5000
 
         # Boot scan limit (messages):
         # - Render Free: limit scan to avoid spikes
@@ -125,11 +120,11 @@ class LPGCachePersistence(commands.Cog):
         # Default ON to match 'thread = memory' semantics.
         self.purge_nonlucky_on_boot = os.getenv('LPG_CACHE_PURGE_NONLUCKY_ON_BOOT', '1') == '1'
         self.purge_limit = _env_int('LPG_CACHE_PURGE_LIMIT', 0)  # 0 = use boot_scan_limit/unlimited
-        self.purge_sleep_ms = _env_int('LPG_CACHE_PURGE_SLEEP_MS', 750 if self.render else 350)
+        self.purge_sleep_ms = _env_int('LPG_CACHE_PURGE_SLEEP_MS', 350)
 
 
         # Map for delete=unlearn
-        self._msgid_to_fp: Dict[int, tuple[str, str]] = {}
+        self._msgid_to_sha1: Dict[int, str] = {}
 
         self.thread: Optional[discord.Thread] = None
 
@@ -153,66 +148,10 @@ class LPGCachePersistence(commands.Cog):
         # Run bootstrap once per process; tasks.loop will handle weekly maintenance
         if self.thread is None:
             await self._bind_thread()
-            # Load denylist once per boot (used to suppress known false-positives)
-            try:
-                from nixe.helpers import lpg_denylist as deny
-                loaded = await deny.load_from_thread(self.bot)
-                log.warning('[lpgmem] denylist loaded=%s', loaded)
-            except Exception as e:
-                log.warning('[lpgmem] denylist load failed: %r', e)
             await self._purge_nonlucky_in_thread()
             await self._bootstrap_from_thread()
             if self.weekly_maintenance and self.minipc and not self._weekly.is_running():
                 self._weekly.start()
-
-
-    @commands.Cog.listener()
-    async def on_message(self, msg: discord.Message):
-        # Live purge: delete bot-authored JSON entries with ok:false in the LPG memory thread.
-        # Boot purge only runs on restart, so this keeps the thread clean during uptime.
-        try:
-            if not msg:
-                return
-            if not self.thread:
-                await self._bind_thread()
-            if not self.thread:
-                return
-
-            ch = getattr(msg, "channel", None)
-            if not ch:
-                return
-            if int(getattr(ch, "id", 0) or 0) != int(getattr(self.thread, "id", 0) or 0):
-                return
-
-            bu = getattr(self.bot, "user", None)
-            if not bu:
-                return
-            if getattr(getattr(msg, "author", None), "id", None) != bu.id:
-                return
-
-            content = str(getattr(msg, "content", "") or "").strip()
-            if not content:
-                return
-
-            raw = content
-            if raw.startswith("```"):
-                # Strip code fences (```json ... ```)
-                try:
-                    raw = raw.split("\n", 1)[1] if "\n" in raw else ""
-                except Exception:
-                    raw = ""
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-            raw = raw.strip()
-
-            if raw.startswith("{") and raw.endswith("}"):
-                import json as _json
-                obj = _json.loads(raw)
-                if obj.get("ok", True) is False:
-                    await safe_delete(msg, label="lpgmem-live-purge-json")
-                    return
-        except Exception:
-            return
 
     async def _bind_thread(self):
         try:
@@ -257,33 +196,6 @@ class LPGCachePersistence(commands.Cog):
                 except Exception:
                     pass
                 emb = (msg.embeds[0] if getattr(msg, 'embeds', None) else None)
-
-                # Also purge bot-authored JSON log entries that are NOT OK / NOT LUCKY.
-                try:
-                    content = str(getattr(msg, "content", "") or "").strip()
-                    if content:
-                        raw = content
-                        if raw.startswith("```"):
-                            # Strip code fences (```json ... ```)
-                            try:
-                                raw = raw.split("\n", 1)[1] if "\n" in raw else ""
-                            except Exception:
-                                raw = ""
-                            if raw.endswith("```"):
-                                raw = raw[:-3]
-                        raw = raw.strip()
-                        if raw.startswith("{") and raw.endswith("}"):
-                            import json as _json
-                            obj = _json.loads(raw)
-                            okv = obj.get("ok", True)
-                            if okv is False:
-                                await safe_delete(msg, label='lpgmem-purge-json')
-                                deleted += 1
-                                await asyncio.sleep(sleep_s)
-                                continue
-                except Exception:
-                    pass
-
                 if not emb:
                     continue
                 is_not_lucky = False
@@ -299,7 +211,7 @@ class LPGCachePersistence(commands.Cog):
                 if not is_not_lucky:
                     continue
                 try:
-                    await safe_delete(msg, label='lpgmem-purge')
+                    await msg.delete()
                     deleted += 1
                     await asyncio.sleep(sleep_s)
                 except Exception as e:
@@ -357,7 +269,7 @@ class LPGCachePersistence(commands.Cog):
                                 "ts": float(msg.created_at.timestamp()) if getattr(msg, "created_at", None) else 0.0,
                             }
                         )
-                        self._msgid_to_fp[int(msg.id)] = (sha1, ah)
+                        self._msgid_to_sha1[int(msg.id)] = sha1
                         loaded += 1
                     except Exception:
                         continue
@@ -384,7 +296,7 @@ class LPGCachePersistence(commands.Cog):
                     sha1 = str(ent.get("sha1") or "")
                     ah = str(ent.get("ahash") or "")
                     if sha1:
-                        self._msgid_to_fp[int(msg.id)] = (sha1, ah)
+                        self._msgid_to_sha1[int(msg.id)] = sha1
                         loaded += 1
                     backfilled += 1
 
@@ -416,24 +328,45 @@ class LPGCachePersistence(commands.Cog):
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         # delete=unlearn (thread only)
         try:
-            if int(getattr(payload, "channel_id", 0) or 0) != int(MEMORY_THREAD_ID):
-                return
+            ch_id = int(getattr(payload, "channel_id", 0) or 0)
             mid = int(getattr(payload, "message_id", 0) or 0)
-            fp = self._msgid_to_fp.pop(mid, None)
-            sha1 = fp[0] if fp else None
-            ah = fp[1] if fp else ""
+
+            # Primary path: thread id match + msgid→sha1 map (fast)
+            sha1 = self._msgid_to_sha1.pop(mid, None)
+
+            # Fallback: if the message was cached, parse footer to recover sha1 (covers older entries / boot-scan gaps).
+            if not sha1:
+                try:
+                    cached = getattr(payload, "cached_message", None)
+                    if cached and getattr(cached, "embeds", None):
+                        emb0 = cached.embeds[0]
+                        ft = getattr(getattr(emb0, "footer", None), "text", None)
+                        m = _FOOTER_RE.search(str(ft or ""))
+                        if m:
+                            sha1 = m.group(1).lower()
+                except Exception:
+                    sha1 = None
+
+            # Safety gate: only unlearn if either it's the configured memory thread,
+            # or the cached footer explicitly matches our lpgmem pattern.
             if not sha1:
                 return
+            if ch_id != int(MEMORY_THREAD_ID):
+                try:
+                    cached = getattr(payload, "cached_message", None)
+                    ok_footer = False
+                    if cached and getattr(cached, "embeds", None):
+                        emb0 = cached.embeds[0]
+                        ft = getattr(getattr(emb0, "footer", None), "text", None)
+                        ok_footer = bool(_FOOTER_RE.search(str(ft or "")))
+                    if not ok_footer:
+                        return
+                except Exception:
+                    return
+
             from nixe.helpers import lpg_cache_memory as cache
             cache.remove_sha1(sha1)
-            # delete=banish: add to denylist persistent store
-            try:
-                from nixe.helpers import lpg_denylist as deny
-                deny.add(str(sha1), str(ah or ""))
-                await deny.persist_to_thread(self.bot, str(sha1), str(ah or ""))
-            except Exception:
-                pass
-            log.warning("[lpgmem] unlearn+banish mid=%s sha1=%s", mid, sha1[:8])
+            log.warning("[lpgmem] unlearn mid=%s sha1=%s ch=%s", mid, sha1[:8], ch_id)
         except Exception:
             return
 

@@ -9,8 +9,6 @@ from typing import Optional, List, Set
 import discord
 from discord.ext import commands
 
-from nixe.helpers.safe_delete import safe_delete
-
 log = logging.getLogger(__name__)
 
 def _env_str(*keys: str, default: str = "") -> str:
@@ -92,7 +90,7 @@ class GachaLuckGuard(commands.Cog):
         if not has_img: return
         await self._notify(message)
         if self.redirect_id and self.delete_src:
-            try: await safe_delete(message, label='gacha_luck_guard')
+            try: await message.delete()
             except Exception: pass
 
 async def setup(bot: commands.Bot):

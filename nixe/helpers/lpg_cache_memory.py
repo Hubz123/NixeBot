@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import io
 import time
+from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
 
@@ -71,6 +72,54 @@ def hamming_hex64(a: str, b: str) -> int:
 # -----------------------------
 _CACHE: Dict[str, dict] = {}  # sha1 -> entry
 _INDEX_AHASH: Dict[str, List[str]] = {}  # ahash -> [sha1, ...]
+
+# msg_id -> sha1 mapping (for delete=unlearn without needing embed/footer)
+# Keep bounded to avoid leaks on long-running instances.
+_MSGID_TO_SHA1 = OrderedDict()  # type: ignore[var-annotated]
+
+def _msgid_cap() -> int:
+    # Tie cap loosely to cache size; keep a sensible upper bound.
+    try:
+        if _MAX and int(_MAX) > 0:
+            return max(5000, int(_MAX) * 2)
+    except Exception:
+        pass
+    return 50000
+
+def register_msgid_sha1(msg_id: int, sha1: str) -> None:
+    try:
+        mid = int(msg_id or 0)
+        if mid <= 0:
+            return
+        s = str(sha1 or "").strip()
+        if not s:
+            return
+        _MSGID_TO_SHA1[mid] = s
+        try:
+            _MSGID_TO_SHA1.move_to_end(mid)
+        except Exception:
+            pass
+        cap = _msgid_cap()
+        if len(_MSGID_TO_SHA1) > cap:
+            # evict oldest 10%
+            drop = max(1, int(cap * 0.10))
+            for _ in range(drop):
+                try:
+                    _MSGID_TO_SHA1.popitem(last=False)
+                except Exception:
+                    break
+    except Exception:
+        return
+
+def pop_msgid_sha1(msg_id: int) -> Optional[str]:
+    try:
+        mid = int(msg_id or 0)
+        if mid <= 0:
+            return None
+        return _MSGID_TO_SHA1.pop(mid, None)
+    except Exception:
+        return None
+
 # _MAX:
 #   - if >0 : bounded cache (evict oldest 10% when exceeded)
 #   - if <=0: unbounded (minipc mode); caller must do periodic maintenance
@@ -155,13 +204,6 @@ def remove_sha1(sha1: str) -> None:
     if ah:
         _index_remove(sha1, ah)
 
-
-
-def fingerprint_bytes(image_bytes: bytes) -> tuple[str, str, tuple[int,int]]:
-    """Compute (sha1, ahash, (w,h)) without mutating cache."""
-    sha1 = hashlib.sha1(image_bytes).hexdigest()
-    ah, wh = _to_ahash_bytes(image_bytes)
-    return sha1, ah, (int(wh[0]), int(wh[1]))
 
 def put(image_bytes: bytes, ok: bool, score: float, via: str, reason: str) -> dict:
     sha1 = hashlib.sha1(image_bytes).hexdigest()

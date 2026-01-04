@@ -5,7 +5,6 @@ import discord
 from discord.ext import commands
 from nixe.helpers.env_reader import get as _cfg_get, get_int as _cfg_int, get_bool01 as _cfg_bool01
 from nixe.helpers.gemini_phish import classify_image_phish
-from nixe.helpers.safe_delete import safe_delete
 log = logging.getLogger(__name__)
 def _compress(raw: bytes, max_px=640, min_px=384, target_kb=300, quality=75):
     try:
@@ -42,7 +41,7 @@ class ImagePhishGeminiGuard(commands.Cog):
         if not datas: return
         label, conf = await classify_image_phish(datas, hints="discord scam check", timeout_ms=self.timeout_ms)
         if label=="phish" and conf>=self.threshold:
-            try: await safe_delete(msg, label="delete", reason=f"image phishing (gemini conf={conf:.2f})")
+            try: await msg.delete(reason=f"image phishing (gemini conf={conf:.2f})")
             except discord.Forbidden: log.warning("[phish-gemini] missing Manage Messages")
             except Exception as e: log.warning("[phish-gemini] delete failed: %r", e)
             try: await msg.channel.send(f"{msg.author.mention} gambar kamu terindikasi scam/penipuan. Mohon hindari upload konten itu. (conf={conf:.2f})", delete_after=20)

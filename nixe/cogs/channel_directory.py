@@ -24,7 +24,6 @@ import json
 
 import discord
 from discord.ext import commands
-from nixe.helpers.safe_delete import safe_delete
 
 log = logging.getLogger(__name__)
 
@@ -194,7 +193,7 @@ class ChannelDirectory(commands.Cog):
         await asyncio.sleep(self.ttl)
         for m in msgs:
             try:
-                await safe_delete(m, label="delete")
+                await m.delete()
             except Exception:
                 # jangan spam log kalau user sudah hapus manual
                 pass

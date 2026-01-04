@@ -4,7 +4,6 @@ import io, discord
 from discord.ext import commands
 from nixe.helpers.env_reader import get, get_int
 from nixe.helpers.lp_gemini_helper import is_gemini_enabled, is_lucky_pull
-from nixe.helpers.safe_delete import safe_delete
 def _csv_ids(s:str):
     return {int(x) for x in (s or "").replace(","," ").split() if x.isdigit()}
 class LuckyPullGuard(commands.Cog):
@@ -29,7 +28,7 @@ class LuckyPullGuard(commands.Cog):
             b=await a.read()
             dec,score,_=is_lucky_pull(b, threshold=self.th)
             if dec:
-                try: await safe_delete(m, label="delete", reason=str("Nixe: Lucky pull not allowed here"))
+                try: await m.delete(reason="Nixe: Lucky pull not allowed here")
                 except Exception: pass
                 if self.redirect:
                     try:

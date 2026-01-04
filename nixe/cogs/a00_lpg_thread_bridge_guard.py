@@ -3,8 +3,6 @@ import os, logging, asyncio
 from typing import Optional, List, Tuple, Any
 import discord
 from discord.ext import commands
-
-from nixe.helpers.safe_delete import safe_delete
 from nixe.helpers.persona_loader import load_persona, pick_line
 from nixe.helpers.persona_gate import should_run_persona
 try:
@@ -372,68 +370,8 @@ def _load_neg_text() -> list[str]:
         except Exception as e:
             log.warning(f"[lpg-negtext] failed to read {path}: {e} (using inline list only)")
 
-    # Built-in defaults (used when env/file not provided)
     if not out:
-        out = [
-            "owned",
-            "inventory",
-            "loadout",
-            "equipment",
-            "equip",
-            "chapter",
-            "episode",
-            "story",
-            "mission",
-            "quest",
-            "reward",
-            "rewards",
-            "claim",
-            "claimed",
-            "progress",
-            "progression",
-            "event",
-            "shop",
-            "exchange",
-            "stage",
-            "selection",
-            "select",
-            "continue",
-            "continue?",
-            "login",
-            "daily",
-            "weekly",
-            "ends in",
-            "remaining",
-            "days",
-            "hours",
-            "left",
-            "期間",
-            "終了まで",
-            "終了",
-            "あと",
-            "日",
-            "所持",
-            "所有",
-            "報酬",
-            "任務",
-            "章",
-            "物語",
-            "ストーリー",
-            "進行",
-            "挑戦",
-            "選択",
-            "装備",
-            "編成",
-            "交換",
-            "ショップ",
-            "ログイン",
-            "受け取",
-            "受取",
-            "獲得",
-            "クリア",
-            "報酬を受け取",
-        ]
-
+        return []
 
     # normalize + dedup (case-insensitive), preserve first-seen order
     seen: set[str] = set()
@@ -447,101 +385,6 @@ def _load_neg_text() -> list[str]:
         seen.add(s)
         norm.append(s)
     return norm
-
-def _load_pos_text() -> list[str]:
-    """Load positive-text cues for true gacha result screens."""
-    out: list[str] = []
-
-    raw = (os.getenv("LPG_POSITIVE_TEXT") or "").strip()
-    if raw:
-        try:
-            if raw.startswith("[") or raw.startswith("{"):
-                j = json.loads(raw)
-                if isinstance(j, list):
-                    out.extend([str(x).strip() for x in j if str(x).strip()])
-                elif isinstance(j, str):
-                    raw2 = j
-                    for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
-                        s = part.strip()
-                        if s:
-                            out.append(s)
-                else:
-                    raw2 = raw
-                    for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
-                        s = part.strip()
-                        if s:
-                            out.append(s)
-            else:
-                raw2 = raw
-                for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
-                    s = part.strip()
-                    if s:
-                        out.append(s)
-        except Exception:
-            raw2 = raw
-            for part in str(raw2).replace(";", ",").replace("\n", ",").split(","):
-                s = part.strip()
-                if s:
-                    out.append(s)
-
-    path = (os.getenv("LPG_POSITIVE_TEXT_FILE") or "").strip()
-    if path:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    s = line.strip()
-                    if not s or s.startswith("#"):
-                        continue
-                    out.append(s)
-            log.info(f"[lpg-postext] loaded file={path} tokens={len(out)}")
-        except FileNotFoundError:
-            log.warning(f"[lpg-postext] file not found: {path} (using inline list only)")
-        except Exception as e:
-            log.warning(f"[lpg-postext] failed to read {path}: {e} (using inline list only)")
-
-    if not out:
-        out = [
-        "draw",
-        "pull",
-        "gacha",
-        "result",
-        "results",
-        "x10",
-        "10x",
-        "ten pull",
-        "confirm",
-        "skip",
-        "again",
-        "recruit",
-        "summon",
-        "ガチャ",
-        "結果",
-        "10連",
-        "十連",
-        "引く",
-        "確定",
-        "スキップ",
-        "もう一度",
-        "引き直し",
-        "召喚",
-        "募集",
-        "抽選",
-        "出現",
-        "獲得",
-        ]
-
-    seen: set[str] = set()
-    norm: list[str] = []
-    for t in out:
-        s = str(t).strip().lower()
-        if not s:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        norm.append(s)
-    return norm
-
 def _detect_image_mime(image_bytes: bytes) -> str:
     # quick magic
     if image_bytes[:4] == b"\x89PNG":
@@ -598,55 +441,27 @@ async def _ocr_neg_text(image_bytes: bytes, timeout_ms: int = 3500) -> tuple[boo
         model = "gemini-2.5-flash-lite"
 
     img_bytes, mime = _maybe_convert_to_jpeg(image_bytes)
-    # OCR preprocessing: improve faint UI text and include a top-left crop (banner/timer text).
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+
     sys_prompt = (
-        "You are an OCR engine. Extract all readable text from the provided image(s). "
-        "Merge results. Return ONLY compact JSON: {\"text\": \"...\"}."
+        "You are an OCR engine. Extract all readable text from the image. "
+        "Return ONLY compact JSON: {\"text\": \"...\"}. No commentary."
     )
-
-    parts = [{"text": sys_prompt}]
-    try:
-        if Image is not None:
-            from PIL import ImageOps, ImageFilter
-            im = Image.open(BytesIO(img_bytes)).convert("RGB")
-            mx = max(im.size[0], im.size[1])
-            if mx and mx < 1100:
-                scale = 1100.0 / float(mx)
-                im = im.resize((max(1, int(im.size[0] * scale)), max(1, int(im.size[1] * scale))))
-            gimg = ImageOps.grayscale(im)
-            gimg = ImageOps.autocontrast(gimg)
-            gimg = gimg.filter(ImageFilter.SHARPEN)
-            im2 = gimg.convert("RGB")
-
-            buf = BytesIO()
-            im2.save(buf, format="JPEG", quality=90)
-            main_bytes = buf.getvalue()
-
-            w, h = im2.size
-            crop = im2.crop((0, 0, int(w * 0.52), int(h * 0.42)))
-            buf2 = BytesIO()
-            crop.save(buf2, format="JPEG", quality=90)
-            crop_bytes = buf2.getvalue()
-
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(main_bytes).decode("utf-8")}})
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(crop_bytes).decode("utf-8")}})
-        else:
-            parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(img_bytes).decode("utf-8")}})
-    except Exception:
-        parts.append({"inline_data": {"mime_type": mime, "data": base64.b64encode(img_bytes).decode("utf-8")}})
-
     payload = {
         "contents": [
             {
                 "role": "user",
-                "parts": parts,
+                "parts": [
+                    {"text": sys_prompt},
+                    {"inline_data": {"mime_type": mime, "data": b64}},
+                ],
             }
         ],
         "generationConfig": {
             "temperature": 0.0,
             "topP": 0.1,
             "topK": 1,
-            "maxOutputTokens": 384,
+            "maxOutputTokens": 256,
             "responseMimeType": "application/json",
         },
     }
@@ -787,15 +602,9 @@ class LPGThreadBridgeGuard(commands.Cog):
         ]
         # Negative text hard-veto (OCR) to prevent false positives on reward/selection UIs
         self.neg_hard_veto = _env_bool("LPG_NEGATIVE_HARD_VETO", True)
-        self.neg_minlen = _env_int("LPG_NEGATIVE_HARD_VETO_MINLEN", 2)
+        self.neg_minlen = _env_int("LPG_NEGATIVE_HARD_VETO_MINLEN", 3)
         self.neg_tokens = [t.lower() for t in _load_neg_text() if t and len(t.strip()) >= self.neg_minlen]
         self.neg_ocr_timeout_ms = _env_int("LPG_NEGATIVE_OCR_TIMEOUT_MS", 3500)
-
-        # Positive text confirm (OCR) for LUCKY results: if OCR succeeds and is non-empty,
-        # require at least one positive cue; otherwise treat as NOT LUCKY. (Reduces grid UI false positives.)
-        self.pos_confirm = _env_bool("LPG_POSITIVE_OCR_CONFIRM", True)
-        self.pos_tokens = [t.lower() for t in _load_pos_text() if t and len(t.strip()) >= 2]
-        self.pos_ocr_minlen = _env_int("LPG_POSITIVE_OCR_MINLEN", 12)
 
 
         log.warning(
@@ -828,73 +637,56 @@ class LPGThreadBridgeGuard(commands.Cog):
         return name.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"))
 
     async def _negtext_veto(self, image_bytes: bytes) -> Tuple[bool, str]:
-        """OCR-based veto/confirm for candidate LUCKY results.
-
-        Policy:
-        - If OCR succeeds and any NEG token is present => veto.
-        - If OCR succeeds, text length >= pos_ocr_minlen, and no POS token is present (when pos_confirm=1) => veto.
-        - If OCR fails/empty => do not veto (avoid false negatives).
         """
-        if (not self.neg_tokens) and (not (self.pos_confirm and self.pos_tokens)):
-            return False, "ocr_disabled"
-
+        Run OCR and hard-veto lucky classification if any negative token is found.
+        Returns (vetoed, reason).
+        """
+        if not self.neg_hard_veto or not self.neg_tokens:
+            return False, "veto_disabled"
         ok, ocr_text, r = await _ocr_neg_text(image_bytes, timeout_ms=self.neg_ocr_timeout_ms)
         if not ok or not ocr_text:
             return False, f"ocr_skip({r})"
+        low = ocr_text.lower()
+        # Extra guard: roster/collection grids often show many "Lv. 90" labels.
+        # If OCR detects multiple Lv.<num> occurrences, treat as NOT-LUCKY (prevents roster false positives).
+        try:
+            lv_hits = len(re.findall(r"\blv\.?\s*\d{1,3}\b", low))
+            if lv_hits >= 3:
+                return True, f"negtext_veto(ocr:lv_grid:{lv_hits})"
+        except Exception:
+            pass
 
-        low = " ".join(str(ocr_text).split()).lower()
+        for tok in self.neg_tokens:
+            if tok and tok in low:
+                return True, f"negtext_veto(ocr:{tok})"
+        return False, "no_neg_match"
 
-        # Negative tokens
-        if self.neg_tokens and self.neg_hard_veto:
-            for tok in self.neg_tokens:
-                if tok and tok in low:
-                    return True, f"ocr_neg({tok})"
-
-        # Positive confirm for true gacha results
-        if self.pos_confirm and self.pos_tokens and len(low) >= int(self.pos_ocr_minlen or 0):
-            hit = False
-            for tok in self.pos_tokens:
-                if tok and tok in low:
-                    hit = True
-                    break
-            if not hit:
-                return True, "ocr_no_positive"
-
-        return False, "ocr_ok"
-
-
-    async def _classify(self, message: discord.Message) -> tuple[bool, float, str, str]:
+    async def _classify(self, message: discord.Message, *, image_bytes: Optional[bytes] = None) -> tuple[bool, float, str, str]:
         """Classify image with resilient Gemini + BURST fallback.
         Returns: (lucky_ok, score, provider, reason)
         """
         if not classify_lucky_pull_bytes:
             return (False, 0.0, "none", "classifier_missing")
 
-        imgs = [a for a in (message.attachments or []) if self._is_image(a)]
-        if not imgs:
-            return (False, 0.0, "none", "no_image")
-
         data: Optional[bytes] = None
         try:
-            data = await imgs[0].read()
+            if isinstance(image_bytes, (bytes, bytearray)) and image_bytes:
+                data = bytes(image_bytes)
+            else:
+                imgs = [a for a in (message.attachments or []) if self._is_image(a)]
+                if not imgs:
+                    return (False, 0.0, "none", "no_image")
+                data = await imgs[0].read()
             if not data:
                 return (False, 0.0, "none", "empty_bytes")
             if len(data) > self.max_bytes:
                 data = data[: self.max_bytes]
 
-            # Pre-check denylist (delete=banish): skip expensive classify if known false-positive
-            sha1 = ""
-            ah = ""
-            try:
-                from nixe.helpers import lpg_cache_memory as _cache
-                sha1, ah, _wh = _cache.fingerprint_bytes(bytes(data))
-                from nixe.helpers import lpg_denylist as _deny
-                denied, dwhy = _deny.is_denied(sha1, ah)
-                if denied:
-                    log.info("[lpg-thread-bridge] DENYLIST_HIT lucky=False reason=%s", dwhy)
-                    return (False, 0.0, "denylist", dwhy)
-            except Exception:
-                pass
+            # Hard negative-text veto via OCR (prevents Epiphany/reward selection false positives)
+            vetoed, vreason = await self._negtext_veto(data)
+            if vetoed:
+                log.info("[lpg-thread-bridge] NEG_VETO lucky=False reason=%s", vreason)
+                return (False, 0.0, "negtext_veto", vreason)
 
             # primary path: gemini_bridge (may be monkeypatched by overlay)
             res = await asyncio.wait_for(
@@ -955,17 +747,8 @@ class LPGThreadBridgeGuard(commands.Cog):
                         r2low = r2.lower()
                         if not (r2low.startswith("early(") or "early(ok)" in r2low or r2low.startswith("ok")):
                             r2 = f"lastchance({breason})"
-                        verdict_ok = bool(bok and bscore >= self.thr)
-                        if verdict_ok:
-                            try:
-                                vetoed, vreason = await self._negtext_veto(data)
-                                if vetoed:
-                                    log.info("[lpg-thread-bridge] OCR_VETO lucky=False reason=%s", vreason)
-                                    return (False, float(bscore or 0.0), str(bvia or "gemini:burst"), f"ocr_veto({vreason})")
-                            except Exception:
-                                pass
                         return (
-                            verdict_ok,
+                            bool(bok and bscore >= self.thr),
                             bscore,
                             str(bvia or "gemini:burst"),
                             r2,
@@ -977,14 +760,6 @@ class LPGThreadBridgeGuard(commands.Cog):
                     )
 
             verdict_ok = bool(ok and score >= self.thr)
-            if verdict_ok:
-                try:
-                    vetoed, vreason = await self._negtext_veto(data)
-                    if vetoed:
-                        log.info("[lpg-thread-bridge] OCR_VETO lucky=False reason=%s", vreason)
-                        return (False, float(score or 0.0), str(provider or "gemini"), f"ocr_veto({vreason})")
-                except Exception:
-                    pass
             return (verdict_ok, score, provider, reason or "classified")
 
         except asyncio.TimeoutError:
@@ -1013,14 +788,6 @@ class LPGThreadBridgeGuard(commands.Cog):
                     r2low = r2.lower()
                     if not (r2low.startswith("early(") or "early(ok)" in r2low or r2low.startswith("ok")):
                         r2 = f"lastchance({reason})"
-                    if verdict_ok:
-                        try:
-                            vetoed, vreason = await self._negtext_veto(data)
-                            if vetoed:
-                                log.info("[lpg-thread-bridge] OCR_VETO lucky=False reason=%s", vreason)
-                                return (False, float(score or 0.0), str(via or "gemini:burst"), f"ocr_veto({vreason})")
-                        except Exception:
-                            pass
                     return (
                         verdict_ok,
                         score,
@@ -1045,7 +812,7 @@ class LPGThreadBridgeGuard(commands.Cog):
     ):
         # Delete
         try:
-            await safe_delete(message, label='lpg-thread-bridge')
+            await message.delete()
             log.info(
                 "[lpg-thread-bridge] message deleted | user=%s ch=%s",
                 getattr(message.author, "id", None),
@@ -1200,7 +967,9 @@ class LPGThreadBridgeGuard(commands.Cog):
         provider_hint: Optional[str] = None
 
         if self.require_classify:
-            lucky, score, provider, reason = await self._classify(message)
+            if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
+                return
+            lucky, score, provider, reason = await self._classify(message, image_bytes=bytes(raw_bytes))
             log.info(
                 "[lpg-thread-bridge] classify: lucky=%s score=%.3f via=%s reason=%s",
                 lucky,
@@ -1209,6 +978,22 @@ class LPGThreadBridgeGuard(commands.Cog):
                 reason,
             )
             provider_hint = (provider or "").lower()
+            # Extra false-positive guard: roster/collection grids show many "Lv. <num>" labels.
+            # Run OCR only when classifier says LUCKY and neg-token list is empty (avoids extra OCR calls).
+            if lucky and (not self.neg_tokens) and isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
+                try:
+                    ok2, ocr_text2, r2 = await _ocr_neg_text(bytes(raw_bytes), timeout_ms=self.neg_ocr_timeout_ms)
+                    if ok2 and ocr_text2:
+                        low2 = ocr_text2.lower()
+                        lv_hits2 = len(re.findall(r"\blv\.?\s*\d{1,3}\b", low2))
+                        if lv_hits2 >= 3:
+                            lucky = False
+                            score = 0.0
+                            provider = "negtext_veto"
+                            reason = f"ocr:lv_grid:{lv_hits2}"
+                except Exception:
+                    pass
+
 
                 # Permanent thread memory policy:
         # - Only LUCKY entries are posted into the memory thread (ID hardcoded).

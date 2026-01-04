@@ -6,7 +6,6 @@ from discord.ext import commands
 from nixe.helpers.env_reader import get, get_int
 from nixe.helpers.phash_tools import dhash_bytes, hamming
 from nixe.helpers.phash_board import get_blacklist_hashes
-from nixe.helpers.safe_delete import safe_delete
 URL_RE = re.compile(r"https?://[\w.-]+\.[a-z]{2,}(?:/\S*)?", re.I)
 _PRESET_TEXT = {"suspicious":"Suspicious or spam account","compromised":"Compromised or hacked account","breaking":"Breaking server rules","other":"Other"}
 def _ban_reason():
@@ -56,7 +55,7 @@ class FirstTouchdownFirewall(commands.Cog):
             days=min(7, secs//86400)
             await m.guild.ban(m.author, reason=reason, delete_message_days=days)
         except Exception:
-            try: await safe_delete(m, label="delete", reason=str(reason))
+            try: await m.delete(reason=reason)
             except Exception: pass
     def _link_hit(self, content:str)->bool:
         for match in URL_RE.finditer(content or ""):

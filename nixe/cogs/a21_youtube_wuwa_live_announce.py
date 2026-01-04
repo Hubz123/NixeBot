@@ -1177,7 +1177,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 if not looks_like_add:
                     continue
                 try:
-                    await safe_delete(m, label='a21_youtube_wuwa_live_announce')
+                    await m.delete()
                 except Exception:
                     pass
         except Exception:
@@ -1266,13 +1266,24 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if message.author and getattr(message.author, "bot", False):
                 return
 
-            if not self.watchlist_thread_id:
-                # Fallback to configured override if not yet cached
-                if WATCHLIST_THREAD_ID_OVERRIDE:
-                    self.watchlist_thread_id = int(WATCHLIST_THREAD_ID_OVERRIDE)
-                else:
-                    return
-            if getattr(message.channel, "id", 0) != self.watchlist_thread_id:
+            ch = message.channel
+
+            # Robust watchlist thread detection:
+            # - Prefer exact thread id when known
+            # - Fallback to thread name match (avoids stale hardcoded IDs breaking auto-delete)
+            if not isinstance(ch, discord.Thread):
+                return
+
+            want_name = (WATCHLIST_THREAD_NAME or "").strip().lower()
+            ch_name = (getattr(ch, "name", "") or "").strip().lower()
+
+            if self.watchlist_thread_id and int(getattr(ch, "id", 0) or 0) == int(self.watchlist_thread_id):
+                pass
+            elif want_name and ch_name == want_name:
+                # Bind on first sight so subsequent checks use the correct id.
+                self.watchlist_thread_id = int(getattr(ch, "id", 0) or 0)
+                self.watchlist_thread = ch
+            else:
                 return
 
             # Collect text from message content and small text/json attachments
@@ -1299,7 +1310,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if not texts:
                 # still try to delete to keep thread clean
                 try:
-                    await safe_delete(message, label='a21_youtube_wuwa_live_announce')
+                    await message.delete()
                 except Exception:
                     pass
                 return
@@ -1331,7 +1342,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             # Finally delete the moderator message so the thread only keeps the store embed
             try:
-                await safe_delete(message, label='a21_youtube_wuwa_live_announce')
+                await message.delete()
             except Exception:
                 pass
 

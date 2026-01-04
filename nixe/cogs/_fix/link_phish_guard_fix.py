@@ -2,8 +2,6 @@ from __future__ import annotations
 import re, logging, discord
 from discord.ext import commands
 
-from nixe.helpers.safe_delete import safe_delete
-
 log = logging.getLogger(__name__)
 
 def _cfg(key, default=None):
@@ -40,7 +38,7 @@ class LinkPhishGuardFix(commands.Cog):
         for rx in self.patterns:
             if rx.search(hay):
                 try:
-                    await safe_delete(message, label='link_phish_guard_fix')
+                    await message.delete()
                 except Exception:
                     pass
                 try:

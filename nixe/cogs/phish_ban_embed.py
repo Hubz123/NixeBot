@@ -6,7 +6,6 @@ import discord
 from discord.ext import commands
 
 from nixe.helpers import banlog
-from nixe.helpers.safe_delete import safe_delete
 
 log = logging.getLogger("nixe.cogs.phish_ban_embed")
 
@@ -154,7 +153,7 @@ class PhishBanEmbed(commands.Cog):
                 try:
                     if not safe_data_thread or int(channel.id) != safe_data_thread:
                         msg = await channel.fetch_message(int(mid))
-                        await safe_delete(msg, label="delete")
+                        await msg.delete()
                 except Exception:
                     pass
 

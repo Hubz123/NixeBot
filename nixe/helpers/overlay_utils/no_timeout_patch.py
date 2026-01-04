@@ -149,20 +149,32 @@ def patch_guard_defer():
                 _orig = getattr(obj, "_classify")
                 if not inspect.iscoroutinefunction(_orig):
                     continue
-                async def _wrapped(self, image_bytes: bytes):
-                    try:
-                        return await _orig(self, image_bytes)
-                    except asyncio.TimeoutError:
-                        last_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1800"))
-                        if last_ms > 0:
-                            try:
-                                from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes_burst as _burst
-                                os.environ.setdefault("LPG_BURST_TIMEOUT_MS", os.getenv("LPG_BURST_TIMEOUT_MS", "1500"))
-                                ok, score, via, reason = await _burst(image_bytes)
-                                return (bool(ok), float(score), f"{via or 'gemini:lastchance'}", f"lastchance({reason})")
-                            except Exception:
-                                pass
-                        return (False, 0.0, "pending", "deferred_noexec")
+                def _make_wrapped(_orig_func):
+                    async def _wrapped(self, *args, **kwargs):
+                        try:
+                            return await _orig_func(self, *args, **kwargs)
+                        except asyncio.TimeoutError:
+                            # Support both calling conventions:
+                            #   _classify(image_bytes)
+                            #   _classify(message, image_bytes=...)
+                            image_bytes = kwargs.get('image_bytes')
+                            if image_bytes is None:
+                                for a in args:
+                                    if isinstance(a, (bytes, bytearray)):
+                                        image_bytes = bytes(a)
+                                        break
+                            last_ms = int(os.getenv('LPG_GUARD_LASTCHANCE_MS', '1800'))
+                            if last_ms > 0 and image_bytes:
+                                try:
+                                    from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes_burst as _burst
+                                    os.environ.setdefault('LPG_BURST_TIMEOUT_MS', os.getenv('LPG_BURST_TIMEOUT_MS', '1500'))
+                                    ok, score, via, reason = await _burst(bytes(image_bytes))
+                                    return (bool(ok), float(score), f"{via or 'gemini:lastchance'}", f"lastchance({reason})")
+                                except Exception:
+                                    pass
+                            return (False, 0.0, 'pending', 'deferred_noexec')
+                    return _wrapped
+                _wrapped = _make_wrapped(_orig)
                 setattr(obj, "_classify", _wrapped)
                 logger.info("[nixe-patch] guard defer patch applied on %s.%s", modname, attr)
 

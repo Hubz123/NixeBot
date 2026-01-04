@@ -1331,14 +1331,15 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             # Always refresh store embed and keep the thread clean
             try:
-                th = await self._ensure_watchlist_thread()
+                # Use the current thread directly (we are already inside the watchlist thread).
+                th = self.watchlist_thread if isinstance(getattr(self, "watchlist_thread", None), discord.Thread) else ch
                 if th:
                     await self._sync_watchlist_store_message(th)
                     store_mid = int(self.state.get("watchlist_store_mid") or 0)
                     if store_mid:
                         await self._cleanup_watchlist_thread(th, store_mid)
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning("[yt-wuwa] watchlist store sync failed (thread=%s): %r", getattr(ch, "id", "unknown"), e)
 
             # Finally delete the moderator message so the thread only keeps the store embed
             try:

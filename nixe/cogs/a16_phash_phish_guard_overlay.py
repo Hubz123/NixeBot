@@ -158,7 +158,10 @@ class PhashPhishGuard(commands.Cog):
         # WEBP pHash matching must be strict to avoid false positives.
         self.bits_max_webp: int = _env_int("PHISH_PHASH_WEBP_MAX_BITS", min(self.bits_max, 6))
         # Only enforce pHash-ban for WEBP under this size.
-        self.max_bytes: int = _env_int("PHISH_PHASH_MAX_BYTES", _env_int("PHISH_WEBP_PHASH_MAX_BYTES", 1048576))
+        self.max_bytes_webp: int = _env_int("PHISH_WEBP_PHASH_MAX_BYTES", 1048576)
+        self.max_bytes_other: int = _env_int("PHISH_PHASH_MAX_BYTES_OTHER", 3145728)
+        # If set (>0), PHISH_PHASH_MAX_BYTES overrides both caps.
+        self.max_bytes_override: int = _env_int("PHISH_PHASH_MAX_BYTES", 0)
         self.seen_ttl_sec: int = _env_int("PHISH_PHASH_SEEN_TTL_SEC", 900)
         self.guard_ids: Set[int] = _env_set("LPG_GUARD_CHANNELS")
         # Channels/threads where pHash phishing guard must NEVER act
@@ -346,7 +349,7 @@ class PhashPhishGuard(commands.Cog):
 
         # Collect candidate image attachments (filtered by PHISH_PHASH_EXTS).
         images: List[Tuple[bytes, bool]] = []  # (raw_bytes, is_webp)
-        exts_env = os.getenv("PHISH_PHASH_EXTS", "webp,png").lower()
+        exts_env = os.getenv("PHISH_PHASH_EXTS", "webp,png,jpg,jpeg,gif").lower()
         allowed_exts = tuple(sorted({('.' + e.strip().lstrip('.')) for e in exts_env.split(',') if e.strip()}))
         ct_map = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif'}
         allowed_cts = tuple(sorted({ct_map.get(ext) for ext in allowed_exts if ct_map.get(ext)}))
@@ -367,7 +370,8 @@ class PhashPhishGuard(commands.Cog):
                 size = int(getattr(a, "size", 0) or 0)
             except Exception:
                 size = 0
-            if size and size > self.max_bytes:
+            cap_pre = self.max_bytes_override if self.max_bytes_override > 0 else self.max_bytes_other
+            if size and size > cap_pre:
                 continue
 
             url = getattr(a, "url", None) or ""
@@ -378,11 +382,12 @@ class PhashPhishGuard(commands.Cog):
                 b = await a.read()
                 if not b:
                     continue
-                # Hard enforce after download as well.
-                if len(b) > self.max_bytes:
-                    continue
+                # Hard enforce after download (cap depends on detected format).
                 # Robust WEBP detection even when the filename is misleading.
                 is_webp = (ct == "image/webp") or name.endswith(".webp") or (len(b) > 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP")
+                cap_eff = self.max_bytes_override if self.max_bytes_override > 0 else (self.max_bytes_webp if is_webp else self.max_bytes_other)
+                if len(b) > cap_eff:
+                    continue
                 images.append((b, bool(is_webp)))
             except Exception:
                 continue

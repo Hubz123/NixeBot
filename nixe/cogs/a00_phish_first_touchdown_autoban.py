@@ -7,6 +7,8 @@ import os, re, io, discord
 from discord.ext import commands
 from collections import Counter
 
+ENABLE = os.getenv('PHISH_FIRST_TOUCHDOWN_AUTOBAN_ENABLE', '0') == '1'
+
 def _getenv(k,d=""): return os.getenv(k,d)
 def _csv(v): return [x.strip() for x in (v or "").split(",") if x.strip()]
 
@@ -161,4 +163,5 @@ class PhishFirstTouchdownAutoban(commands.Cog):
             await self._ban_and_embed(m)
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(PhishFirstTouchdownAutoban(bot))
+    if ENABLE:
+        await bot.add_cog(PhishFirstTouchdownAutoban(bot))

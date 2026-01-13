@@ -45,6 +45,7 @@ ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
 ANNOUNCE_CHANNEL_ID = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", 1453036422465585283)
 POLL_SECONDS = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", 20)
 CONCURRENCY = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", 8)
+NOTIFY_ROLE_ID = _env_int("NIXE_YT_WUWA_NOTIFY_ROLE_ID", 0)
 def _env_float(key: str, default: float) -> float:
     try:
         raw = os.getenv(key, "").strip()
@@ -426,7 +427,19 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         self.template: str = DEFAULT_MESSAGE_TEMPLATE
 
         self._reload_watchlist()
-        self.loop.start()
+        self._loop_started = False
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_loop_started', False):
+            return
+        self._loop_started = True
+        try:
+            if not self.loop.is_running():
+                self.loop.start()
+        except Exception:
+            pass
+
+
 
     def cog_unload(self):
         try:
@@ -684,7 +697,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         try:
             starter = await parent.send(
                 "[yt-wuwa] Watchlist thread auto-created. Paste YouTube channel links/handles here (e.g., @handle or https://www.youtube.com/@handle).",
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=allowed_mentions,
             )
             th = await starter.create_thread(
                 name=target_name,
@@ -1059,7 +1072,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     await store.edit(
                         content=f"{WATCHLIST_STORE_MARKER} (archived; superseded by {m2.id})",
                         embed=None,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                        allowed_mentions=allowed_mentions,
                     )
                 except TypeError:
                     try:
@@ -1331,15 +1344,14 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             # Always refresh store embed and keep the thread clean
             try:
-                # Use the current thread directly (we are already inside the watchlist thread).
-                th = self.watchlist_thread if isinstance(getattr(self, "watchlist_thread", None), discord.Thread) else ch
+                th = await self._ensure_watchlist_thread()
                 if th:
                     await self._sync_watchlist_store_message(th)
                     store_mid = int(self.state.get("watchlist_store_mid") or 0)
                     if store_mid:
                         await self._cleanup_watchlist_thread(th, store_mid)
-            except Exception as e:
-                log.warning("[yt-wuwa] watchlist store sync failed (thread=%s): %r", getattr(ch, "id", "unknown"), e)
+            except Exception:
+                pass
 
             # Finally delete the moderator message so the thread only keeps the store embed
             try:
@@ -1671,12 +1683,19 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         video_link = f"https://www.youtube.com/watch?v={video_id}"
         content = self._render_template(creator_name, video_link)
 
+        role_id = NOTIFY_ROLE_ID
+        if role_id:
+            content = f"<@&{role_id}> {content}"
+            allowed_mentions = discord.AllowedMentions(roles=True, users=False, everyone=False)
+        else:
+            allowed_mentions = discord.AllowedMentions.none()
+
         # Native embed mode: do NOT attach a custom embed/image; let Discord unfurl the YouTube link.
         if ANNOUNCE_NATIVE_EMBED:
             try:
                 await channel.send(
                     content=content,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                    allowed_mentions=allowed_mentions,
                 )
             except Exception as e:
                 # Never let the announce loop die due to a send error.
@@ -1698,7 +1717,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 content=content,
                 embed=embed,
                 view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=allowed_mentions,
             )
         except Exception as e:
             # Never let the announce loop die due to a send error.

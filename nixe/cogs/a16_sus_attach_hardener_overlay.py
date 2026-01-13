@@ -161,11 +161,42 @@ def _content_signals(message: discord.Message) -> Tuple[int,str]:
     return score, ",".join(reasons) or "ok"
 
 try:
-    from nixe.helpers.gemini_bridge import classify_phish_image  # async
+    # Phishing image classification MUST use GROQ_API_KEY (phishing-only).
+    # Keep the old async signature used by this cog: (images, hints, timeout_ms) -> (label, conf)
+    from nixe.helpers.groq_bridge import classify_phish_image as _classify_phish_image_sync  # sync
 except Exception as e:
-    log.debug("[sus-hard] gemini helper not available: %r", e)
-    async def classify_phish_image(images, hints: str = "", timeout_ms: int = 10000):
+    _classify_phish_image_sync = None  # type: ignore
+    log.debug("[sus-hard] groq helper not available: %r", e)
+
+async def classify_phish_image(images, hints: str = "", timeout_ms: int = 10000):
+    # Compatibility wrapper: previous implementation expected a "label, conf" tuple.
+    # We route to groq_bridge (sync) using an executor to avoid blocking the event loop.
+    if not _classify_phish_image_sync:
         return "benign", 0.0
+
+    imgs = list(images or [])
+    if not imgs:
+        return "benign", 0.0
+
+    per_timeout = max(1.0, float(timeout_ms or 10000) / 1000.0)
+    loop = asyncio.get_running_loop()
+
+    for b in imgs:
+        if not isinstance(b, (bytes, bytearray)) or not b:
+            continue
+        try:
+            res = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda bb=bytes(b): _classify_phish_image_sync(image_bytes=bb, context_text=hints)),
+                timeout=per_timeout,
+            )
+            ph = int(getattr(res, "phish", 0) or 0)
+            if ph == 1:
+                return "phish", 1.0
+        except Exception:
+            continue
+
+    return "benign", 0.0
+
 
 class SusAttachHardener(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -213,107 +244,106 @@ class SusAttachHardener(commands.Cog):
             except Exception: pass
         return blobs[:2]
 
-
-async def _collect_image_urls(self, message: discord.Message) -> List[str]:
-    """Collect image URLs (preferred for Groq vision)."""
-    urls: List[str] = []
-    for att in getattr(message, "attachments", []) or []:
-        try:
-            if isinstance(att, discord.Attachment) and (att.filename or "").lower().endswith(tuple(_IMG_EXT)) and getattr(att, "url", None):
-                urls.append(att.url)
-        except Exception:
-            pass
-    for emb in getattr(message, "embeds", []) or []:
-        try:
-            url = ""
-            if emb.image and emb.image.url:
-                url = emb.image.url
-            elif emb.thumbnail and emb.thumbnail.url:
-                url = emb.thumbnail.url
-            if url:
-                urls.append(url)
-        except Exception:
-            pass
-    seen = set()
-    out: List[str] = []
-    for u in urls:
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
-
-async def _groq_confirm_phish(self, urls: List[str], context_text: str = "") -> dict:
-    """Groq vision confirm; returns dict(phish, confidence, reason, signals). Fail-closed."""
-    import os, json
-    try:
-        import aiohttp
-    except Exception:
-        return {"phish": False, "confidence": 0.0, "reason": "aiohttp_missing", "signals": []}
-
-    api_key = os.getenv("GROQ_API_KEY", "") or ""
-    if not api_key:
-        return {"phish": False, "confidence": 0.0, "reason": "no_groq_key", "signals": []}
-
-    model = os.getenv("GROQ_MODEL_VISION", os.getenv("GROQ_MODEL", "llama-3.2-11b-vision-preview"))
-    endpoint = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-    prompt = (
-        "You are a strict, high-precision phishing detector for Discord image scams.\n"
-        "Classify phish=true ONLY if there are clear indicators of a scam or deceptive intent.\n"
-        "If it is a normal photo, artwork, game screenshot, harmless promo, or meme, return phish=false.\n"
-        "Look for cues like: fake crypto/USDT withdrawal success, promo code, claim rewards, urgent verify/login,\n"
-        "QR login, suspicious domains, brand impersonation, seed phrase, giveaway bait.\n"
-        "Return STRICT JSON only: "
-        "{\"phish\":true/false, \"confidence\":0.0-1.0, \"reason\":\"short\", \"signals\":[\"...\"]}."
-    )
-    if context_text:
-        prompt += "\nContext: " + context_text
-
-    best = {"phish": False, "confidence": 0.0, "reason": "no-match", "signals": []}
-    timeout = aiohttp.ClientTimeout(total=float(self.groq_timeout_s))
-    urls = (urls or [])[: max(1, self.groq_max_images)]
-
-    async with aiohttp.ClientSession(timeout=timeout) as sess:
-        for u in urls:
-            payload = {
-                "model": model,
-                "temperature": 0.0,
-                "max_tokens": 200,
-                "messages": [
-                    {"role": "system", "content": "You are a strict, high-precision phishing detector."},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": u}},
-                    ]},
-                ],
-            }
+    async def _collect_image_urls(self, message: discord.Message) -> List[str]:
+        """Collect image URLs (preferred for Groq vision)."""
+        urls: List[str] = []
+        for att in getattr(message, "attachments", []) or []:
             try:
-                async with sess.post(endpoint, headers=headers, json=payload) as resp:
-                    txt = await resp.text()
-                    if resp.status != 200:
-                        continue
-                    data = json.loads(txt)
-                    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
-                    m = re.search(r"\{[\s\S]*\}", content)
-                    if not m:
-                        continue
-                    obj = json.loads(m.group(0))
-                    ph = bool(obj.get("phish", False))
-                    conf = float(obj.get("confidence", 0.0) or 0.0)
-                    if ph and conf >= float(best.get("confidence", 0.0) or 0.0):
-                        best = {
-                            "phish": True,
-                            "confidence": conf,
-                            "reason": str(obj.get("reason", ""))[:200],
-                            "signals": obj.get("signals", []) if isinstance(obj.get("signals", []), list) else [],
-                        }
-                    elif (not best.get("phish")) and conf >= float(best.get("confidence", 0.0) or 0.0):
-                        best["confidence"] = conf
+                if isinstance(att, discord.Attachment) and (att.filename or "").lower().endswith(tuple(_IMG_EXT)) and getattr(att, "url", None):
+                    urls.append(att.url)
             except Exception:
-                continue
+                pass
+        for emb in getattr(message, "embeds", []) or []:
+            try:
+                url = ""
+                if emb.image and emb.image.url:
+                    url = emb.image.url
+                elif emb.thumbnail and emb.thumbnail.url:
+                    url = emb.thumbnail.url
+                if url:
+                    urls.append(url)
+            except Exception:
+                pass
+        seen = set()
+        out: List[str] = []
+        for u in urls:
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
 
-    return best
+    async def _groq_confirm_phish(self, urls: List[str], context_text: str = "") -> dict:
+        """Groq vision confirm; returns dict(phish, confidence, reason, signals). Fail-closed."""
+        import os, json
+        try:
+            import aiohttp
+        except Exception:
+            return {"phish": False, "confidence": 0.0, "reason": "aiohttp_missing", "signals": []}
+
+        api_key = os.getenv("GROQ_API_KEY", "") or ""
+        if not api_key:
+            return {"phish": False, "confidence": 0.0, "reason": "no_groq_key", "signals": []}
+
+        model = os.getenv("GROQ_MODEL_VISION", os.getenv("GROQ_MODEL", "llama-3.2-11b-vision-preview"))
+        endpoint = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+        prompt = (
+            "You are a strict, high-precision phishing detector for Discord image scams.\n"
+            "Classify phish=true ONLY if there are clear indicators of a scam or deceptive intent.\n"
+            "If it is a normal photo, artwork, game screenshot, harmless promo, or meme, return phish=false.\n"
+            "Look for cues like: fake crypto/USDT withdrawal success, promo code, claim rewards, urgent verify/login,\n"
+            "QR login, suspicious domains, brand impersonation, seed phrase, giveaway bait.\n"
+            "Return STRICT JSON only: "
+            "{\"phish\":true/false, \"confidence\":0.0-1.0, \"reason\":\"short\", \"signals\":[\"...\"]}."
+        )
+        if context_text:
+            prompt += "\nContext: " + context_text
+
+        best = {"phish": False, "confidence": 0.0, "reason": "no-match", "signals": []}
+        timeout = aiohttp.ClientTimeout(total=float(self.groq_timeout_s))
+        urls = (urls or [])[: max(1, self.groq_max_images)]
+
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            for u in urls:
+                payload = {
+                    "model": model,
+                    "temperature": 0.0,
+                    "max_tokens": 200,
+                    "messages": [
+                        {"role": "system", "content": "You are a strict, high-precision phishing detector."},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": u}},
+                        ]},
+                    ],
+                }
+                try:
+                    async with sess.post(endpoint, headers=headers, json=payload) as resp:
+                        txt = await resp.text()
+                        if resp.status != 200:
+                            continue
+                        data = json.loads(txt)
+                        content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+                        m = re.search(r"\{[\s\S]*\}", content)
+                        if not m:
+                            continue
+                        obj = json.loads(m.group(0))
+                        ph = bool(obj.get("phish", False))
+                        conf = float(obj.get("confidence", 0.0) or 0.0)
+                        if ph and conf >= float(best.get("confidence", 0.0) or 0.0):
+                            best = {
+                                "phish": True,
+                                "confidence": conf,
+                                "reason": str(obj.get("reason", ""))[:200],
+                                "signals": obj.get("signals", []) if isinstance(obj.get("signals", []), list) else [],
+                            }
+                        elif (not best.get("phish")) and conf >= float(best.get("confidence", 0.0) or 0.0):
+                            best["confidence"] = conf
+                except Exception:
+                    continue
+
+        return best
 
     @commands.Cog.listener("on_message")
     async def _on_message(self, message: discord.Message):
@@ -381,7 +411,7 @@ async def _groq_confirm_phish(self, urls: List[str], context_text: str = "") -> 
             imgs = await self._collect_images(message)
             if imgs:
                 if self.verbose:
-                    log.debug("[sus-hard] gem try: imgs=%d thr=%.2f timeout=%dms", len(imgs), self.gem_thr, self.gem_timeout)
+                    log.debug("[sus-hard] groq try: imgs=%d thr=%.2f timeout=%dms", len(imgs), self.gem_thr, self.gem_timeout)
                 try:
                     label, conf = await classify_phish_image(imgs, hints=self.gem_hints, timeout_ms=self.gem_timeout)
                     if label == "phish" and conf >= self.gem_thr:
@@ -389,12 +419,12 @@ async def _groq_confirm_phish(self, urls: List[str], context_text: str = "") -> 
                         reasons.append(f"gemini-phish@{conf:.2f}")
                         log.warning("[sus-hard] gemini-phish detected: conf=%.3f thr=%.2f", conf, self.gem_thr)
                     elif self.verbose:
-                        log.debug("[sus-hard] gem classify: (%s, %.3f) thr=%.2f", label, conf, self.gem_thr)
+                        log.debug("[sus-hard] groq classify: (%s, %.3f) thr=%.2f", label, conf, self.gem_thr)
                 except Exception as e:
-                    log.warning("[sus-hard] gem error: %r", e)
+                    log.warning("[sus-hard] groq error: %r", e)
             else:
                 if self.verbose:
-                    log.debug("[sus-hard] gem skip: no images collected")
+                    log.debug("[sus-hard] groq skip: no images collected")
 
         if total_score >= self.delete_threshold:
             try:
@@ -402,6 +432,7 @@ async def _groq_confirm_phish(self, urls: List[str], context_text: str = "") -> 
                 log.warning("[sus-hard] deleted in %s (score=%s reasons=%s)", message.channel.id, total_score, ";".join(reasons))
             except Exception as e:
                 log.warning("[sus-hard] delete failed: %r", e)
+
 
 
 async def setup(bot):

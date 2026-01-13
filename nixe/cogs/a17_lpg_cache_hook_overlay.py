@@ -57,12 +57,13 @@ class LPGCacheHook(commands.Cog):
             exact_ent = None
             sim_ent = None
             sim_dist = None
+            cache_hint = ""
             try:
                 from nixe.helpers import lpg_cache_memory as cache
                 exact_ent = cache.get_exact(image_bytes)
                 # Legacy behaviour: allow exact hit to short-circuit if not limited to error-only.
                 if exact_ent and not self.fallback_on_error_only:
-                    return exact_ent["ok"], exact_ent["score"], "cache:sha1", "hit"
+                    cache_hint = "cache_hit_sha1"
                 sim = cache.get_similar(image_bytes, self.maxdist)
                 if sim:
                     sim_ent, sim_dist = sim
@@ -71,16 +72,22 @@ class LPGCacheHook(commands.Cog):
                         and sim_ent.get("ok")
                         and float(sim_ent.get("score", 0.0)) >= self.sim_ok_min
                     ):
-                        # Similar-positive hit can short-circuit only when error-only fallback is disabled.
-                        return True, float(sim_ent.get("score", 0.0)), "cache:ahash", f"dist={sim_dist}"
+                        # Similar-positive hit is recorded but does NOT short-circuit.
+                        cache_hint = f"cache_hit_ahash:dist={sim_dist}"
             except Exception:
                 # cache failures must never break classify
                 exact_ent = None
                 sim_ent = None
                 sim_dist = None
+                cache_hint = ""
 
             # Call provider (shield/burst pipeline under the hood)
             ok, score, via, reason = await self._orig(image_bytes, *args, **kwargs)
+            try:
+                if cache_hint and isinstance(reason, str) and reason:
+                    reason = f"{reason};{cache_hint}"
+            except Exception:
+                pass
 
             # Decide whether provider result looks like a transport/timeout error.
             rlow = str(reason or "").lower()

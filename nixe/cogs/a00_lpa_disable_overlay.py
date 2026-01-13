@@ -13,7 +13,19 @@ class LPAutoDisableOverlay(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.log = logging.getLogger(__name__)
-        self._task = bot.loop.create_task(self._apply())
+        self._task = None
+        self._started = False
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_started', False):
+            return
+        self._started = True
+        try:
+            self._task = asyncio.create_task(self._apply())
+        except Exception:
+            self._task = None
+
+
 
     async def _apply(self):
         await self.bot.wait_until_ready()

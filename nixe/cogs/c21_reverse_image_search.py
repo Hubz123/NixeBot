@@ -295,7 +295,8 @@ class ReverseImageCog(commands.Cog):
     async def on_ready(self):
         # Delay registration until the bot is fully ready.
         if not self._registered:
-            self.bot.loop.create_task(self._ensure_registered())
+            import asyncio
+            asyncio.create_task(self._ensure_registered())
 
 
 async def setup(bot: commands.Bot):

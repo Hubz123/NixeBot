@@ -36,7 +36,18 @@ def _render(items):
 class LpgMemoryBoard(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self._task = asyncio.create_task(self._boot())
+        self._task = None
+        self._started = False
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_started', False):
+            return
+        self._started = True
+        try:
+            self._task = asyncio.create_task(self._boot())
+        except Exception:
+            self._task = None
+
 
     async def _boot(self):
         await self.bot.wait_until_ready()

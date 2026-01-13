@@ -31,6 +31,23 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+def _force_utf8_stdio() -> None:
+    """Force UTF-8 stdio to avoid UnicodeEncodeError on Windows pipes.
+
+    In `tools/smoketest_super.py`, this script is executed with stdout captured
+    via a pipe. On Windows, the default stdio encoding can be non-UTF-8 and can
+    raise UnicodeEncodeError when printing Japanese/Unicode channel names.
+    """
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        # Best-effort only; never crash verifier due to encoding configuration.
+        pass
+
+
 DEFAULT_TIMEOUT_SEC = 60
 
 
@@ -143,6 +160,7 @@ def resolve_json_path(maybe_path: Optional[str]) -> Path:
 
 
 def main() -> None:
+    _force_utf8_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument("json_path", nargs="?", default=None, help="Path ke youtube_wuwa_watchlist.json (opsional)")
     ap.add_argument("--sleep", type=float, default=2.0, help="Delay antar channel (detik)")

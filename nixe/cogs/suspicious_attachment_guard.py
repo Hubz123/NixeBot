@@ -134,11 +134,41 @@ def _content_signals(message: discord.Message) -> Tuple[int,str]:
     return score, ",".join(reasons) or "ok"
 
 try:
-    from nixe.helpers.gemini_bridge import classify_phish_image  # async
+    # Phishing image classification MUST use GROQ_API_KEY (phishing-only).
+    # Keep the old async signature used by this cog: (images, hints, timeout_ms) -> (label, conf)
+    from nixe.helpers.groq_bridge import classify_phish_image as _classify_phish_image_sync  # sync
 except Exception as e:
-    log.debug("[sus-attach] gemini helper not available: %r", e)
-    async def classify_phish_image(images, hints: str = "", timeout_ms: int = 10000):
+    _classify_phish_image_sync = None  # type: ignore
+    log.debug("[sus-attach] groq helper not available: %r", e)
+
+async def classify_phish_image(images, hints: str = "", timeout_ms: int = 10000):
+    # Compatibility wrapper: previous implementation expected a "label, conf" tuple.
+    # We route to groq_bridge (sync) using an executor to avoid blocking the event loop.
+    if not _classify_phish_image_sync:
         return "benign", 0.0
+
+    imgs = list(images or [])
+    if not imgs:
+        return "benign", 0.0
+
+    per_timeout = max(1.0, float(timeout_ms or 10000) / 1000.0)
+    loop = asyncio.get_running_loop()
+
+    for b in imgs:
+        if not isinstance(b, (bytes, bytearray)) or not b:
+            continue
+        try:
+            res = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda bb=bytes(b): _classify_phish_image_sync(image_bytes=bb, context_text=hints)),
+                timeout=per_timeout,
+            )
+            ph = int(getattr(res, "phish", 0) or 0)
+            if ph == 1:
+                return "phish", 1.0
+        except Exception:
+            continue
+
+    return "benign", 0.0
 
 try:
     from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes_suspicious  # async
@@ -275,10 +305,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
         if try_gem:
             imgs = await self._collect_images(message)
             if imgs:
-                log.info("[sus-attach] gem try: imgs=%d thr=%.2f timeout=%dms", len(imgs), self.gem_thr, self.gem_timeout)
+                log.info("[sus-attach] groq try: imgs=%d thr=%.2f timeout=%dms", len(imgs), self.gem_thr, self.gem_timeout)
                 try:
                     label, conf = await classify_phish_image(imgs, hints=self.gem_hints, timeout_ms=self.gem_timeout)
-                    log.info("[sus-attach] gem classify: (%s, %.3f) thr=%.2f", label, conf, self.gem_thr)
+                    log.info("[sus-attach] groq classify: (%s, %.3f) thr=%.2f", label, conf, self.gem_thr)
                     if label == "phish" and conf >= self.gem_thr:
                         total_score = max(total_score, self.delete_threshold)
                         reasons.append(f"gemini-phish@{conf:.2f}")
@@ -290,9 +320,9 @@ class SuspiciousAttachmentGuard(commands.Cog):
                         except Exception as e:
                             log.warning("[sus-attach] ban failed: %r", e)
                 except Exception as e:
-                    log.warning("[sus-attach] gem error: %r", e)
+                    log.warning("[sus-attach] groq error: %r", e)
             else:
-                log.info("[sus-attach] gem skip: no images collected")
+                log.info("[sus-attach] groq skip: no images collected")
 
         # If there is an archive attachment (.zip/.rar/...) plus suspicious content,
         # treat this as definitely malicious so we at least delete (and optionally ban).

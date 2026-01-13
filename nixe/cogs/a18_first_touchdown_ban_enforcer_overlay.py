@@ -55,7 +55,26 @@ async def _patch_instance(bot: commands.Bot, cog: commands.Cog):
 class FirstTouchdownBanEnforcer(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._task = bot.loop.create_task(self._install())
+        self._task = None
+        self._started = False
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # Start only when the client is ready (and avoid bot.loop access).
+        if self._started:
+            return
+        self._started = True
+        try:
+            self._task = asyncio.create_task(self._install())
+        except Exception:
+            self._task = None
+
+    def cog_unload(self):
+        try:
+            if self._task and not self._task.done():
+                self._task.cancel()
+        except Exception:
+            pass
 
     async def _install(self):
         await asyncio.sleep(0.5)

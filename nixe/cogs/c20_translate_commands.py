@@ -26,7 +26,7 @@ Optional configs (runtime_env.json or env):
   TRANSLATE_SLASH_ENABLE=1
   TRANSLATE_GUILD_ID=<single guild id>
   TRANSLATE_GUILD_IDS=<comma separated ids>
-  TRANSLATE_ALLOW_FALLBACK=1  (allow fallback to GEMINI_API_KEY / GEMINI_API_KEY_B)
+  TRANSLATE_ALLOW_FALLBACK=0  (deprecated; no fallback to non-translate keys is allowed)
   TRANSLATE_JA_DUAL_ENABLE=1   (if target_lang is JA, output formal+casual+romaji)
   TRANSLATE_JA_ROMAJI_ENABLE=1 (enable romaji field in JA dual mode)
   REVERSE_IMAGE_ENABLE=1       (enable Reverse image context menu)
@@ -485,37 +485,32 @@ def _pick_provider() -> str:
     """
     return "gemini"
 def _pick_gemini_key() -> str:
-    key = _env("TRANSLATE_GEMINI_API_KEY", "")
-    if key:
-        return key
-    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        return _env("GEMINI_API_KEY", _env("GEMINI_API_KEY_B", _env("GEMINI_BACKUP_API_KEY", "")))
-    return ""
+    """Translate must use TRANSLATE_GEMINI_API_KEY ONLY.
+    No fallback to LPG keys (GEMINI_API_KEY/GEMINI_API_KEY_B) is allowed.
+    """
+    key = (_env("TRANSLATE_GEMINI_API_KEY", "") or "").strip()
+    return key
+
 
 def _pick_groq_key() -> str:
-    key = _env("TRANSLATE_GROQ_API_KEY", "")
-    if key:
-        return key
-    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        return _env("GROQ_API_KEY", "")
-    return ""
+    """Translate Groq (optional) must use TRANSLATE_GROQ_API_KEY ONLY.
+    No fallback to GROQ_API_KEY is allowed (GROQ_API_KEY is phishing-only).
+    """
+    key = (_env("TRANSLATE_GROQ_API_KEY", "") or "").strip()
+    return key
+
 
 def _pick_groq_qc_key() -> str:
-    # In your runtime, GEMINI_API_KEY_B may actually store a Groq "LPG backup" key.
-    # Prefer that for QC, but allow an explicit override.
-    key = _env("TRANSLATE_GROQ_QC_API_KEY", "").strip()
+    """Translate QC key selection.
+    Must NOT reuse LPG keys or phishing keys.
+    Allowed: TRANSLATE_GROQ_QC_API_KEY, then TRANSLATE_GROQ_API_KEY.
+    """
+    key = (_env("TRANSLATE_GROQ_QC_API_KEY", "") or "").strip()
     if key:
         return key
-    key = _env("GEMINI_API_KEY_B", "").strip()
-    if key:
-        return key
-    # As a last resort, reuse the translate Groq key if present.
-    key = _env("TRANSLATE_GROQ_API_KEY", "").strip()
-    if key:
-        return key
-    if _as_bool("TRANSLATE_ALLOW_FALLBACK", False):
-        return _env("GROQ_API_KEY", "").strip()
-    return ""
+    key = (_env("TRANSLATE_GROQ_API_KEY", "") or "").strip()
+    return key
+
 
 
 # -------------------------
@@ -2287,17 +2282,18 @@ class TranslateCommands(commands.Cog):
     async def on_ready(self):
         # ensure commands registered after ready (Render-safe)
         if not self._registered:
-            self.bot.loop.create_task(self._ensure_registered())
+            self._ensure_task = None
+        # scheduled in on_ready to keep dry-run safe
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
         if _translate_guild_ids():
             return  # explicit list; don't auto-add
         self._registered = False
-        self.bot.loop.create_task(self._ensure_registered())
+        self._ensure_task = None
+
+        # scheduled in on_ready to keep dry-run safe
 
 async def setup(bot: commands.Bot):
     cog = TranslateCommands(bot)
     await bot.add_cog(cog)
-    # register after ready
-    bot.loop.create_task(cog._ensure_registered())

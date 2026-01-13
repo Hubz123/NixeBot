@@ -9,8 +9,8 @@ from discord.ext import commands
 log = logging.getLogger(__name__)
 
 from nixe.helpers.env_reader import get as _cfg_get
-API_KEY = _cfg_get('GEMINI_API_KEY') or os.getenv("GEMINI_API_KEY")
-DEFAULT_MODEL = _cfg_get('GEMINI_MODEL', 'gemini-2.5-flash')
+API_KEY = _cfg_get('TRANSLATE_GEMINI_API_KEY') or os.getenv("TRANSLATE_GEMINI_API_KEY")
+DEFAULT_MODEL = _cfg_get('TRANSLATE_GEMINI_MODEL', 'gemini-2.5-flash')
 
 class GeminiHealth(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -21,7 +21,7 @@ class GeminiHealth(commands.Cog):
     @commands.command(name="gemini-check")
     async def gemini_check(self, ctx: commands.Context, model: Optional[str]=None):
         if not API_KEY:
-            await ctx.reply("Gemini API key belum di-set (GEMINI_API_KEY/GEMINI_API_KEY).", mention_author=False)
+            await ctx.reply("Gemini translate API key belum di-set (TRANSLATE_GEMINI_API_KEY).", mention_author=False)
             return
         mdl = model or DEFAULT_MODEL
         base = "https://generativelanguage.googleapis.com/v1beta"

@@ -1,3 +1,0 @@
-
-# Dedicated channel for TESTBAN embeds
-TESTBAN_CHANNEL_ID = 936690788946030613

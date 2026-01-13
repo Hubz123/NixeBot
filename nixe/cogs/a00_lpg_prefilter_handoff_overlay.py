@@ -129,24 +129,17 @@ class LPGPrefilterHandoff(commands.Cog):
                     self.bot.dispatch("nixe_unusual_image_prefilter", message, {"name": name, "ct": ctype, "actual": actual})
                 except Exception:
                     pass
-                # optional: warmup Groq once so cold-start won't RTO
-                if os.getenv("PHISH_WARMUP_GROQ","1") == "1":
-                    asyncio.create_task(self._warmup_groq())
+                # Optional: warmup Groq once so cold-start won't RTO.
+                # IMPORTANT: do NOT use GROQ_API_KEY here. LPG-only pipeline
+                # must never consume the phishing key. If you want a warmup,
+                # a phishing cog should handle it.
+                if os.getenv("PHISH_WARMUP_GROQ", "1") == "1":
+                    try:
+                        self.bot.dispatch("nixe_phish_warmup_groq")
+                    except Exception:
+                        pass
         except Exception as e:
             log.debug("[lpg-prefilter] err: %r", e)
-
-    async def _warmup_groq(self):
-        try:
-            import aiohttp, os
-            timeout = aiohttp.ClientTimeout(total=3.0)
-            async with aiohttp.ClientSession(timeout=timeout) as sess:
-                url = "https://api.groq.com/openai/v1/models"
-                headers = {"Authorization": f"Bearer {os.getenv('GROQ_API_KEY','')}"}
-                async with sess.get(url, headers=headers) as resp:
-                    await resp.text()
-            log.info("[lpg-prefilter] GROQ warmup ok")
-        except Exception:
-            pass
 
 async def setup(bot):
     await bot.add_cog(LPGPrefilterHandoff(bot))

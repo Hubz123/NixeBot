@@ -1,283 +1,571 @@
 {
   "enabled": true,
   "announce_channel_id": 1453036422465585283,
-  "poll_seconds": 90,
-  "concurrency": 4,
+  "poll_seconds": 20,
+  "concurrency": 8,
   "title_whitelist_regex": "#?鳴潮|Wuthering\\s*Waves|WuWa",
   "message_template": "Hey, {creator.name} just posted a new video!\n{video.link}",
   "targets": [
     {
+      "name": "1LLUMI(いるみ)",
+      "query": "1LLUMI(いるみ)",
+      "handle": "@1llumi3",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@1llumi3"
+    },
+    {
+      "name": "@Amane_Alice",
+      "query": "@Amane_Alice",
+      "handle": "@Amane_Alice",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Amane_Alice"
+    },
+    {
+      "name": "@AnonRemu",
+      "query": "@AnonRemu",
+      "handle": "@AnonRemu",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@AnonRemu"
+    },
+    {
+      "name": "@Bellmona",
+      "query": "@Bellmona",
+      "handle": "@Bellmona",
+      "url": "https://www.youtube.com/@Bellmona"
+    },
+    {
+      "name": "@erusha",
+      "query": "@erusha",
+      "handle": "@erusha",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@erusha"
+    },
+    {
+      "name": "@ghostdoll_y",
+      "query": "@ghostdoll_y",
+      "handle": "@ghostdoll_y",
+      "url": "https://www.youtube.com/@ghostdoll_y"
+    },
+    {
+      "name": "@HoshizonoYui",
+      "query": "@HoshizonoYui",
+      "handle": "@HoshizonoYui",
+      "url": "https://www.youtube.com/@HoshizonoYui"
+    },
+    {
+      "name": "@KOKO__virtual",
+      "query": "@KOKO__virtual",
+      "handle": "@KOKO__virtual",
+      "url": "https://www.youtube.com/@KOKO__virtual"
+    },
+    {
+      "name": "@kunue-ri-YT",
+      "query": "@kunue-ri-YT",
+      "handle": "@kunue-ri-YT",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@kunue-ri-YT"
+    },
+    {
+      "name": "@mafel.v.p",
+      "query": "@mafel.v.p",
+      "handle": "@mafel.v.p",
+      "url": "https://www.youtube.com/@mafel.v.p"
+    },
+    {
+      "name": "@milimirror",
+      "query": "@milimirror",
+      "handle": "@milimirror",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@milimirror"
+    },
+    {
+      "name": "@minaneko_mai",
+      "query": "@minaneko_mai",
+      "handle": "@minaneko_mai",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@minaneko_mai"
+    },
+    {
+      "name": "@Misaki_Hizakura",
+      "query": "@Misaki_Hizakura",
+      "handle": "@Misaki_Hizakura",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Misaki_Hizakura"
+    },
+    {
+      "name": "@nanagisamahalo",
+      "query": "@nanagisamahalo",
+      "handle": "@nanagisamahalo",
+      "url": "https://www.youtube.com/@nanagisamahalo"
+    },
+    {
+      "name": "@nanomaemuki",
+      "query": "@nanomaemuki",
+      "handle": "@nanomaemuki",
+      "url": "https://www.youtube.com/@nanomaemuki"
+    },
+    {
+      "name": "@nekogumorei",
+      "query": "@nekogumorei",
+      "handle": "@nekogumorei",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@nekogumorei"
+    },
+    {
+      "name": "@nekonosemugi",
+      "query": "@nekonosemugi",
+      "handle": "@nekonosemugi",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@nekonosemugi"
+    },
+    {
+      "name": "@pandaruki9715",
+      "query": "@pandaruki9715",
+      "handle": "@pandaruki9715",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@pandaruki9715"
+    },
+    {
+      "name": "@puu_channel",
+      "query": "@puu_channel",
+      "handle": "@puu_channel",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@puu_channel"
+    },
+    {
+      "name": "@Rika99ch",
+      "query": "@Rika99ch",
+      "handle": "@Rika99ch",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Rika99ch"
+    },
+    {
+      "name": "@Ririka_Tsukimia",
+      "query": "@Ririka_Tsukimia",
+      "handle": "@Ririka_Tsukimia",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Ririka_Tsukimia"
+    },
+    {
+      "name": "@rokoko6693",
+      "query": "@rokoko6693",
+      "handle": "@rokoko6693",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@rokoko6693"
+    },
+    {
+      "name": "@seraalara",
+      "query": "@seraalara",
+      "handle": "@seraalara",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@seraalara"
+    },
+    {
+      "name": "@SGHR210",
+      "query": "@SGHR210",
+      "handle": "@SGHR210",
+      "url": "https://www.youtube.com/@SGHR210"
+    },
+    {
+      "name": "@shizukinia",
+      "query": "@shizukinia",
+      "handle": "@shizukinia",
+      "url": "https://www.youtube.com/@shizukinia"
+    },
+    {
+      "name": "@suicho_nayusa",
+      "query": "@suicho_nayusa",
+      "handle": "@suicho_nayusa",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@suicho_nayusa"
+    },
+    {
       "name": "FALMIKA Ch. ファルミカ",
       "query": "FALMIKA Ch. ファルミカ",
       "handle": "@fal_mika",
-      "channel_id": "",
       "url": "https://www.youtube.com/@fal_mika"
+    },
+    {
+      "name": "hizakuramelia",
+      "query": "hizakuramelia",
+      "handle": "@HizakuraMelia",
+      "url": "https://www.youtube.com/@HizakuraMelia"
     },
     {
       "name": "Lisa ch.三ツ星リサ‪",
       "query": "Lisa ch.三ツ星リサ‪",
       "handle": "@333lisa_vtuber",
-      "channel_id": "",
       "url": "https://www.youtube.com/@333lisa_vtuber"
+    },
+    {
+      "name": "Lulebel  Ch. ルルベル",
+      "query": "Lulebel  Ch. ルルベル",
+      "handle": "@lulebel",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@lulebel"
+    },
+    {
+      "name": "Lunon ch. 月奏あず",
+      "query": "Lunon ch. 月奏あず",
+      "handle": "@Lunon_azu",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Lunon_azu"
+    },
+    {
+      "name": "Matsuri Channel 夏色まつり",
+      "query": "Matsuri Channel 夏色まつり",
+      "handle": "@NatsuiroMatsuri",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@NatsuiroMatsuri"
+    },
+    {
+      "name": "Merin Ch. 紫乃 めりん。",
+      "query": "Merin Ch. 紫乃 めりん。",
+      "handle": "@merin0402",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@merin0402"
     },
     {
       "name": "Mero Ch. / 蝶望メロ",
       "query": "Mero Ch. / 蝶望メロ",
       "handle": "@chiyono_mero",
-      "channel_id": "",
       "url": "https://www.youtube.com/@chiyono_mero"
     },
     {
-      "name": "サボり屋ニコ",
-      "query": "サボり屋ニコ",
-      "handle": "@nico_saboriya",
+      "name": "Petr Petrichor ch / ペトル・ペトリコール",
+      "query": "Petr Petrichor ch / ペトル・ペトリコール",
+      "handle": "@PetrPetrichorCH",
       "channel_id": "",
-      "url": "https://www.youtube.com/@nico_saboriya"
+      "url": "https://www.youtube.com/@PetrPetrichorCH"
     },
     {
-      "name": "シャルロット・リリー / CharlotteLily",
-      "query": "シャルロット・リリー / CharlotteLily",
-      "handle": "@CharlotteLilyVT",
+      "name": "slnio_SAME",
+      "query": "slnio_SAME",
+      "handle": "@slnio_same0022",
       "channel_id": "",
-      "url": "https://www.youtube.com/@CharlotteLilyVT"
+      "url": "https://www.youtube.com/@slnio_same0022"
+    },
+    {
+      "name": "UCm2gbO8BoBgSFtDM_aQKmIw",
+      "query": "UCm2gbO8BoBgSFtDM_aQKmIw",
+      "handle": "",
+      "channel_id": "UCm2gbO8BoBgSFtDM_aQKmIw",
+      "url": "https://www.youtube.com/channel/UCm2gbO8BoBgSFtDM_aQKmIw"
+    },
+    {
+      "name": "Yusura Renoa Ch. / 桜桃れのあ",
+      "query": "Yusura Renoa Ch. / 桜桃れのあ",
+      "handle": "",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@%E6%A1%9C%E6%A1%83%E3%82%8C%E3%81%AE%E3%81%82"
+    },
+    {
+      "name": "Yö Channel.灯月ユオ",
+      "query": "Yö Channel.灯月ユオ",
+      "handle": "@touzukiyo",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@touzukiyo"
+    },
+    {
+      "name": "あまのみこ",
+      "query": "あまのみこ",
+      "handle": "@AmanoMiko",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@AmanoMiko"
     },
     {
       "name": "たまﾁｬﾝ / Tamaya Hanabi",
       "query": "たまﾁｬﾝ / Tamaya Hanabi",
       "handle": "@tama_00x00",
-      "channel_id": "",
       "url": "https://www.youtube.com/@tama_00x00"
+    },
+    {
+      "name": "なぁぁ",
+      "query": "なぁぁ",
+      "handle": "@naa_VT",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@naa_VT"
+    },
+    {
+      "name": "ににに",
+      "query": "ににに",
+      "handle": "",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@%E3%81%82%E3%81%84%E3%81%A9%E3%82%8B%E3%81%AB%E3%81%AB"
+    },
+    {
+      "name": "ぱいん丸 / Pinemaru",
+      "query": "ぱいん丸 / Pinemaru",
+      "handle": "@pinemaru0408",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@pinemaru0408"
     },
     {
       "name": "ほこり。",
       "query": "ほこり。",
       "handle": "@0_hokori",
-      "channel_id": "",
       "url": "https://www.youtube.com/@0_hokori"
     },
     {
       "name": "まんまる manmaru ch.",
       "query": "まんまる manmaru ch.",
       "handle": "@manmaruch-onigami",
-      "channel_id": "",
       "url": "https://www.youtube.com/@manmaruch-onigami"
     },
     {
       "name": "ゆっきー",
       "query": "ゆっきー",
       "handle": "@yukky__neko",
-      "channel_id": "",
       "url": "https://www.youtube.com/@yukky__neko"
     },
     {
       "name": "わぬ太 / wanuta",
       "query": "わぬ太 / wanuta",
       "handle": "@wanuta_v",
-      "channel_id": "",
       "url": "https://www.youtube.com/@wanuta_v"
+    },
+    {
+      "name": "サボり屋ニコ",
+      "query": "サボり屋ニコ",
+      "handle": "@nico_saboriya",
+      "url": "https://www.youtube.com/@nico_saboriya"
+    },
+    {
+      "name": "シャルロット・リリー / CharlotteLily",
+      "query": "シャルロット・リリー / CharlotteLily",
+      "handle": "@CharlotteLilyVT",
+      "url": "https://www.youtube.com/@CharlotteLilyVT"
+    },
+    {
+      "name": "ルーチェ / Luce",
+      "query": "ルーチェ / Luce",
+      "handle": "@LuceDoll",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@LuceDoll"
     },
     {
       "name": "九条レイ / Kujo Rei",
       "query": "九条レイ / Kujo Rei",
       "handle": "@Kujo_Rei",
-      "channel_id": "",
       "url": "https://www.youtube.com/@Kujo_Rei"
+    },
+    {
+      "name": "冬乃 六花 -Fuyuno Rikka-",
+      "query": "冬乃 六花 -Fuyuno Rikka-",
+      "handle": "@Fuyuno_Rikka",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Fuyuno_Rikka"
     },
     {
       "name": "冬陽リッカ_Fuyubi Rikka",
       "query": "冬陽リッカ_Fuyubi Rikka",
       "handle": "@Fuyubi06",
-      "channel_id": "",
       "url": "https://www.youtube.com/@Fuyubi06"
     },
     {
       "name": "咎神テトラ",
       "query": "咎神テトラ",
       "handle": "@togamitetora",
-      "channel_id": "UCq5dZHvUcJSOi1Q-wfIpRPg",
-      "url": "https://www.youtube.com/channel/UCq5dZHvUcJSOi1Q-wfIpRPg"
+      "url": "https://www.youtube.com/@togamitetora"
+    },
+    {
+      "name": "咲摩くるみ /Sakuma Kurumi",
+      "query": "咲摩くるみ /Sakuma Kurumi",
+      "handle": "@Sakumakurumi",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Sakumakurumi"
     },
     {
       "name": "夜魅ちゃんねる",
       "query": "夜魅ちゃんねる",
       "handle": "@Yomi_Vtuber",
-      "channel_id": "",
       "url": "https://www.youtube.com/@Yomi_Vtuber"
+    },
+    {
+      "name": "天天りか -Amagami Rika-",
+      "query": "天天りか -Amagami Rika-",
+      "handle": "@amagami_rika",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@amagami_rika"
     },
     {
       "name": "天音るな Amane Luna",
       "query": "天音るな Amane Luna",
       "handle": "@Nekoluna000x",
-      "channel_id": "UCHQNyoV6t6FdEVnQ49k37Xw",
-      "url": "https://www.youtube.com/channel/UCHQNyoV6t6FdEVnQ49k37Xw"
+      "url": "https://www.youtube.com/@Nekoluna000x"
+    },
+    {
+      "name": "姫川あまゆ-Himekawa Amayou-",
+      "query": "姫川あまゆ-Himekawa Amayou-",
+      "handle": "@amayoutxt",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@amayoutxt"
+    },
+    {
+      "name": "宮月コノ",
+      "query": "宮月コノ",
+      "handle": "@Konochannel",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Konochannel"
+    },
+    {
+      "name": "小熊猫 ひな -Kogumaneko Hina-",
+      "query": "小熊猫 ひな -Kogumaneko Hina-",
+      "handle": "@Kogumaneko_Hina",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Kogumaneko_Hina"
     },
     {
       "name": "廿楽ない / Tsuzura Nai",
       "query": "廿楽ない / Tsuzura Nai",
       "handle": "@tsuzura_nai",
-      "channel_id": "UCsTx1obr-7rszy0f5RgyKvA",
-      "url": "https://www.youtube.com/channel/UCsTx1obr-7rszy0f5RgyKvA"
+      "url": "https://www.youtube.com/@tsuzura_nai"
     },
     {
       "name": "徘徊カイ -Hai kai Kai-",
       "query": "徘徊カイ -Hai kai Kai-",
       "handle": "@haikai_111",
-      "channel_id": "",
       "url": "https://www.youtube.com/@haikai_111"
     },
     {
       "name": "恋ノ病ねこ / konoyami neko",
       "query": "恋ノ病ねこ / konoyami neko",
       "handle": "@konoyami_neko",
-      "channel_id": "",
       "url": "https://www.youtube.com/@konoyami_neko"
     },
     {
       "name": "早乙女ぱおら / Saotome Paola",
       "query": "早乙女ぱおら / Saotome Paola",
       "handle": "@paola666",
-      "channel_id": "",
       "url": "https://www.youtube.com/@paola666"
+    },
+    {
+      "name": "星宮ちょこ / Hoshimiya Choco",
+      "query": "星宮ちょこ / Hoshimiya Choco",
+      "handle": "@hoshimiyachoco",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@hoshimiyachoco"
+    },
+    {
+      "name": "朱坂あさ / Akasaka Asa",
+      "query": "朱坂あさ / Akasaka Asa",
+      "handle": "@akasakaasa",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@akasakaasa"
+    },
+    {
+      "name": "桜狐フェネ",
+      "query": "桜狐フェネ",
+      "handle": "@sakuracofene",
+      "url": "https://www.youtube.com/@sakuracofene"
     },
     {
       "name": "汐音りさ【Sion Risa】",
       "query": "汐音りさ【Sion Risa】",
       "handle": "@sion_risa",
-      "channel_id": "",
       "url": "https://www.youtube.com/@sion_risa"
     },
     {
       "name": "湊瀬もこ / minase moco",
       "query": "湊瀬もこ / minase moco",
       "handle": "@minase_moco",
-      "channel_id": "",
       "url": "https://www.youtube.com/@minase_moco"
+    },
+    {
+      "name": "狐酔ゆら / Koyoi Yura",
+      "query": "狐酔ゆら / Koyoi Yura",
+      "handle": "@KoyoiYura",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@KoyoiYura"
     },
     {
       "name": "猫ノ瀬 むぎ",
       "query": "猫ノ瀬 むぎ",
-      "handle": "",
-      "channel_id": "UCeTfrESQDWxo2874tq3V_YA",
       "url": "https://www.youtube.com/channel/UCeTfrESQDWxo2874tq3V_YA"
+    },
+    {
+      "name": "猫宮 れお / Nekomiya Leo",
+      "query": "猫宮 れお / Nekomiya Leo",
+      "handle": "@Nekomiya_Leo",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Nekomiya_Leo"
+    },
+    {
+      "name": "猫戸ネル~Nekoto Neru~",
+      "query": "猫戸ネル~Nekoto Neru~",
+      "handle": "@nek0t0_neru",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@nek0t0_neru"
     },
     {
       "name": "甘音おゆ / AmaneOyu",
       "query": "甘音おゆ / AmaneOyu",
       "handle": "@AmaneOyu",
-      "channel_id": "",
       "url": "https://www.youtube.com/@AmaneOyu"
     },
     {
       "name": "白樺るるは",
       "query": "白樺るるは",
       "handle": "@shirakabaruruha",
-      "channel_id": "",
       "url": "https://www.youtube.com/@shirakabaruruha"
+    },
+    {
+      "name": "紅乃みやこ(KurenoMiyako)",
+      "query": "紅乃みやこ(KurenoMiyako)",
+      "handle": "@KurenoMiyako",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@KurenoMiyako"
     },
     {
       "name": "紬絆めい",
       "query": "紬絆めい",
       "handle": "@TsumugiMei_ch",
-      "channel_id": "",
       "url": "https://www.youtube.com/@TsumugiMei_ch"
+    },
+    {
+      "name": "群青ロマン / Gunjo Roman",
+      "query": "群青ロマン / Gunjo Roman",
+      "handle": "@GunjoRoman",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@GunjoRoman"
     },
     {
       "name": "葫白ひな(cohakuhina)⛪🧄Vtuber",
       "query": "葫白ひな(cohakuhina)⛪🧄Vtuber",
       "handle": "@cohakuhina",
-      "channel_id": "",
       "url": "https://www.youtube.com/@cohakuhina"
     },
     {
       "name": "蒼桜 すぴか -Aoi Spica-",
       "query": "蒼桜 すぴか -Aoi Spica-",
       "handle": "@spica_aoi",
-      "channel_id": "",
       "url": "https://www.youtube.com/@spica_aoi"
     },
     {
       "name": "虎鈴ととら / KOSUZU TOTORA",
       "query": "虎鈴ととら / KOSUZU TOTORA",
       "handle": "@kosuzu_totora",
-      "channel_id": "",
       "url": "https://www.youtube.com/@kosuzu_totora"
+    },
+    {
+      "name": "詩星 白亜",
+      "query": "詩星 白亜",
+      "handle": "@color_hakua",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@color_hakua"
     },
     {
       "name": "雪咲ゆうか / Yuuka Yukisaki",
       "query": "雪咲ゆうか / Yuuka Yukisaki",
       "handle": "@yukisaki_yuuka",
-      "channel_id": "",
       "url": "https://www.youtube.com/@yukisaki_yuuka"
     },
     {
       "name": "雪音ムツキ-Yukine Mutsuki-",
       "query": "雪音ムツキ-Yukine Mutsuki-",
       "handle": "@Mutsuki_Yukine",
-      "channel_id": "",
       "url": "https://www.youtube.com/@Mutsuki_Yukine"
-    },
-    {
-      "name": "@ghostdoll_y",
-      "query": "ghostdoll_y",
-      "handle": "@ghostdoll_y",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@ghostdoll_y"
-    },
-    {
-      "name": "@sakuracofene",
-      "query": "sakuracofene",
-      "handle": "@sakuracofene",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@sakuracofene"
-    },
-    {
-      "name": "hizakuramelia",
-      "query": "hizakuramelia",
-      "handle": "@HizakuraMelia",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@HizakuraMelia"
-    },
-    {
-      "name": "桜狐フェネ",
-      "query": "桜狐フェネ",
-      "handle": "@sakuracofene",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@sakuracofene"
-    },
-    {
-      "name": "@shizukinia",
-      "query": "shizukinia",
-      "handle": "@shizukinia",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@shizukinia"
-    },
-    {
-      "name": "@KOKO__virtual",
-      "query": "KOKO__virtual",
-      "handle": "@KOKO__virtual",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@KOKO__virtual"
-    },
-    {
-      "name": "@mafel.v.p",
-      "query": "mafel.v.p",
-      "handle": "@mafel.v.p",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@mafel.v.p"
-    },
-    {
-      "name": "@nanagisamahalo",
-      "query": "nanagisamahalo",
-      "handle": "@nanagisamahalo",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@nanagisamahalo"
-    },
-    {
-      "name": "@nanomaemuki",
-      "query": "nanomaemuki",
-      "handle": "@nanomaemuki",
-      "channel_id": "",
-      "url": "https://www.youtube.com/@nanomaemuki"
     }
-  ]
+  ],
+  "announce_native_embed": true
 }

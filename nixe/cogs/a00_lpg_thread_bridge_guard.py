@@ -5,10 +5,8 @@ import discord
 from discord.ext import commands
 from nixe.helpers.persona_loader import load_persona, pick_line
 from nixe.helpers.persona_gate import should_run_persona
-try:
-    from nixe.helpers.gemini_bridge import classify_lucky_pull_bytes
-except Exception:
-    classify_lucky_pull_bytes = None
+import nixe.helpers.gemini_bridge as gb
+classify_lucky_pull_bytes = gb.classify_lucky_pull_bytes  # resolved via gemini_bridge (Groq-only for LPG)
 
 log = logging.getLogger("nixe.cogs.a00_lpg_thread_bridge_guard")
 
@@ -417,14 +415,20 @@ def _maybe_convert_to_jpeg(image_bytes: bytes) -> tuple[bytes, str]:
 
 async def _ocr_neg_text(image_bytes: bytes, timeout_ms: int = 3500) -> tuple[bool, str, str]:
     """
-    OCR image with Gemini Vision, returning (ok, ocr_text, reason).
-    Uses same key pool as LPG classify (GEMINI_API_KEYS or legacy).
+    OCR image via Groq Vision (OpenAI-compatible endpoint) using GEMINI_* keys.
+
+    IMPORTANT POLICY:
+    - For this project, Google Gemini is reserved for translate flows only.
+    - LPG must NOT call Google Gemini REST endpoints.
+    - The user's configuration maps GEMINI_* keys to Groq API keys, so we reuse GEMINI_* here.
+
+    Returns: (ok, ocr_text, reason)
     """
     if aiohttp is None:
         return False, "", "aiohttp_missing"
 
+    # Keys (Groq API keys stored in GEMINI_* env vars)
     keys_raw = (os.getenv("GEMINI_API_KEYS", "") or "").strip()
-
     keys: list[str] = []
     if keys_raw:
         keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
@@ -434,92 +438,98 @@ async def _ocr_neg_text(image_bytes: bytes, timeout_ms: int = 3500) -> tuple[boo
             if kv:
                 keys.append(kv)
     if not keys:
-        return False, "", "no_gemini_key"
+        return False, "", "no_key(GEMINI_*)"
 
-    model = (os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite") or "").strip()
+    # Model selection: prefer dedicated OCR model, else reuse GROQ_MODEL_VISION.
+    model = (os.getenv("GROQ_MODEL_VISION_OCR", "") or "").strip()
     if not model:
-        model = "gemini-2.5-flash-lite"
+        model = (os.getenv("GROQ_MODEL_VISION", "") or "").strip()
+    if not model:
+        cand = (os.getenv("GROQ_MODEL_VISION_CANDIDATES", "") or "").strip()
+        if cand:
+            model = [x.strip() for x in cand.split(",") if x.strip()][0]
+    if not model:
+        return False, "", "no_groq_vision_model"
 
     img_bytes, mime = _maybe_convert_to_jpeg(image_bytes)
     b64 = base64.b64encode(img_bytes).decode("utf-8")
+    data_url = f"data:{mime};base64,{b64}"
 
     sys_prompt = (
         "You are an OCR engine. Extract all readable text from the image. "
         "Return ONLY compact JSON: {\"text\": \"...\"}. No commentary."
     )
     payload = {
-        "contents": [
+        "model": model,
+        "temperature": 0,
+        "max_tokens": 900,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
             {
                 "role": "user",
-                "parts": [
-                    {"text": sys_prompt},
-                    {"inline_data": {"mime_type": mime, "data": b64}},
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                    {"type": "text", "text": "OCR this image. Output JSON only."},
                 ],
-            }
+            },
         ],
-        "generationConfig": {
-            "temperature": 0.0,
-            "topP": 0.1,
-            "topK": 1,
-            "maxOutputTokens": 256,
-            "responseMimeType": "application/json",
-        },
     }
 
-    last_err = ""
-    tsec = max(1.5, float(timeout_ms) / 1000.0)
-    timeout = aiohttp.ClientTimeout(total=tsec)
+    timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_ms) / 1000.0))
+    last_err = "no_result"
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
     for key in keys:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, json=payload) as resp:
-                    txt = await resp.text()
+                async with session.post(
+                    url,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=payload,
+                ) as resp:
                     if resp.status != 200:
                         last_err = f"http_{resp.status}"
                         continue
-                    try:
-                        j = json.loads(txt)
-                        cand = (j.get("candidates") or [{}])[0]
-                        parts = cand.get("content", {}).get("parts") or []
-                        out = "".join([p.get("text", "") for p in parts]).strip()
-                        if not out:
-                            last_err = "empty_output"
-                            continue
-                        # out may be json or raw text
-                        if out.startswith("{"):
-                            try:
-                                oj = json.loads(out)
-                                ocr_text = str(oj.get("text", "") or "")
-                            except Exception:
-                                ocr_text = out
-                        else:
-                            ocr_text = out
-                        ocr_text = (ocr_text or "").strip()
-                        if not ocr_text:
-                            last_err = "empty_ocr"
-                            continue
-                        return True, ocr_text, "ok"
-                    except Exception:
-                        # salvage braces
-                        m = re.search(r"\{.*\}", txt, flags=re.S)
-                        if m:
-                            try:
-                                oj = json.loads(m.group(0))
-                                ocr_text = str(oj.get("text", "") or "").strip()
-                                if ocr_text:
-                                    return True, ocr_text, "salvaged"
-                            except Exception:
-                                pass
-                        last_err = "parse_error"
-                        continue
+                    js = await resp.json()
+        except asyncio.TimeoutError:
+            # OCR timeout: fail open (no veto) but keep the return signature stable.
+            return False, "", "timeout"
+
         except Exception as e:
             last_err = f"vision_failed:{e.__class__.__name__}"
             continue
 
-    return False, "", last_err or "vision_failed"
+        try:
+            content = (js.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        except Exception:
+            content = ""
 
+        if not content:
+            last_err = "no_result"
+            continue
+
+        # Prefer strict JSON, but salvage if model returns raw text.
+        ocr_text = ""
+        try:
+            obj = json.loads(content)
+            ocr_text = str(obj.get("text", "") or "").strip()
+        except Exception:
+            try:
+                mm = re.search(r"\{\s*\"text\"\s*:\s*\".*?\"\s*\}", content, flags=re.S)
+                if mm:
+                    obj = json.loads(mm.group(0))
+                    ocr_text = str(obj.get("text", "") or "").strip()
+                else:
+                    ocr_text = str(content).strip()
+            except Exception:
+                ocr_text = str(content).strip()
+
+        if ocr_text:
+            return True, ocr_text, "ok"
+
+        last_err = "empty_text"
+
+    return False, "", last_err
 class LPGThreadBridgeGuard(commands.Cog):
     """Lucky Pull guard (thread-aware) — fully env-aligned.
     - Only deletes when image is classified as Lucky (Gemini) unless LPG_REQUIRE_CLASSIFY=0.
@@ -656,6 +666,16 @@ class LPGThreadBridgeGuard(commands.Cog):
         except Exception:
             pass
 
+        # Tier-list / ranking grids: common false positives (T1/T2/S-tier, "tier list", "ranking")
+        try:
+            tier_hits = len(re.findall(r"\bt\s*[0-6]\b", low))
+            has_tier_words = any(w in low for w in ("tier list", "tierlist", "ranking", "s-tier", "a-tier", "b-tier"))
+            # Require multiple signals to reduce accidental matches.
+            if (tier_hits >= 2) or (has_tier_words and (tier_hits >= 1 or "\n" in low)):
+                return True, f"negtext_veto(ocr:tierlist:t_hits={tier_hits})"
+        except Exception:
+            pass
+
         for tok in self.neg_tokens:
             if tok and tok in low:
                 return True, f"negtext_veto(ocr:{tok})"
@@ -688,10 +708,10 @@ class LPGThreadBridgeGuard(commands.Cog):
                 log.info("[lpg-thread-bridge] NEG_VETO lucky=False reason=%s", vreason)
                 return (False, 0.0, "negtext_veto", vreason)
 
-            # primary path: gemini_bridge (may be monkeypatched by overlay)
-            res = await asyncio.wait_for(
-                classify_lucky_pull_bytes(data), timeout=self.timeout
-            )
+            # Primary path: gemini_bridge (may be monkeypatched by overlay).
+            # Fetch from module at call-time to respect overlays.
+            import nixe.helpers.gemini_bridge as _gb
+            res = await asyncio.wait_for(_gb.classify_lucky_pull_bytes(data), timeout=self.timeout)
 
             ok: bool = False
             score: float = 0.0
@@ -715,88 +735,17 @@ class LPGThreadBridgeGuard(commands.Cog):
             reason = reason or ""
             score = float(score or 0.0)
 
-            # If Gemini gave a parse / no_result style error, escalate to BURST once.
-            bad_reason = False
-            rlow = reason.lower()
-            if ("parse_error" in rlow) or ("none:no_result" in rlow) or (
-                "classify_exception" in rlow
-            ):
-                bad_reason = True
-            if not rlow and provider.startswith("gemini:") and (not ok) and score <= 0.0:
-                bad_reason = True
-
-            if bad_reason and provider.startswith("gemini:") and data:
-                try:
-                    try:
-                        from nixe.helpers.gemini_lpg_burst import (
-                            classify_lucky_pull_bytes_burst as _burst,
-                        )
-                    except Exception:
-                        try:
-                            from nixe.helpers.gemini_lpg_burst import (
-                                classify_lucky_pull_bytes as _burst,
-                            )
-                        except Exception:
-                            _burst = None
-                    if _burst is not None:
-                        fb_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1200"))
-                        os.environ["LPG_BURST_TIMEOUT_MS"] = str(fb_ms)
-                        bok, bscore, bvia, breason = await _burst(data)
-                        bscore = float(bscore or 0.0)
-                        r2 = str(breason or "")
-                        r2low = r2.lower()
-                        if not (r2low.startswith("early(") or "early(ok)" in r2low or r2low.startswith("ok")):
-                            r2 = f"lastchance({breason})"
-                        return (
-                            bool(bok and bscore >= self.thr),
-                            bscore,
-                            str(bvia or "gemini:burst"),
-                            r2,
-                        )
-                except Exception as e:
-                    log.debug(
-                        "[lpg-thread-bridge] lastchance burst on-parse-error failed: %r",
-                        e,
-                    )
+            # Enforce provider re-check: do not trust cache hits for deletion decisions.
+            if str(provider or "").startswith("cache:"):
+                return (False, 0.0, str(provider), "cache_disallowed")
 
             verdict_ok = bool(ok and score >= self.thr)
             return (verdict_ok, score, provider, reason or "classified")
 
         except asyncio.TimeoutError:
-            # Guard hard-timeout hit; do one last-chance BURST retry (short) to avoid false negatives
-            if not data:
-                return (False, 0.0, "timeout", "classify_timeout")
-            try:
-                try:
-                    from nixe.helpers.gemini_lpg_burst import (
-                        classify_lucky_pull_bytes_burst as _burst,
-                    )
-                except Exception:
-                    try:
-                        from nixe.helpers.gemini_lpg_burst import (
-                            classify_lucky_pull_bytes as _burst,
-                        )
-                    except Exception:
-                        _burst = None
-                if _burst is not None:
-                    fb_ms = int(os.getenv("LPG_GUARD_LASTCHANCE_MS", "1200"))
-                    os.environ["LPG_BURST_TIMEOUT_MS"] = str(fb_ms)
-                    ok, score, via, reason = await _burst(data)
-                    score = float(score or 0.0)
-                    verdict_ok = bool(ok and score >= self.thr)
-                    r2 = str(reason or "")
-                    r2low = r2.lower()
-                    if not (r2low.startswith("early(") or "early(ok)" in r2low or r2low.startswith("ok")):
-                        r2 = f"lastchance({reason})"
-                    return (
-                        verdict_ok,
-                        score,
-                        str(via or "gemini:burst"),
-                        r2,
-                    )
-            except Exception:
-                pass
+            # Burst/lastchance disabled by policy (Groq-only for LPG)
             return (False, 0.0, "timeout", "classify_timeout")
+
         except Exception as e:
             log.warning("[lpg-thread-bridge] classify error: %r", e)
             return (False, 0.0, "error", "classify_exception")
@@ -999,24 +948,11 @@ class LPGThreadBridgeGuard(commands.Cog):
         # - Only LUCKY entries are posted into the memory thread (ID hardcoded).
         # - NOT LUCKY is intentionally not posted (prevents log spam; supports delete=unlearn semantics).
 
-        # Assume-lucky on fallback timeouts if explicitly enabled
+        # Never force lucky based on fallback markers. If provider says NOT_LUCKY, stop.
         if not lucky:
-            try:
-                assume = os.getenv("LPG_ASSUME_LUCKY_ON_FALLBACK", "0") == "1"
-                if assume and isinstance(reason, str) and (
-                    "lastchance(" in reason or "shield_fallback(" in reason
-                ):
-                    log.warning(
-                        "[lpg-thread-bridge] assume_lucky_fallback active → forcing redirect (reason=%s)",
-                        reason,
-                    )
-                    lucky = True
-                else:
-                    return
-            except Exception:
-                return
+            return
 
-        # Post LUCKY classification result to permanent memory thread (pHash + image + footer sha1/ahash)
+# Post LUCKY classification result to permanent memory thread (pHash + image + footer sha1/ahash)
         try:
             # Compute pHash for status embed.
             ph = ph_val

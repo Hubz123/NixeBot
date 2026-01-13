@@ -27,11 +27,23 @@ NO_FALLBACK = (os.getenv("NIXE_PHASH_DISABLE_LOG_FALLBACK", "1") == "1")
 class PhashImagephisingWatcher(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._task = self.bot.loop.create_task(self._bootstrap())
+        self._task = None
+        self._started = False
 
     def cog_unload(self):
         try: self._task.cancel()
         except Exception: pass
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_started', False):
+            return
+        self._started = True
+        try:
+            self._task = asyncio.create_task(self._bootstrap())
+        except Exception:
+            self._task = None
+
+
 
     async def _bootstrap(self):
         await self.bot.wait_until_ready()

@@ -324,6 +324,64 @@ class LPGCachePersistence(commands.Cog):
         except Exception as e:
             log.warning("[lpgmem] bootstrap failed: %r", e)
 
+    
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Track msg_id→sha1 for newly created memory entries so delete=unlearn is reliable.
+        try:
+            if int(getattr(getattr(message, "channel", None), "id", 0) or 0) != int(MEMORY_THREAD_ID):
+                return
+            if not getattr(message, "embeds", None):
+                return
+            emb0 = message.embeds[0]
+            ft = getattr(getattr(emb0, "footer", None), "text", None)
+            m = _FOOTER_RE.search(str(ft or ""))
+            if not m:
+                return
+            sha1 = m.group(1).lower()
+            mid = int(getattr(message, "id", 0) or 0)
+            if mid <= 0 or not sha1:
+                return
+            self._msgid_to_sha1[mid] = sha1
+            try:
+                from nixe.helpers import lpg_cache_memory as cache
+                cache.register_msgid_sha1(mid, sha1)
+            except Exception:
+                pass
+        except Exception:
+            return
+
+    @commands.Cog.listener()
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent):
+        # bulk delete=bulk unlearn (thread only)
+        try:
+            ch_id = int(getattr(payload, "channel_id", 0) or 0)
+            if ch_id != int(MEMORY_THREAD_ID):
+                return
+            mids = list(getattr(payload, "message_ids", []) or [])
+            if not mids:
+                return
+            from nixe.helpers import lpg_cache_memory as cache
+            for mid in mids:
+                try:
+                    mid_i = int(mid or 0)
+                except Exception:
+                    continue
+                sha1 = self._msgid_to_sha1.pop(mid_i, None)
+                if not sha1:
+                    try:
+                        sha1 = cache.pop_msgid_sha1(mid_i)
+                    except Exception:
+                        sha1 = None
+                if sha1:
+                    try:
+                        cache.remove_sha1(str(sha1))
+                        log.warning("[lpgmem] unlearn(bulk) mid=%s sha1=%s", mid_i, sha1)
+                    except Exception:
+                        pass
+        except Exception:
+            return
+
     @commands.Cog.listener()
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
         # delete=unlearn (thread only)
@@ -333,6 +391,12 @@ class LPGCachePersistence(commands.Cog):
 
             # Primary path: thread id match + msgid→sha1 map (fast)
             sha1 = self._msgid_to_sha1.pop(mid, None)
+            if not sha1:
+                try:
+                    from nixe.helpers import lpg_cache_memory as _cache
+                    sha1 = _cache.pop_msgid_sha1(mid)
+                except Exception:
+                    sha1 = None
 
             # Fallback: if the message was cached, parse footer to recover sha1 (covers older entries / boot-scan gaps).
             if not sha1:

@@ -53,11 +53,22 @@ class PhashAutoReseedPort(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._ran_guilds = set()
-        self.auto_task.start()
-
+        self._started = False
     def cog_unload(self):
         try: self.auto_task.cancel()
         except Exception: pass
+
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_started', False):
+            return
+        self._started = True
+        try:
+            if not self.auto_task.is_running():
+                self.auto_task.start()
+        except Exception:
+            pass
 
     @tasks.loop(count=1)
     async def auto_task(self):

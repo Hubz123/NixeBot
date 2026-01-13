@@ -165,13 +165,8 @@ def patch_guard_defer():
                                         break
                             last_ms = int(os.getenv('LPG_GUARD_LASTCHANCE_MS', '1800'))
                             if last_ms > 0 and image_bytes:
-                                try:
-                                    from nixe.helpers.gemini_lpg_burst import classify_lucky_pull_bytes_burst as _burst
-                                    os.environ.setdefault('LPG_BURST_TIMEOUT_MS', os.getenv('LPG_BURST_TIMEOUT_MS', '1500'))
-                                    ok, score, via, reason = await _burst(bytes(image_bytes))
-                                    return (bool(ok), float(score), f"{via or 'gemini:lastchance'}", f"lastchance({reason})")
-                                except Exception:
-                                    pass
+                                # lastchance burst disabled by policy (Groq-only for LPG)
+                                pass
                             return (False, 0.0, 'pending', 'deferred_noexec')
                     return _wrapped
                 _wrapped = _make_wrapped(_orig)

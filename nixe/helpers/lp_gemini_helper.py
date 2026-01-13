@@ -1,39 +1,83 @@
+# -*- coding: utf-8 -*-
+"""
+Legacy compatibility helper used by LuckyPullGuard.
+
+IMPORTANT RULES (project policy):
+- LPG must use GEMINI_API_KEY / GEMINI_API_KEY_B (these keys are used for LPG via Groq models in gemini_bridge).
+- GROQ_API_KEY is phishing-only.
+- TRANSLATE_GEMINI_API_KEY is translate-only.
+
+This module MUST NOT call Google Gemini REST.
+"""
 
 from __future__ import annotations
-import base64, json, re
+
+import asyncio
 from typing import Optional, Tuple
+
 from .env_reader import get
-try:
-    import urllib.request as _urlreq
-except Exception:
-    _urlreq=None
-def _endpoint(model: str) -> str:
-    return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+from . import gemini_bridge
+
+def _has_lpg_key() -> bool:
+    # GEMINI_API_KEYS (CSV) is supported in gemini_bridge; keep simple checks here.
+    if (get("GEMINI_API_KEYS", "") or "").strip():
+        return True
+    if (get("GEMINI_API_KEY", "") or "").strip():
+        return True
+    if (get("GEMINI_API_KEY_B", "") or "").strip():
+        return True
+    if (get("GEMINI_BACKUP_API_KEY", "") or "").strip():
+        return True
+    return False
+
 def is_gemini_enabled() -> bool:
-    return get("LUCKYPULL_GEMINI_ENABLE","1")=="1" and bool(get("GEMINI_API_KEY",""))
-def score_lucky_pull_image(image_bytes: bytes, timeout: float = 7.0) -> Optional[Tuple[bool,float,str]]:
-    if not is_gemini_enabled() or _urlreq is None: return None
-    api_key=get("GEMINI_API_KEY",""); model=get("GEMINI_MODEL","gemini-1.5-flash")
-    url=_endpoint(model)+f"?key={api_key}"
-    b64=base64.b64encode(image_bytes).decode("ascii")
-    body={"contents":[{"parts":[{"text":"Return JSON {\"is_lucky\": bool, \"score\": float, \"reason\": str} for whether this is a gacha lucky pull result screen. Be conservative."},{"inline_data":{"mime_type":"image/png","data":b64}}]}]}
+    # Keep the existing env flag name for backward compatibility.
+    return get("LUCKYPULL_GEMINI_ENABLE", "1") == "1" and _has_lpg_key()
+
+async def score_lucky_pull_image_async(
+    image_bytes: bytes,
+    timeout: float = 7.0,
+) -> Optional[Tuple[bool, float, str]]:
+    """Async LPG scoring wrapper.
+    Returns (is_lucky, score, reason) or None if unavailable/error.
+    """
+    if not is_gemini_enabled():
+        return None
     try:
-        req=_urlreq.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type":"application/json"})
-        with _urlreq.urlopen(req, timeout=timeout) as resp:
-            raw=resp.read().decode("utf-8", errors="ignore")
-    except Exception: return None
+        ok, score, _via, reason = await asyncio.wait_for(
+            gemini_bridge.classify_lucky_pull_bytes(image_bytes),
+            timeout=timeout,
+        )
+        if not ok:
+            return None
+        return (bool(score >= 0.0), float(score), str(reason or "")[:200])
+    except Exception:
+        return None
+
+def score_lucky_pull_image(
+    image_bytes: bytes,
+    timeout: float = 7.0,
+) -> Optional[Tuple[bool, float, str]]:
+    """Synchronous wrapper.
+
+    Safe to call ONLY when no event loop is running (e.g., in a worker thread).
+    If called from within an active asyncio loop, returns None to avoid blocking.
+    """
+    if not is_gemini_enabled():
+        return None
     try:
-        data=json.loads(raw); txt=""
-        for c in data.get("candidates") or []:
-            for p in (c.get("content") or {}).get("parts") or []:
-                if "text" in p: txt+=p["text"]
-        m=re.search(r"\{[^\}]*\}", txt, re.S)
-        if not m: return None
-        obj=json.loads(m.group(0))
-        return (bool(obj.get("is_lucky",False)), float(obj.get("score",0.0)), str(obj.get("reason",""))[:200])
-    except Exception: return None
+        asyncio.get_running_loop()
+        # In event loop: do not block. Use score_lucky_pull_image_async instead.
+        return None
+    except RuntimeError:
+        # No running loop: OK to run.
+        return asyncio.run(score_lucky_pull_image_async(image_bytes, timeout=timeout))
+
 def is_lucky_pull(image_bytes: bytes, threshold: float = 0.65):
-    res=score_lucky_pull_image(image_bytes)
-    if not res: return (False,0.0,"gemini_unavailable_or_low_confidence")
-    ok,score,reason=res
-    return (bool(ok and score>=float(threshold)), float(score), reason)
+    """Legacy interface returning (decision, score, reason)."""
+    res = score_lucky_pull_image(image_bytes)
+    if not res:
+        return (False, 0.0, "lpg_unavailable_or_async_required")
+    _ok, score, reason = res
+    score = float(score or 0.0)
+    return (bool(score >= float(threshold)), score, reason)

@@ -188,8 +188,9 @@ class YouTubeWuWaTestPreview(commands.Cog):
         self._cooldown: dict[int, float] = {}
         self._session: Optional[aiohttp.ClientSession] = None
 
-    async def cog_load(self):
-        # reuse session if app has one; otherwise create
+    async def _ensure_session(self) -> None:
+        if self._session and not self._session.closed:
+            return
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=25),
             headers={
@@ -198,11 +199,16 @@ class YouTubeWuWaTestPreview(commands.Cog):
             },
         )
 
-    
+    def cog_unload(self):
+        try:
+            if self._session and not self._session.closed:
+                asyncio.create_task(self._session.close())
+        except Exception:
+            pass
+
     async def _try_fetch_channel_name_oembed(self, url: str) -> Optional[str]:
         try:
-            if not self._session or self._session.closed:
-                return None
+            await self._ensure_session()
             oembed_url = f"https://www.youtube.com/oembed?url={quote_plus(url)}&format=json"
             async with self._session.get(oembed_url) as resp:
                 if resp.status != 200:
@@ -221,8 +227,7 @@ class YouTubeWuWaTestPreview(commands.Cog):
 
     async def _try_fetch_channel_name_from_channel_page(self, url: str) -> Optional[str]:
         try:
-            if not self._session or self._session.closed:
-                return None
+            await self._ensure_session()
             async with self._session.get(url, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return None

@@ -25,7 +25,7 @@ def _compress(raw: bytes, max_px=640, min_px=384, target_kb=300, quality=75):
 class ImagePhishGeminiGuard(commands.Cog):
     def __init__(self, bot):
         self.bot=bot
-        self.enabled = _cfg_bool01("PHISH_GEMINI_ENABLE","1")=="1"
+        self.enabled = _cfg_bool01("PHISH_GEMINI_ENABLE","0")=="1"
         self.threshold = float(_cfg_get("PHISH_GEMINI_THRESHOLD","0.92"))
         self.timeout_ms = _cfg_int("PHISH_GEMINI_MAX_LATENCY_MS", 9000)
         self.max_imgs = max(1, _cfg_int("PHISH_GEMINI_MAX_IMAGES", 2))

@@ -14,10 +14,22 @@ log = logging.getLogger(__name__)
 class PhashHourlyScheduler(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._started = False
         self._loop = None
 
     async def cog_load(self):
-        self._loop = self.loop_collect.start()
+        self._loop = None
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_started', False):
+            return
+        self._started = True
+        try:
+            if not self.loop_collect.is_running():
+                self._loop = self.loop_collect.start()
+        except Exception:
+            self._loop = None
 
     def cog_unload(self):
         if self._loop:

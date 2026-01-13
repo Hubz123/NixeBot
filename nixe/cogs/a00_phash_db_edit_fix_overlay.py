@@ -18,7 +18,8 @@ DB_THREAD_ID = int(os.getenv("NIXE_PHASH_DB_THREAD_ID", "0") or 0)
 class PhashDbEditFixOverlay(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._task = self.bot.loop.create_task(self._run())
+        self._task = None
+        self._started = False
 
     def cog_unload(self):
         try:
@@ -55,6 +56,17 @@ class PhashDbEditFixOverlay(commands.Cog):
             except Exception:
                 pass
         return None
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_started', False):
+            return
+        self._started = True
+        try:
+            self._task = asyncio.create_task(self._run())
+        except Exception:
+            self._task = None
+
+
 
     async def _run(self):
         await self.bot.wait_until_ready()

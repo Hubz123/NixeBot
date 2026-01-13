@@ -25,6 +25,8 @@ SKIP_EXTENSIONS = {
     "nixe.cogs.link_phish_guard",
     # Legacy duplicate of LuckyPullGuard (newer module is lucky_pull_guard).
     "nixe.cogs.luckypull_guard",
+    # Gemini phishing guard must NEVER load (phishing is Groq-only).
+    "nixe.cogs.image_phish_gemini_guard",
 }
 
 

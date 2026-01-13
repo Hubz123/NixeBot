@@ -179,7 +179,8 @@ class PhashPhishGuard(commands.Cog):
         }
         self.log_chan_id: int = _env_int("PHISH_LOG_CHAN_ID", _env_int("NIXE_PHISH_LOG_CHAN_ID", 0))
         # lazy bootstrap
-        self._bootstrap_task = asyncio.create_task(self._bootstrap())
+        self._bootstrap_task = None
+        self._booted = False
         log.info(
             "[phash-phish] init bits_max=%s guards=%s skip=%s safe=%s",
             self.bits_max,
@@ -187,6 +188,17 @@ class PhashPhishGuard(commands.Cog):
             sorted(self.skip_ids),
             sorted(self.safe_threads),
         )
+
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if getattr(self, '_booted', False):
+            return
+        self._booted = True
+        try:
+            self._bootstrap_task = asyncio.create_task(self._bootstrap())
+        except Exception:
+            self._bootstrap_task = None
 
     async def _bootstrap(self) -> None:
         await self.bot.wait_until_ready()

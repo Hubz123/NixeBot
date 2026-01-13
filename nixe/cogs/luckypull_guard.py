@@ -3,7 +3,8 @@ from __future__ import annotations
 import io, discord
 from discord.ext import commands
 from nixe.helpers.env_reader import get, get_int
-from nixe.helpers.lp_gemini_helper import is_gemini_enabled, is_lucky_pull
+from nixe.helpers.lp_gemini_helper import is_gemini_enabled
+from nixe.helpers.lp_gemini_async import is_lucky_pull_async
 def _csv_ids(s:str):
     return {int(x) for x in (s or "").replace(","," ").split() if x.isdigit()}
 class LuckyPullGuard(commands.Cog):
@@ -26,7 +27,7 @@ class LuckyPullGuard(commands.Cog):
             name=(a.filename or "").lower()
             if not any(name.endswith(ext) for ext in (".png",".jpg",".jpeg",".webp")): continue
             b=await a.read()
-            dec,score,_=is_lucky_pull(b, threshold=self.th)
+            dec, score, _reason = await is_lucky_pull_async(b, threshold=self.th)
             if dec:
                 try: await m.delete(reason="Nixe: Lucky pull not allowed here")
                 except Exception: pass

@@ -1,6 +1,7 @@
 # nixe/cogs/a16_gemini_cleanup_overlay.py
 from __future__ import annotations
 import inspect
+import asyncio
 from discord.ext import commands
 
 class GeminiCleanupOverlay(commands.Cog):
@@ -16,7 +17,16 @@ class GeminiCleanupOverlay(commands.Cog):
             from nixe.helpers.gemini_http_cleanup import close_now
             fut = close_now()
             if inspect.isawaitable(fut):
-                self.bot.loop.create_task(fut)
+                # discord.py v2.4+ may disallow bot.loop in non-async contexts.
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(fut)
+                except RuntimeError:
+                    # No running loop; best-effort run (avoid raising).
+                    try:
+                        asyncio.run(fut)
+                    except Exception:
+                        pass
         except Exception:
             pass
 

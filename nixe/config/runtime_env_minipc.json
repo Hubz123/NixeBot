@@ -39,6 +39,7 @@
   "GEMINI_MODEL": "gemini-2.5-flash-lite",
   "GEMINI_LUCKY_THRESHOLD": "0.9",
   "GEMINI_LUCKY_HINTS": "10-pull results grid, NEW!!, star icons, gold/orange/rainbow beam",
+  "GEMINI_LUCKY_THRESHOLD": "0.90",
   "LUCKYPULL_GEM_TIMEOUT_MS": "9000",
   "LPG_GUARD_LASTCHANCE_MS": "8000",
   "LPG_BURST_TIMEOUT_MS": "8000",

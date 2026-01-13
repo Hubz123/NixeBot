@@ -95,7 +95,7 @@ def _build_sys_prompt() -> str:
         "Strong NOT_LUCKY cues:\n"
         "- Promotional/event banners or announcements with BIG headline text,\n"
         "- Collage of multiple character arts without in-game result grid/UI,\n"
-        "- Deck-building, loadout, or skill-card management screens where you are configuring cards or skills you own rather than seeing the outcome of a pull.\n"
+        "- Deck-building, loadout, or skill-card management screens where you are configuring cards or skills you own rather than seeing the outcome of a pull.\n- Character roster/collection/team selection screens (many character icons with levels like 'Lv. 90', elements, and a scrollable grid) are NOT gacha results.\n- If the screenshot shows many repeated level labels (e.g., 'Lv.' appears 3+ times) or looks like a unit list / inventory grid, set lucky=false with score <= 0.2.\n- Wiki/leak-style character sheets or lineups with IDs/names/roles (not an in-game result UI) are NOT gacha results.\n"
         "- Screens mentioning or corresponding to any of: " + neg_txt + ".\n\n"
         "Rules:\n"
         "- Be conservative: if mixed/unsure, choose not_lucky with score <= 0.4.\n"
@@ -125,45 +125,36 @@ def _env_keys_list() -> list[str]:
 
 def _env_models_list() -> list[str]:
     """
-    Primary model + optional fallbacks.
+    Models list for LPG classifier (Groq-only).
 
-    NOTE:
-    - If GROQ_MODEL_VISION / GROQ_MODEL_VISION_CANDIDATES is set, prefer those.
-    - This lets us route via Groq models while still using GEMINI_* env names
-      for API keys / legacy config, without touching other config files.
+    Policy:
+    - LPG must NOT call Google Gemini REST. Gemini is reserved for translate / OCR-translate flows.
+    - LPG uses ONLY Groq vision models from env:
+        - GROQ_MODEL_VISION (primary)
+        - GROQ_MODEL_VISION_CANDIDATES (comma-separated)
+        - GROQ_MODEL_VISION_FALLBACKS (comma-separated)
+
+    If none are configured, return an empty list and the caller will report `no_groq_model`.
     """
     models: list[str] = []
 
-    # Prefer Groq vision models if configured
     g_primary = _env("GROQ_MODEL_VISION", "").strip()
     if g_primary:
         models.append(g_primary)
 
-    g_raw = _env("GROQ_MODEL_VISION_CANDIDATES", "").strip()
-    if g_raw:
-        for part in g_raw.split(","):
-            p = part.strip()
-            if p and p not in models:
-                models.append(p)
+    cand = _env("GROQ_MODEL_VISION_CANDIDATES", "").strip()
+    if cand:
+        for m in [x.strip() for x in cand.split(",") if x.strip()]:
+            if m not in models:
+                models.append(m)
 
-    if models:
-        return models
+    fb = _env("GROQ_MODEL_VISION_FALLBACKS", "").strip()
+    if fb:
+        for m in [x.strip() for x in fb.split(",") if x.strip()]:
+            if m not in models:
+                models.append(m)
 
-    # Fallback to legacy Gemini model config
-    primary = _env("GEMINI_MODEL", "gemini-2.5-flash-lite").strip()
-    if primary:
-        models.append(primary)
-    for kname in (
-        "LUCKYPULL_GEMINI_FALLBACK",
-        "LUCKYPULL_GEMINI_FALLBACK2",
-        "GEMINI_FALLBACK_MODEL",
-        "GEMINI_FALLBACK_MODEL2",
-    ):
-        mv = _env(kname, "").strip()
-        if mv and mv not in models:
-            models.append(mv)
     return models
-
 def _extract_json_obj(text: str) -> str:
     """
     Salvage first JSON object from Gemini free-form output.
@@ -337,34 +328,14 @@ async def _classify_one(
     timeout_sec: float,
 ) -> tuple[bool, float, str, str]:
     """One LPG classify attempt.
-    Routes to Groq (OpenAI-compatible via `groq` SDK) when using non-Gemini models,
-    and to the Gemini REST API when the model name indicates Gemini.
+    Routes to Groq (OpenAI-compatible via `groq` SDK) for LPG.
+    NOTE: Google Gemini REST is explicitly disallowed in LPG; Gemini is reserved for translate flows (TRANSLATE_GEMINI_API_KEY) only.
     """
     m = (model or "").strip().lower()
     use_gemini = m.startswith("gemini") or m.startswith("models/")
     if use_gemini:
-        # Gemini expects inline_data parts.
-        b64 = base64.b64encode(img_bytes).decode("ascii")
-        payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": sys_prompt},
-                        {"inline_data": {"mime_type": mime, "data": b64}},
-                    ],
-                }
-            ]
-        }
-        try:
-            timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_sec)))
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                return await _call_gemini_once(session, api_key, model, payload)
-        except asyncio.TimeoutError:
-            return False, 0.0, f"gemini:{model}", "timeout"
-        except Exception as e:
-            return False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}"
-
+        # LPG must not use Google Gemini REST.
+        return False, 0.0, f"none:{model}", "gemini_model_disallowed"
     # Default: Groq path (keeps legacy `via` prefix in _call_groq_lpg_once)
     return await _call_groq_lpg_once(
         key=api_key,
@@ -392,6 +363,8 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
         return False, 0.0, "none", "no_api_key"
 
     models = _env_models_list()
+    if not models:
+        return False, 0.0, "none", "no_groq_model"
     if not models:
         models = ["meta-llama/llama-4-scout-17b-16e-instruct"]
 

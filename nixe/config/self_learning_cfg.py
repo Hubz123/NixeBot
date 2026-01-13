@@ -58,6 +58,10 @@ PHASH_DB_MARKER      = os.getenv("PHASH_DB_MARKER") or "[phash-db-board]"
 PHASH_LOG_SCAN_LIMIT = _to_int(os.getenv("PHASH_LOG_SCAN_LIMIT") or 200, 200)
 PHASH_HAMMING_MAX    = _to_int(os.getenv("PHASH_HAMMING_MAX") or 0, 0)
 
+# --- healthz compat (some web helpers import these here) ---
+NIXE_HEALTHZ_PATH = os.getenv("NIXE_HEALTHZ_PATH") or "/healthz"
+NIXE_HEALTHZ_SILENCE = _to_int(os.getenv("NIXE_HEALTHZ_SILENCE") or 1, 1)
+
 __all__ = [
     "LOG_CHANNEL_ID",
     "THREAD_NIXE",
@@ -75,4 +79,6 @@ __all__ = [
     "PHASH_DB_MARKER",
     "PHASH_LOG_SCAN_LIMIT",
     "PHASH_HAMMING_MAX",
+    "NIXE_HEALTHZ_PATH",
+    "NIXE_HEALTHZ_SILENCE",
 ]

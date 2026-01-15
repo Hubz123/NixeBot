@@ -11,8 +11,8 @@ def _read_env_hybrid(dotenv_path: str, runtime_json_path: str) -> dict:
         "env_file_keys": 0,
         "runtime_env_exported_total": 0,
         "env_exported_tokens": 0,
-        "GEMINI_API_KEY": False,
-        "GEMINI_API_KEY_B": False,
+        "LPG_API_KEY (legacy GEMINI_API_KEY ok)": False,
+        "LPG_API_KEY (legacy GEMINI_API_KEY ok)_B": False,
         "DISCORD_TOKEN": bool(os.getenv("DISCORD_TOKEN")),
         "error": None,
     }
@@ -49,8 +49,8 @@ def _read_env_hybrid(dotenv_path: str, runtime_json_path: str) -> dict:
     except Exception as e:
         info["error"] = f"runtime json read error: {e}"
 
-    info["GEMINI_API_KEY"] = bool(os.getenv("GEMINI_API_KEY"))
-    info["GEMINI_API_KEY_B"] = bool(os.getenv("GEMINI_API_KEY_B") or os.getenv("GEMINI_BACKUP_API_KEY"))
+    info["LPG_API_KEY (legacy GEMINI_API_KEY ok)"] = bool(os.getenv("LPG_API_KEY") or os.getenv("LPG_API_KEY (legacy GEMINI_API_KEY ok)"))
+    info["LPG_API_KEY (legacy GEMINI_API_KEY ok)_B"] = bool(os.getenv("LPG_API_KEY_B") or os.getenv("LPG_API_KEY (legacy GEMINI_API_KEY ok)_B") or os.getenv("GEMINI_BACKUP_API_KEY"))
     info["DISCORD_TOKEN"] = bool(os.getenv("DISCORD_TOKEN"))
     return info
 
@@ -195,8 +195,8 @@ def _gemini_parse(json_obj: dict):
 def classify_lucky(image_bytes: bytes, threshold: float = 0.95):
     neg_words = _parse_negative_words()
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    api_a = os.getenv("GEMINI_API_KEY") or ""
-    api_b = os.getenv("GEMINI_API_KEY_B") or os.getenv("GEMINI_BACKUP_API_KEY") or ""
+    api_a = os.getenv("LPG_API_KEY") or os.getenv("LPG_API_KEY (legacy GEMINI_API_KEY ok)") or ""
+    api_b = os.getenv("LPG_API_KEY_B") or os.getenv("LPG_API_KEY (legacy GEMINI_API_KEY ok)_B") or os.getenv("GEMINI_BACKUP_API_KEY") or ""
     prompt = _build_prompt(neg_words)
     best = ("none", 0.0, "none", False, "")
     last_err = None

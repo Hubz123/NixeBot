@@ -38,6 +38,11 @@ async def setup(bot):
     path = os.getenv("ENV_HYBRID_JSON_PATH", "nixe/config/runtime_env.json")
     prefer_env = (os.getenv("ENV_HYBRID_PREFER_ENV", "1") == "1")
     exported = _merge_env_from_json(path, prefer_env=prefer_env)
+    # LPG key rename compatibility:
+    # - Preferred: LPG_API_*
+    # - Legacy: GEMINI_* (historically used for LPG Groq keys in this repo)
+    # This DOES NOT modify any JSON; it only mirrors env vars at runtime.
+
     # Short preview (sensitive keys redacted)
     preview = {k: ("***" if "KEY" in k or "TOKEN" in k else v) for k, v in list(exported.items())[:7]}
     log.warning("[env-hybrid] exported %d key(s) from %s; prefer_env=%s; preview=%s",

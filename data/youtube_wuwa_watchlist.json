@@ -154,6 +154,12 @@
       "url": "https://www.youtube.com/@rokoko6693"
     },
     {
+      "name": "@sakuracofene",
+      "query": "@sakuracofene",
+      "handle": "@sakuracofene",
+      "url": "https://www.youtube.com/@sakuracofene"
+    },
+    {
       "name": "@seraalara",
       "query": "@seraalara",
       "handle": "@seraalara",
@@ -230,6 +236,13 @@
       "query": "Mero Ch. / 蝶望メロ",
       "handle": "@chiyono_mero",
       "url": "https://www.youtube.com/@chiyono_mero"
+    },
+    {
+      "name": "nEgI Ch. 彩鮫ねぎ",
+      "query": "nEgI Ch. 彩鮫ねぎ",
+      "handle": "@nEgI846",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@nEgI846"
     },
     {
       "name": "Petr Petrichor ch / ペトル・ペトリコール",
@@ -422,6 +435,13 @@
       "url": "https://www.youtube.com/@tsuzura_nai"
     },
     {
+      "name": "彗月るい Hazuki Rui",
+      "query": "彗月るい Hazuki Rui",
+      "handle": "@RuiHazuki",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@RuiHazuki"
+    },
+    {
       "name": "徘徊カイ -Hai kai Kai-",
       "query": "徘徊カイ -Hai kai Kai-",
       "handle": "@haikai_111",
@@ -452,6 +472,13 @@
       "handle": "@akasakaasa",
       "channel_id": "",
       "url": "https://www.youtube.com/@akasakaasa"
+    },
+    {
+      "name": "柳 / Yanagi",
+      "query": "柳 / Yanagi",
+      "handle": "@Ya_na_gi",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Ya_na_gi"
     },
     {
       "name": "桜狐フェネ",

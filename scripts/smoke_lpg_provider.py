@@ -71,10 +71,10 @@ def main():
     env_json = _load_json_first()
     _load_env_file()
 
-    gA = os.getenv("GEMINI_API_KEY") or ""
-    gB = os.getenv("GEMINI_API_KEY_B") or ""
+    gA = os.getenv("LPG_API_KEY") or os.getenv("LPG_API_KEY (legacy GEMINI_API_KEY ok)") or ""
+    gB = os.getenv("LPG_API_KEY_B") or os.getenv("LPG_API_KEY (legacy GEMINI_API_KEY ok)_B") or ""
     gems = [k for k in (gA,gB) if k]
-    print(f"[SMOKE] GEMINI_API_KEY count={len(gems)} detail={[ _mask(k) for k in gems ]}")
+    print(f"[SMOKE] LPG_API_KEY (legacy GEMINI_API_KEY ok) count={len(gems)} detail={[ _mask(k) for k in gems ]}")
     print(f"[SMOKE] GROQ_API_KEY? {'True' if os.getenv('GROQ_API_KEY') else 'False'}")
 
     # LP area (optional)

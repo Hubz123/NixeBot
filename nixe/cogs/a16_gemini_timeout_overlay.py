@@ -20,6 +20,10 @@ class GeminiTimeoutOverlay(commands.Cog):
 
         try:
             import nixe.helpers.gemini_bridge as gb
+            # Skip patching if LPG guard will use overlay-safe raw entrypoint.
+            if hasattr(gb, 'classify_lucky_pull_bytes_raw'):
+                log.warning('[gemini-timeout] skip patch (raw LPG entrypoint present)')
+                return
             if hasattr(gb, 'classify_lucky_pull_bytes') and inspect.iscoroutinefunction(gb.classify_lucky_pull_bytes):
                 self._patch_async(gb)
                 log.warning('[gemini-timeout] patched classify_lucky_pull_bytes timeout_ms=%s retry=%s jitter=%sms conc=%s',

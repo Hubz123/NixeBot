@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os, logging, asyncio
+from nixe.helpers.env_reader import get as _cfg_get
 from typing import Optional, List, Tuple, Any
 import discord
 from discord.ext import commands
@@ -420,116 +421,134 @@ async def _ocr_neg_text(image_bytes: bytes, timeout_ms: int = 3500) -> tuple[boo
     IMPORTANT POLICY:
     - For this project, Google Gemini is reserved for translate flows only.
     - LPG must NOT call Google Gemini REST endpoints.
-    - The user's configuration maps GEMINI_* keys to Groq API keys, so we reuse GEMINI_* here.
+    - The user's configuration provides Groq API keys for LPG; preferred vars are LPG_API_*, legacy GEMINI_* is still accepted.
 
     Returns: (ok, ocr_text, reason)
     """
-    if aiohttp is None:
-        return False, "", "aiohttp_missing"
+    try:
+        if aiohttp is None:
+            return False, "", "aiohttp_missing"
 
-    # Keys (Groq API keys stored in GEMINI_* env vars)
-    keys_raw = (os.getenv("GEMINI_API_KEYS", "") or "").strip()
-    keys: list[str] = []
-    if keys_raw:
-        keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
-    if not keys:
-        for kn in ("GEMINI_API_KEY", "GEMINI_API_KEY_B", "GEMINI_BACKUP_API_KEY"):
-            kv = (os.getenv(kn, "") or "").strip()
-            if kv:
-                keys.append(kv)
-    if not keys:
-        return False, "", "no_key(GEMINI_*)"
+        # Keys (Groq API keys reserved for LPG)
+        # Preferred: LPG_API_*
+        # Backward compatibility: GEMINI_* (legacy naming)
+        keys_raw = (_cfg_get("LPG_API_KEYS", "") or "").strip()
+        keys: list[str] = []
+        if keys_raw:
+            keys = [k.strip() for k in keys_raw.split(",") if k.strip()]
+        if not keys:
+            for kn in ("LPG_API_KEY", "LPG_API_KEY_B", "LPG_BACKUP_API_KEY"):
+                kv = (_cfg_get(kn, "") or "").strip()
+                if kv:
+                    keys.append(kv)
 
-    # Model selection: prefer dedicated OCR model, else reuse GROQ_MODEL_VISION.
-    model = (os.getenv("GROQ_MODEL_VISION_OCR", "") or "").strip()
-    if not model:
-        model = (os.getenv("GROQ_MODEL_VISION", "") or "").strip()
-    if not model:
-        cand = (os.getenv("GROQ_MODEL_VISION_CANDIDATES", "") or "").strip()
-        if cand:
-            model = [x.strip() for x in cand.split(",") if x.strip()][0]
-    if not model:
-        return False, "", "no_groq_vision_model"
+        # Legacy fallback
+        if not keys:
+            keys_raw2 = (_cfg_get("GEMINI_API_KEYS", "") or "").strip()
+            if keys_raw2:
+                keys = [k.strip() for k in keys_raw2.split(",") if k.strip()]
+        if not keys:
+            for kn in ("GEMINI_API_KEY", "GEMINI_API_KEY_B", "GEMINI_BACKUP_API_KEY"):
+                kv = (_cfg_get(kn, "") or "").strip()
+                if kv:
+                    keys.append(kv)
 
-    img_bytes, mime = _maybe_convert_to_jpeg(image_bytes)
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
-    data_url = f"data:{mime};base64,{b64}"
+        if not keys:
+            return False, "", "no_key(LPG_API_* or legacy GEMINI_*)"
 
-    sys_prompt = (
-        "You are an OCR engine. Extract all readable text from the image. "
-        "Return ONLY compact JSON: {\"text\": \"...\"}. No commentary."
-    )
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "max_tokens": 900,
-        "messages": [
-            {"role": "system", "content": sys_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                    {"type": "text", "text": "OCR this image. Output JSON only."},
-                ],
-            },
-        ],
-    }
+        # Model selection: prefer dedicated OCR model, else reuse GROQ_MODEL_VISION.
+        model = (os.getenv("GROQ_MODEL_VISION_OCR", "") or "").strip()
+        if not model:
+            model = (os.getenv("GROQ_MODEL_VISION", "") or "").strip()
+        if not model:
+            cand = (os.getenv("GROQ_MODEL_VISION_CANDIDATES", "") or "").strip()
+            if cand:
+                model = [x.strip() for x in cand.split(",") if x.strip()][0]
+        if not model:
+            return False, "", "no_groq_vision_model"
 
-    timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_ms) / 1000.0))
-    last_err = "no_result"
-    url = "https://api.groq.com/openai/v1/chat/completions"
+        img_bytes, mime = _maybe_convert_to_jpeg(image_bytes)
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        data_url = f"data:{mime};base64,{b64}"
 
-    for key in keys:
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    url,
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        last_err = f"http_{resp.status}"
-                        continue
-                    js = await resp.json()
-        except asyncio.TimeoutError:
-            # OCR timeout: fail open (no veto) but keep the return signature stable.
-            return False, "", "timeout"
+        sys_prompt = (
+            "You are an OCR engine. Extract all readable text from the image. "
+            "Return ONLY compact JSON: {\"text\": \"...\"}. No commentary."
+        )
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "max_tokens": 900,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                        {"type": "text", "text": "OCR this image. Output JSON only."},
+                    ],
+                },
+            ],
+        }
 
-        except Exception as e:
-            last_err = f"vision_failed:{e.__class__.__name__}"
-            continue
+        timeout = aiohttp.ClientTimeout(total=max(1.0, float(timeout_ms) / 1000.0))
+        last_err = "no_result"
+        url = "https://api.groq.com/openai/v1/chat/completions"
 
-        try:
-            content = (js.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        except Exception:
-            content = ""
-
-        if not content:
-            last_err = "no_result"
-            continue
-
-        # Prefer strict JSON, but salvage if model returns raw text.
-        ocr_text = ""
-        try:
-            obj = json.loads(content)
-            ocr_text = str(obj.get("text", "") or "").strip()
-        except Exception:
+        for key in keys:
             try:
-                mm = re.search(r"\{\s*\"text\"\s*:\s*\".*?\"\s*\}", content, flags=re.S)
-                if mm:
-                    obj = json.loads(mm.group(0))
-                    ocr_text = str(obj.get("text", "") or "").strip()
-                else:
-                    ocr_text = str(content).strip()
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        url,
+                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                        json=payload,
+                    ) as resp:
+                        if resp.status != 200:
+                            last_err = f"http_{resp.status}"
+                            continue
+                        js = await resp.json()
+            except asyncio.TimeoutError:
+                # OCR timeout: fail open (no veto) but keep the return signature stable.
+                return False, "", "timeout"
+
+            except Exception as e:
+                last_err = f"vision_failed:{e.__class__.__name__}"
+                continue
+
+            try:
+                content = (js.get("choices") or [{}])[0].get("message", {}).get("content", "")
             except Exception:
-                ocr_text = str(content).strip()
+                content = ""
 
-        if ocr_text:
-            return True, ocr_text, "ok"
+            if not content:
+                last_err = "no_result"
+                continue
 
-        last_err = "empty_text"
+            # Prefer strict JSON, but salvage if model returns raw text.
+            ocr_text = ""
+            try:
+                obj = json.loads(content)
+                ocr_text = str(obj.get("text", "") or "").strip()
+            except Exception:
+                try:
+                    mm = re.search(r"\{\s*\"text\"\s*:\s*\".*?\"\s*\}", content, flags=re.S)
+                    if mm:
+                        obj = json.loads(mm.group(0))
+                        ocr_text = str(obj.get("text", "") or "").strip()
+                    else:
+                        ocr_text = str(content).strip()
+                except Exception:
+                    ocr_text = str(content).strip()
 
-    return False, "", last_err
+            if ocr_text:
+                return True, ocr_text, "ok"
+
+            last_err = "empty_text"
+
+        return False, "", last_err
+    except Exception as e:
+        return False, "", "exc:" + type(e).__name__
+
 class LPGThreadBridgeGuard(commands.Cog):
     """Lucky Pull guard (thread-aware) — fully env-aligned.
     - Only deletes when image is classified as Lucky (Gemini) unless LPG_REQUIRE_CLASSIFY=0.
@@ -557,9 +576,15 @@ class LPGThreadBridgeGuard(commands.Cog):
                 or os.getenv("LUCKYPULL_GUARD_CHANNELS", "")
             )
         )
-        self.timeout = float(
-            os.getenv("LPG_TIMEOUT_SEC", os.getenv("LUCKYPULL_TIMEOUT_SEC", "10"))
-        )
+        # IMPORTANT: read from env_reader so runtime_env.json wiring is honored even before env-hybrid export.
+        try:
+            from nixe.helpers.env_reader import get as _get
+            self.timeout = float(_get("LPG_TIMEOUT_SEC", _get("LUCKYPULL_TIMEOUT_SEC", "10")))
+        except Exception:
+            self.timeout = float(os.getenv("LPG_TIMEOUT_SEC", os.getenv("LUCKYPULL_TIMEOUT_SEC", "10")))
+
+        # Classification timeout retry cap (seconds). If initial classify hits timeout, retry once with larger timeout.
+        self.timeout_retry_cap = float(os.getenv("LPG_CLASSIFY_TIMEOUT_RETRY_CAP", "25") or "25")
         self.thr = float(
             os.getenv("LPG_GEMINI_THRESHOLD")
             or os.getenv("GEMINI_LUCKY_THRESHOLD", "0.85")
@@ -614,7 +639,7 @@ class LPGThreadBridgeGuard(commands.Cog):
         self.neg_hard_veto = _env_bool("LPG_NEGATIVE_HARD_VETO", True)
         self.neg_minlen = _env_int("LPG_NEGATIVE_HARD_VETO_MINLEN", 3)
         self.neg_tokens = [t.lower() for t in _load_neg_text() if t and len(t.strip()) >= self.neg_minlen]
-        self.neg_ocr_timeout_ms = _env_int("LPG_NEGATIVE_OCR_TIMEOUT_MS", 3500)
+        self.neg_ocr_timeout_ms = _env_int("LPG_NEGATIVE_OCR_TIMEOUT_MS", 12000)
 
 
         log.warning(
@@ -653,7 +678,21 @@ class LPGThreadBridgeGuard(commands.Cog):
         """
         if not self.neg_hard_veto or not self.neg_tokens:
             return False, "veto_disabled"
-        ok, ocr_text, r = await _ocr_neg_text(image_bytes, timeout_ms=self.neg_ocr_timeout_ms)
+        try:
+
+            _ret = await _ocr_neg_text(image_bytes, timeout_ms=self.neg_ocr_timeout_ms)
+
+            if (not isinstance(_ret, tuple)) or (len(_ret) != 3):
+
+                ok, ocr_text, r = False, "", "invalid_return(" + type(_ret).__name__ + ")"
+
+            else:
+
+                ok, ocr_text, r = _ret
+
+        except Exception as e:
+
+            ok, ocr_text, r = False, "", "ocr_exc(" + type(e).__name__ + ")"
         if not ok or not ocr_text:
             return False, f"ocr_skip({r})"
         low = ocr_text.lower()
@@ -681,6 +720,61 @@ class LPGThreadBridgeGuard(commands.Cog):
                 return True, f"negtext_veto(ocr:{tok})"
         return False, "no_neg_match"
 
+
+    def _temp_env(self, mapping: dict[str, str]):
+        """Temporarily set os.environ for the duration of a classify call.
+        This does NOT mutate runtime_env.json; it only adjusts the current process env,
+        and values are restored immediately after the call.
+        """
+        class _EnvCtx:
+            def __init__(self, mp: dict[str, str]):
+                self.mp = mp
+                self.prev: dict[str, str | None] = {}
+            def __enter__(self):
+                for k, v in self.mp.items():
+                    self.prev[k] = os.environ.get(k)
+                    os.environ[k] = str(v)
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                for k, prev in self.prev.items():
+                    if prev is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = prev
+                return False
+        return _EnvCtx(mapping)
+
+    def _get_timeout_sec(self) -> float:
+        """Resolve the active LPG timeout from runtime/env, with sane fallbacks."""
+        try:
+            from nixe.helpers.env_reader import get as _get  # type: ignore
+            v = _get("LPG_TIMEOUT_SEC", _get("LUCKYPULL_TIMEOUT_SEC", self.timeout))
+        except Exception:
+            v = os.getenv("LPG_TIMEOUT_SEC", os.getenv("LUCKYPULL_TIMEOUT_SEC", str(self.timeout)))
+        try:
+            t = float(v or 0.0)
+        except Exception:
+            t = float(self._get_timeout_sec() or 0.0)
+        if t <= 0:
+            t = 10.0
+        return t
+
+    def _sync_groq_budget_env(self, total_timeout_sec: float):
+        """Align gemini_bridge internal LPG budgets with guard timeout to prevent premature timeouts."""
+        try:
+            t = float(total_timeout_sec or 0.0)
+        except Exception:
+            t = 0.0
+        if t <= 0:
+            return {}
+        # Keep a small safety margin so asyncio.wait_for does not kill mid-parse.
+        total_budget = max(3.0, t - 0.5)
+        # Per-attempt timeout should be smaller than total budget.
+        per_attempt = max(2.8, min(total_budget - 0.3, total_budget - 1.0))  # ~= total_budget-1.0
+        return {
+            "LUCKYPULL_GROQ_TOTAL_TIMEOUT_SEC": f"{total_budget:.3f}",
+            "LUCKYPULL_GROQ_TIMEOUT": f"{per_attempt:.3f}",
+        }
     async def _classify(self, message: discord.Message, *, image_bytes: Optional[bytes] = None) -> tuple[bool, float, str, str]:
         """Classify image with resilient Gemini + BURST fallback.
         Returns: (lucky_ok, score, provider, reason)
@@ -700,7 +794,7 @@ class LPGThreadBridgeGuard(commands.Cog):
             if not data:
                 return (False, 0.0, "none", "empty_bytes")
             if len(data) > self.max_bytes:
-                data = data[: self.max_bytes]
+                data = await asyncio.to_thread(_compress_to_under, data, int(self.max_bytes))
 
             # Hard negative-text veto via OCR (prevents Epiphany/reward selection false positives)
             vetoed, vreason = await self._negtext_veto(data)
@@ -711,7 +805,21 @@ class LPGThreadBridgeGuard(commands.Cog):
             # Primary path: gemini_bridge (may be monkeypatched by overlay).
             # Fetch from module at call-time to respect overlays.
             import nixe.helpers.gemini_bridge as _gb
-            res = await asyncio.wait_for(_gb.classify_lucky_pull_bytes(data), timeout=self.timeout)
+            try:
+
+                with self._temp_env(self._sync_groq_budget_env(float(self._get_timeout_sec() or 0.0))):
+                    res = await asyncio.wait_for(getattr(_gb,'classify_lucky_pull_bytes_raw', _gb.classify_lucky_pull_bytes)(data), timeout=self._get_timeout_sec())
+
+            except asyncio.TimeoutError:
+
+                # Retry once with a larger timeout to avoid transient latency causing false negatives.
+
+                _t2 = max(float(self._get_timeout_sec() or 0.0) * 2.0, float(self._get_timeout_sec() or 0.0) + 2.0)
+
+                _t2 = min(_t2, float(self.timeout_retry_cap or 25.0))
+
+                with self._temp_env(self._sync_groq_budget_env(float(_t2 or 0.0))):
+                    res = await asyncio.wait_for(getattr(_gb,'classify_lucky_pull_bytes_raw', _gb.classify_lucky_pull_bytes)(data), timeout=float(_t2 or self._get_timeout_sec()))
 
             ok: bool = False
             score: float = 0.0
@@ -779,6 +887,10 @@ class LPGThreadBridgeGuard(commands.Cog):
                 mention = ch.mention if ch else f"<#{self.redirect_id}>"
         except Exception as e:
             log.debug("[lpg-thread-bridge] redirect resolve failed: %r", e)
+        # If NOT lucky: strict cleanup only (no persona/notice spam)
+        if not bool(lucky):
+            return
+
         # Persona
         text = None
         persona_ok = False
@@ -887,7 +999,7 @@ class LPGThreadBridgeGuard(commands.Cog):
                 if fmt == "webp" or fmt not in ("jpeg", "png"):
                     raw_bytes = None
                 elif isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) > LPG_MAX_SEND:
-                    raw_bytes = _compress_to_under(bytes(raw_bytes), LPG_MAX_SEND)
+                    raw_bytes = await asyncio.to_thread(_compress_to_under, bytes(raw_bytes), LPG_MAX_SEND)
         except Exception as e:
             log.debug("[lpg-thread-bridge] failed to read bytes for LPG: %r", e)
             raw_bytes = None
@@ -917,8 +1029,10 @@ class LPGThreadBridgeGuard(commands.Cog):
 
         if self.require_classify:
             if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
-                return
-            lucky, score, provider, reason = await self._classify(message, image_bytes=bytes(raw_bytes))
+                # Still enforce strict guard cleanup even when we cannot read bytes.
+                lucky, score, provider, reason = (False, 0.0, "none", "empty_bytes")
+            else:
+                lucky, score, provider, reason = await self._classify(message, image_bytes=bytes(raw_bytes))
             log.info(
                 "[lpg-thread-bridge] classify: lucky=%s score=%.3f via=%s reason=%s",
                 lucky,
@@ -931,7 +1045,21 @@ class LPGThreadBridgeGuard(commands.Cog):
             # Run OCR only when classifier says LUCKY and neg-token list is empty (avoids extra OCR calls).
             if lucky and (not self.neg_tokens) and isinstance(raw_bytes, (bytes, bytearray)) and raw_bytes:
                 try:
-                    ok2, ocr_text2, r2 = await _ocr_neg_text(bytes(raw_bytes), timeout_ms=self.neg_ocr_timeout_ms)
+                    try:
+
+                        _ret2 = await _ocr_neg_text(bytes(raw_bytes), timeout_ms=self.neg_ocr_timeout_ms)
+
+                        if (not isinstance(_ret2, tuple)) or (len(_ret2) != 3):
+
+                            ok2, ocr_text2, r2 = False, "", "invalid_return(" + type(_ret2).__name__ + ")"
+
+                        else:
+
+                            ok2, ocr_text2, r2 = _ret2
+
+                    except Exception as e:
+
+                        ok2, ocr_text2, r2 = False, "", "ocr_exc(" + type(e).__name__ + ")"
                     if ok2 and ocr_text2:
                         low2 = ocr_text2.lower()
                         lv_hits2 = len(re.findall(r"\blv\.?\s*\d{1,3}\b", low2))

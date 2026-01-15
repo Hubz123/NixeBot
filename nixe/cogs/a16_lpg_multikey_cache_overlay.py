@@ -26,21 +26,34 @@ def _split_multi(val: str):
         return []
     return [p for p in re.split(r"[\s,;|]+", val.strip()) if p]
 
-def _gather_gemini_keys():
+def _gather_lpg_keys():
     keys = []
-    keys += _split_multi(os.getenv("GEMINI_API_KEY", ""))
-    keys += _split_multi(os.getenv("GEMINI_API_KEY_B", ""))
-    raw = os.getenv("GEMINI_KEYS", "").strip()
+    # Preferred new naming
+    keys += _split_multi(os.getenv("LPG_API_KEY", ""))
+    keys += _split_multi(os.getenv("LPG_API_KEY_B", ""))
+    raw = os.getenv("LPG_API_KEYS", "").strip()
     if raw:
-        if raw.startswith("["):
-            try:
-                import json as _json
-                arr = _json.loads(raw)
-                keys += [str(x).strip() for x in arr if str(x).strip()]
-            except Exception:
-                pass
-        else:
-            keys += [s.strip() for s in raw.split(",") if s.strip()]
+        keys += [s.strip() for s in raw.replace(";", ",").split(",") if s.strip()]
+
+    # Legacy fallback
+    if not keys:
+        keys += _split_multi(os.getenv("GEMINI_API_KEY", ""))
+        keys += _split_multi(os.getenv("GEMINI_API_KEY_B", ""))
+        raw2 = os.getenv("GEMINI_API_KEYS", "").strip()
+        if raw2:
+            keys += [s.strip() for s in raw2.replace(";", ",").split(",") if s.strip()]
+        raw3 = os.getenv("GEMINI_KEYS", "").strip()
+        if raw3:
+            if raw3.startswith("["):
+                try:
+                    import json as _json
+                    arr = _json.loads(raw3)
+                    keys += [str(x).strip() for x in arr if str(x).strip()]
+                except Exception:
+                    pass
+            else:
+                keys += [s.strip() for s in raw3.split(",") if s.strip()]
+
     # dedupe while keeping order
     seen = set()
     uniq = []
@@ -51,13 +64,13 @@ def _gather_gemini_keys():
     return uniq
 
 def _collect_state() -> str:
-    keys = _gather_gemini_keys()
-    models = os.getenv("GEMINI_MODELS", "gemini-2.5-flash-lite,gemini-2.5-flash")
+    keys = _gather_lpg_keys()
+    models = os.getenv("GROQ_MODEL_VISION", "").strip() or os.getenv("GROQ_MODEL_VISION_CANDIDATES", "").strip() or "unset"
     order = os.getenv("LPG_PROVIDER_ORDER", "gemini,groq")
     img_order = os.getenv("LPG_IMAGE_PROVIDER_ORDER", order)
-    cool = os.getenv("GEMINI_COOLDOWN_SEC", "600")
-    timeout = os.getenv("GEMINI_TIMEOUT_MS", "20000")
-    retries = os.getenv("GEMINI_MAX_RETRIES", "2")
+    cool = os.getenv("LPG_COOLDOWN_SEC", os.getenv("GEMINI_COOLDOWN_SEC", "600"))
+    timeout = os.getenv("GROQ_TIMEOUT_MS", os.getenv("GEMINI_TIMEOUT_MS", "20000"))
+    retries = os.getenv("LPG_MAX_RETRIES", os.getenv("GEMINI_MAX_RETRIES", "2"))
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     masked = ", ".join([f"**{_mask_tail(k)}**" for k in keys]) if keys else "none"

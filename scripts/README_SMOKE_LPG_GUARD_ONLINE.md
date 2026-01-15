@@ -21,7 +21,7 @@ python scripts\smoke_lpg_guard_online.py ^
   --runtime-json nixe\config\runtime_env.json
 ```
 
-- Requires **DISCORD_TOKEN** and **GEMINI_API_KEY** (optionally **GEMINI_API_KEY_B**) in `.env`
+- Requires **DISCORD_TOKEN** and **LPG_API_KEY (legacy GEMINI_API_KEY also supported)** (optionally **LPG_API_KEY (legacy GEMINI_API_KEY also supported)_B**) in `.env`
 - Uses your `GEMINI_MODEL` from env if set; default `gemini-2.5-flash-lite`
 - Threshold from `LPG_THRESHOLD` env (default **0.85**)
 

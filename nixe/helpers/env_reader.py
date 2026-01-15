@@ -44,20 +44,35 @@ def _get_flag(name: str, default: str = "0") -> str:
     return str(s).strip() if s is not None else str(default)
 
 def get(key: str, default: str = "") -> str:
+    """Read config value with support for JSON runtime + optional secrets.json.
+
+    No implicit aliasing is performed; callers must request the explicit key they need.
+    """
     allow_json_secrets = _get_flag("NIXE_ALLOW_JSON_SECRETS", "1") == "1"
-    if _is_sensitive(key):
-        env_v = os.environ.get(key, None)
-        if env_v is not None: return str(env_v).strip()
-        if allow_json_secrets:
-            s = _load_json(SECRETS_JSON).get(key, None)
-            if s is not None and str(s).strip(): return str(s).strip()
-            j = _load_json(ENV_JSON).get(key, None)
-            if j is not None and str(j).strip(): return str(j).strip()
-        return str(default)
-    v = _load_json(ENV_JSON).get(key, None)
-    if v is None or str(v).strip() in ("", "<inherit>", "<placeholder>"):
-        v = os.environ.get(key, default)
-    return str(v).strip() if v is not None else str(default)
+
+    def _get_one(k: str) -> str:
+        k = (k or "").strip().upper()
+        if not k:
+            return ""
+        if _is_sensitive(k):
+            env_v = os.environ.get(k, None)
+            if env_v is not None and str(env_v).strip():
+                return str(env_v).strip()
+            if allow_json_secrets:
+                s = _load_json(SECRETS_JSON).get(k, None)
+                if s is not None and str(s).strip():
+                    return str(s).strip()
+                j = _load_json(ENV_JSON).get(k, None)
+                if j is not None and str(j).strip():
+                    return str(j).strip()
+            return ""
+        v = _load_json(ENV_JSON).get(k, None)
+        if v is None or str(v).strip() in ("", "<inherit>", "<placeholder>"):
+            v = os.environ.get(k, None)
+        return str(v).strip() if v is not None and str(v).strip() not in ("", "<inherit>", "<placeholder>") else ""
+
+    v = _get_one(key)
+    return v if v else str(default)
 
 def get_int(key: str, default: int = 0) -> int:
     try:
@@ -70,13 +85,30 @@ def get_bool01(key: str, default: str = "0") -> str:
     return "1" if s in ("1","true","yes","y","on") else "0"
 
 def source(key: str) -> str:
+    """Return the best-effort source of a key (env / secrets.json / runtime_env.json).
+
+    No implicit aliasing is performed; source() reflects only the requested key.
+    """
     allow_json_secrets = _get_flag("NIXE_ALLOW_JSON_SECRETS", "1") == "1"
-    if _is_sensitive(key):
-        if os.environ.get(key, None) is not None: return "env"
-        if allow_json_secrets:
-            if _load_json(SECRETS_JSON).get(key, None): return "secrets.json"
-            if _load_json(ENV_JSON).get(key, None): return "runtime_env.json"
+
+    def _source_one(k: str) -> str:
+        k = (k or "").strip().upper()
+        if not k:
+            return "<default>"
+        if _is_sensitive(k):
+            if os.environ.get(k, None) is not None:
+                return "env"
+            if allow_json_secrets:
+                if _load_json(SECRETS_JSON).get(k, None):
+                    return "secrets.json"
+                if _load_json(ENV_JSON).get(k, None):
+                    return "runtime_env.json"
+            return "<default>"
+        if _load_json(ENV_JSON).get(k, None):
+            return "runtime_env.json"
+        if os.environ.get(k, None) is not None:
+            return "env"
         return "<default>"
-    if _load_json(ENV_JSON).get(key, None): return "runtime_env.json"
-    if os.environ.get(key, None) is not None: return "env"
-    return "<default>"
+
+    src = _source_one(key)
+    return src

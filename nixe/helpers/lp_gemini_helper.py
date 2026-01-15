@@ -3,8 +3,8 @@
 Legacy compatibility helper used by LuckyPullGuard.
 
 IMPORTANT RULES (project policy):
-- LPG must use GEMINI_API_KEY / GEMINI_API_KEY_B (these keys are used for LPG via Groq models in gemini_bridge).
-- GROQ_API_KEY is phishing-only.
+- LPG must use LPG_API_KEY / LPG_API_KEY_B (Groq keys). Legacy GEMINI_API_KEY/GEMINI_API_KEY_B is still accepted for backward compatibility.
+- GROQ_API_KEY is phishing-only (do not rely on it for LPG).
 - TRANSLATE_GEMINI_API_KEY is translate-only.
 
 This module MUST NOT call Google Gemini REST.
@@ -12,6 +12,7 @@ This module MUST NOT call Google Gemini REST.
 
 from __future__ import annotations
 
+import os
 import asyncio
 from typing import Optional, Tuple
 
@@ -19,7 +20,16 @@ from .env_reader import get
 from . import gemini_bridge
 
 def _has_lpg_key() -> bool:
-    # GEMINI_API_KEYS (CSV) is supported in gemini_bridge; keep simple checks here.
+    # Prefer new naming
+    if (get("LPG_API_KEYS", "") or "").strip():
+        return True
+    if (get("LPG_API_KEY", "") or "").strip():
+        return True
+    if (get("LPG_API_KEY_B", "") or "").strip():
+        return True
+    if (get("LPG_BACKUP_API_KEY", "") or "").strip():
+        return True
+    # Legacy fallback
     if (get("GEMINI_API_KEYS", "") or "").strip():
         return True
     if (get("GEMINI_API_KEY", "") or "").strip():
@@ -36,7 +46,7 @@ def is_gemini_enabled() -> bool:
 
 async def score_lucky_pull_image_async(
     image_bytes: bytes,
-    timeout: float = 7.0,
+    timeout: float = 12.0,
 ) -> Optional[Tuple[bool, float, str]]:
     """Async LPG scoring wrapper.
     Returns (is_lucky, score, reason) or None if unavailable/error.
@@ -51,12 +61,25 @@ async def score_lucky_pull_image_async(
         if not ok:
             return None
         return (bool(score >= 0.0), float(score), str(reason or "")[:200])
+    except asyncio.TimeoutError:
+        try:
+            _t2 = max(float(timeout or 0.0) * 2.0, float(timeout or 0.0) + 2.0)
+            _t2 = min(_t2, float(os.getenv('LPG_CLASSIFY_TIMEOUT_RETRY_CAP', '25') or '25'))
+            ok, score, _via, reason = await asyncio.wait_for(
+                gemini_bridge.classify_lucky_pull_bytes(image_bytes),
+                timeout=_t2,
+            )
+            if not ok:
+                return None
+            return (bool(score >= 0.0), float(score), str(reason or '')[:200])
+        except Exception:
+            return None
     except Exception:
         return None
 
 def score_lucky_pull_image(
     image_bytes: bytes,
-    timeout: float = 7.0,
+    timeout: float = 12.0,
 ) -> Optional[Tuple[bool, float, str]]:
     """Synchronous wrapper.
 

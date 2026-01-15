@@ -313,7 +313,7 @@ class LPGCachePersistence(commands.Cog):
                 except Exception:
                     continue
 
-            log.warning(
+            log.info(
                 "[lpgmem] bootstrap scanned=%s loaded=%s backfilled=%s (render=%s minipc=%s)",
                 scanned,
                 loaded,

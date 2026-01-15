@@ -71,8 +71,13 @@ LPG_BURST_IMPL_REV = "burst-v3-nonrec-2025-11-29"
 # ---------------------------------------------------------------------------
 
 def _env(key: str, default: str = "") -> str:
-    v = os.getenv(key)
-    return str(v) if v is not None else default
+    try:
+        from .env_reader import get as _get
+        v = _get(key, default)
+        return str(v) if v is not None else str(default)
+    except Exception:
+        v = os.getenv(key)
+        return str(v) if v is not None else default
 
 
 def _env_f(key: str, default: float) -> float:
@@ -83,25 +88,55 @@ def _env_f(key: str, default: float) -> float:
 
 
 def _keys() -> List[str]:
-    """Collect Gemini keys from various envs; order-preserving de-dup."""
+    """Collect LPG Groq keys; order-preserving de-dup.
+
+    Preferred new naming suggested by user:
+      - LPG_API_KEYS (CSV)
+      - LPG_API_KEY / LPG_API_KEY_B / LPG_API_KEY2 / LPG_BACKUP_API_KEY
+
+    Backward compatibility:
+      - GEMINI_API_KEYS (CSV)
+      - GEMINI_API_KEY / GEMINI_API_KEY_B / GEMINI_API_KEY2 / GEMINI_BACKUP_API_KEY
+    """
     keys: List[str] = []
-    raw = _env("GEMINI_API_KEYS", "").strip()
-    if raw:
+
+    def add_raw(raw: str):
+        if not raw:
+            return
         for part in raw.replace(";", ",").split(","):
             k = part.strip()
             if k and k not in keys:
                 keys.append(k)
+
+    # Preferred
+    add_raw(_env("LPG_API_KEYS", "").strip())
     for name in [
-        "GEMINI_API_KEY",
-        "GEMINI_API_KEY_B",
-        "GEMINI_API_KEYB",
-        "GEMINI_API_KEY_2",
-        "GEMINI_API_KEY2",
-        "GEMINI_BACKUP_API_KEY",
+        "LPG_API_KEY",
+        "LPG_API_KEY_B",
+        "LPG_API_KEYB",
+        "LPG_API_KEY_2",
+        "LPG_API_KEY2",
+        "LPG_BACKUP_API_KEY",
     ]:
         v = _env(name, "").strip()
         if v and v not in keys:
             keys.append(v)
+
+    # Legacy fallback
+    if not keys:
+        add_raw(_env("GEMINI_API_KEYS", "").strip())
+        for name in [
+            "GEMINI_API_KEY",
+            "GEMINI_API_KEY_B",
+            "GEMINI_API_KEYB",
+            "GEMINI_API_KEY_2",
+            "GEMINI_API_KEY2",
+            "GEMINI_BACKUP_API_KEY",
+        ]:
+            v = _env(name, "").strip()
+            if v and v not in keys:
+                keys.append(v)
+
     return keys
 
 

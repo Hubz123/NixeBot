@@ -1,4 +1,38 @@
-import os, aiohttp, json, base64, asyncio, re, time, io
+import os, aiohttp, json, base64, asyncio, re, time, io, logging
+import httpx
+
+_log = logging.getLogger(__name__)
+
+
+
+
+def _make_httpx_timeout(total: float):
+    """Build an httpx timeout object compatible across httpx versions.
+
+    Returns either httpx.Timeout or a float fallback (seconds).
+    """
+    try:
+        # Most httpx versions accept a single "total" seconds parameter.
+        return httpx.Timeout(total)
+    except Exception:
+        pass
+    try:
+        # Some versions require per-phase keyword arguments.
+        return httpx.Timeout(connect=total, read=total, write=total, pool=total)
+    except Exception:
+        # Fallback: httpx.AsyncClient accepts a float timeout.
+        return float(total)
+
+
+async def _async_httpx_client(*, timeout):
+    """Create an httpx.AsyncClient with best-effort compatibility across httpx versions.
+
+    Some older httpx releases do not accept `follow_redirects` in the AsyncClient constructor.
+    """
+    try:
+        return httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+    except TypeError:
+        return httpx.AsyncClient(timeout=timeout)
 
 try:
     from groq import Groq  # type: ignore
@@ -46,8 +80,17 @@ def _prepare_inline_image(image_bytes: bytes) -> tuple[bytes, str]:
         return image_bytes, mime
 
 def _env(k: str, default: str = "") -> str:
-    v = os.getenv(k)
-    return v if v is not None and v != "" else default
+    """Read config consistently with runtime/secrets policy.
+    Prefer nixe.helpers.env_reader.get (supports runtime_env.json + secrets.json with NIXE_ALLOW_JSON_SECRETS),
+    fallback to os.getenv for minimal contexts.
+    """
+    try:
+        from .env_reader import get as _get  # lazy import to avoid cycles
+        v = _get(k, default)
+        return str(v).strip() if v is not None and str(v).strip() != "" else str(default)
+    except Exception:
+        v = os.getenv(k)
+        return v if v is not None and v != "" else default
 
 def _load_neg_text() -> list[str]:
     """Load LPG_NEGATIVE_TEXT from env/runtime_env (JSON list or CSV)."""
@@ -68,61 +111,84 @@ def _load_neg_text() -> list[str]:
 
 
 def _build_sys_prompt() -> str:
-    # Fixed NOT_LUCKY phrases to reduce event/banner false-positives.
+    # Fixed NOT_LUCKY phrases to reduce promo/banner false-positives.
+    # NOTE: Do not rely on these keywords alone; strong RESULTS cues should win.
     fixed_neg = [
-        "event", "version", "banner", "promo", "announcement", "福利", "版本", "活动",
-        "免费", "领取", "时装", "套装", "抽+", "抽", "换装", "skin", "costume",
-        "reward", "login bonus", "patch notes",
-        "rescue merit", "available rewards", "guaranteed", "only once", "obtain", "not owned", "reward list", "reward select", "claim reward", "exchange", "shop", "store", "purchase", "selector", "currency", "merit", "redeem",
+        # Broad promo/notice/banners
+        "event", "version", "banner", "promo", "announcement", "patch notes",
+        "福利", "版本", "活动",
+        # Cosmetics / outfits
+        "时装", "套装", "skin", "costume", "换装",
+        # Store / redeem / selector UIs (inventory-like)
+        "store", "purchase", "buy", "redeem", "兑换", "商店", "购买", "selector", "currency",
+        # Explicit reward pages (not results screens)
+        "login bonus", "available rewards", "rescue merit",
     ]
     neg = fixed_neg + _load_neg_text()
     neg_txt = ", ".join(f'"{p}"' for p in neg if p)
 
     return (
         "You are a game UI analyst.\n"
-        "Task: Decide if an IMAGE shows a **gacha/lucky-pull RESULTS screen** "
-        "or **NOT** (promotional banner/event notice/inventory/loadout/etc).\n\n"
-        "Return ONLY compact JSON: {\"lucky\": <true|false>, \"score\": 0..1, \"reason\": \"...\"}.\n\n"
-        "Strong LUCKY cues (need 2+ at the SAME time):\n"
-        "Multi-result (10-pull) screens:\n"
-        "- ~8–12 result tiles (often 10) in a grid/row layout,\n"
-        "- Each tile is a character/weapon/gear icon with STAR rarity markers (★ etc) and/or rarity color frames,\n"
-        "- Result UI buttons like Confirm/Skip/Continue plus a currency/progress bar.\n"
-        "Single-result (1-pull) acquisition screens:\n"
-        "- One large character/card illustration presented as a newly obtained result (often has a 'NEW' badge),\n"
-        "- A clear rarity indicator near the nameplate (row of ★ stars, rarity badge),\n"
-        "- Result-style UI (tap/confirm/continue) rather than full character-detail menus.\n\n"
-        "Strong NOT_LUCKY cues:\n"
-        "- Promotional/event banners or announcements with BIG headline text,\n"
-        "- Collage of multiple character arts without in-game result grid/UI,\n"
-        "- Deck-building, loadout, or skill-card management screens where you are configuring cards or skills you own rather than seeing the outcome of a pull.\n- Character roster/collection/team selection screens (many character icons with levels like 'Lv. 90', elements, and a scrollable grid) are NOT gacha results.\n- If the screenshot shows many repeated level labels (e.g., 'Lv.' appears 3+ times) or looks like a unit list / inventory grid, set lucky=false with score <= 0.2.\n- Wiki/leak-style character sheets or lineups with IDs/names/roles (not an in-game result UI) are NOT gacha results.\n"
-        "- Screens mentioning or corresponding to any of: " + neg_txt + ".\n\n"
+        "Task: Decide if an IMAGE shows a **gacha/lucky-pull RESULTS screen** or **NOT** "
+        "(promotional banner/event notice/inventory/loadout/roster/etc).\n\n"
+        "Guidance:\n"
+        "- LUCKY/RESULTS screens usually show multiple reward tiles/cards, rarity indicators (stars/colors), and action buttons like "
+        "\"Convene/Draw again\", \"10x/1x\", \"Skip\", \"Confirm\", or equivalent.\n"
+        "- NOT_LUCKY includes: event banners/announcements, shop/redeem/selectors, inventory/roster/loadouts, tier lists/rankings.\n"
+        "- If strong RESULTS cues are present, return lucky=true even if some negative keywords appear.\n\n"
+        "Return ONLY compact JSON: {\"lucky\": <true|false>, \"score\": 0..1, \"reason\": \"...\"}.\n"
+        "Score rubric: 0.90+ = clear results UI; 0.70-0.89 = likely results but partial/blurred; "
+        "0.50-0.69 = ambiguous; <0.50 = not results.\n\n"
+        "Negative keyword hints (do NOT treat as absolute): "
+        + neg_txt
+        + "\n\n"
         "Rules:\n"
         "- Be conservative: if mixed/unsure, choose not_lucky with score <= 0.4.\n"
         "- Only choose lucky with score >= 0.9 when results UI is clear."
     )
 
 def _env_keys_list() -> list[str]:
+    """Return LPG key list (Groq API keys) for LuckyPullGuard.
+
+    Preferred new naming:
+      - LPG_API_KEYS (CSV)
+      - LPG_API_KEY / LPG_API_KEY_B / LPG_BACKUP_API_KEY
+
+    Backward compatibility (legacy still accepted):
+      - GEMINI_API_KEYS (CSV)
+      - GEMINI_API_KEY / GEMINI_API_KEY_B / GEMINI_BACKUP_API_KEY
     """
-    Prefer GEMINI_API_KEYS (CSV). Fallback to legacy single-key vars.
-    """
-    raw = (_env("GEMINI_API_KEYS", "") or "").strip()
     keys: list[str] = []
+
+    # Preferred new vars
+    raw = (_env("LPG_API_KEYS", "") or "").strip()
     if raw:
         keys = [k.strip() for k in raw.split(",") if k.strip()]
     if not keys:
-        for kname in ("GEMINI_API_KEY", "GEMINI_API_KEY_B", "GEMINI_BACKUP_API_KEY"):
-            kv = _env(kname, "").strip()
+        for kname in ("LPG_API_KEY", "LPG_API_KEY_B", "LPG_BACKUP_API_KEY"):
+            kv = (_env(kname, "") or "").strip()
             if kv:
                 keys.append(kv)
-    dedup = []
+
+    # Legacy fallback
+    if not keys:
+        raw2 = (_env("GEMINI_API_KEYS", "") or "").strip()
+        if raw2:
+            keys = [k.strip() for k in raw2.split(",") if k.strip()]
+    if not keys:
+        for kname in ("GEMINI_API_KEY", "GEMINI_API_KEY_B", "GEMINI_BACKUP_API_KEY"):
+            kv = (_env(kname, "") or "").strip()
+            if kv:
+                keys.append(kv)
+
+    # Dedupe (stable)
+    dedup: list[str] = []
     seen = set()
     for k in keys:
-        if k not in seen:
-            dedup.append(k); seen.add(k)
+        if k and k not in seen:
+            dedup.append(k)
+            seen.add(k)
     return dedup
-
-
 def _env_models_list() -> list[str]:
     """
     Models list for LPG classifier (Groq-only).
@@ -247,75 +313,99 @@ async def _call_groq_lpg_once(
     mime: str,
     timeout_sec: float,
 ) -> tuple[bool, float, str, str]:
-    """
-    Call Groq for Lucky Pull Guard, using GEMINI_* keys as API keys.
-
-    This keeps GROQ_API_KEY reserved for the phishing module, while LPG
-    reuses the existing GEMINI_API_KEY / GEMINI_API_KEY_B env vars.
+    """Call Groq (OpenAI-compatible) for Lucky Pull Guard.
 
     Returns:
-        (ok, score, via, reason) with `via` shaped as "gemini:<model>"
-        so that existing overlays that check provider strings remain valid.
+        (lucky, score, via, reason) with via shaped as "gemini:<model>" for backward compatibility.
     """
-    if not key or Groq is None:
-        return False, 0.0, f"gemini:{model}", "no_groq_client"
+    via = f"gemini:{model}"
+    if not key:
+        return False, 0.0, via, "no_api_key"
+    if not model:
+        return False, 0.0, via, "no_model"
+
+    # Build OpenAI-compatible chat/completions request with inline data URL image.
+    try:
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+    except Exception:
+        return False, 0.0, via, "b64_error"
+
+    data_url = f"data:{mime};base64,{b64}"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Classify this image."},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0,
+        "max_tokens": 128,
+    }
+
+    # Tight, cancellable http timeout (no executor/thread leaks).
+    _t = float(timeout_sec or 0.0)
+    if _t <= 0:
+        _t = 6.0
+    timeout = _make_httpx_timeout(_t)
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
     try:
-        client = Groq(api_key=key)
-    except Exception:
-        return False, 0.0, f"gemini:{model}", "no_groq_client"
+        async with (await _async_httpx_client(timeout=timeout)) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            # Ensure we always see a request/response line even if httpx logging isn't enabled.
+            _log.info("[lpg] groq chat.completions status=%s model=%s", resp.status_code, model)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        # httpx timeout exception class names vary across versions; do not reference a missing attribute
+        # in an `except httpx.X` clause (can itself raise AttributeError).
+        _timeout_types = []
+        for _n in ("TimeoutException", "TimeoutError", "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout"):
+            _t = getattr(httpx, _n, None)
+            if isinstance(_t, type):
+                _timeout_types.append(_t)
+        if isinstance(e, asyncio.TimeoutError) or (_timeout_types and isinstance(e, tuple(_timeout_types))):
+            return False, 0.0, via, "timeout"
+        return False, 0.0, via, f"error:{type(e).__name__}:{e}"
 
-    # Inline image as data URL; prompt is shared with the old Gemini path
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-    content = [
-        {"type": "text", "text": sys_prompt},
-        {
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
-        },
-    ]
-
-    loop = asyncio.get_running_loop()
-
-    def _run_sync() -> str:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-            temperature=0,
-        )
-        msg = resp.choices[0].message
-        c = getattr(msg, "content", "")
-        if isinstance(c, list):
-            txt = ""
-            for part in c:
+    # Extract assistant text
+    txt = ""
+    try:
+        choices = data.get("choices") or []
+        msg = (choices[0] or {}).get("message") or {}
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     txt += str(part.get("text") or "")
-            return txt
-        return c or ""
-
-    try:
-        txt = await asyncio.wait_for(
-            loop.run_in_executor(None, _run_sync),
-            timeout=timeout_sec,
-        )
-    except asyncio.TimeoutError:
-        return False, 0.0, f"gemini:{model}", "timeout"
-    except Exception as e:
-        return False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}"
+        else:
+            txt = str(content or "")
+    except Exception:
+        txt = ""
 
     js = _extract_json_obj(txt)
     if not js:
-        return False, 0.0, f"gemini:{model}", "parse_error"
+        return False, 0.0, via, "parse_error"
     try:
         obj = json.loads(js)
     except Exception:
-        return False, 0.0, f"gemini:{model}", "parse_error"
+        return False, 0.0, via, "parse_error"
 
     lucky = bool(obj.get("lucky", obj.get("is_lucky", False)))
     score = float(obj.get("score", obj.get("confidence", 0.0)) or 0.0)
     reason = str(obj.get("reason", "") or "")
-
-    return lucky, score, f"gemini:{model}", reason or "early(ok)"
+    return lucky, score, via, reason or "early(ok)"
 
 
 
@@ -347,16 +437,17 @@ async def _classify_one(
     )
 
 
-async def classify_lucky_pull_bytes(image_bytes: bytes):
+async def _classify_lucky_pull_bytes_core(image_bytes: bytes):
     """
     Lucky Pull Guard classifier.
 
-    Default behavior (do not alter): no forced shrinking and no forced key preference.
-    Keys are selected from GEMINI_API_KEYS / GEMINI_API_KEY in the declared order.
-    GEMINI_API_KEY_B is NOT prioritized here; it is reserved for the suspicious-gate path.
-
     Return format:
         (ok: bool, score: float, via: str, reason: str)
+
+    Notes:
+    - LPG uses Groq vision models (see _env_models_list) and LPG keys (see _env_keys_list).
+    - To avoid premature classify_timeout, we clamp per-attempt timeout and total budget to the caller's
+      outer LPG_TIMEOUT_SEC (if configured), with small safety margins.
     """
     keys = _env_keys_list()
     if not keys:
@@ -365,18 +456,34 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
     models = _env_models_list()
     if not models:
         return False, 0.0, "none", "no_groq_model"
-    if not models:
-        models = ["meta-llama/llama-4-scout-17b-16e-instruct"]
 
     sys_prompt = _build_sys_prompt()
     img_bytes, mime = _prepare_inline_image(image_bytes)
 
-    per_timeout = _pick_timeout_sec()
-    total_budget = _pick_total_budget_sec(
-        per_timeout=per_timeout,
-        n_models=len(models),
-        n_keys=len(keys),
+    per_timeout = float(_pick_timeout_sec() or 0.0)
+    total_budget = float(
+        _pick_total_budget_sec(
+            per_timeout=per_timeout,
+            n_models=len(models),
+            n_keys=len(keys),
+        )
+        or 0.0
     )
+
+    # Align internal budgets with runtime outer timeout (do NOT shrink as a percentage).
+    try:
+        outer = float(_env("LPG_TIMEOUT_SEC", "0") or 0.0)
+    except Exception:
+        outer = 0.0
+    if outer and outer > 0:
+        # Keep small safety margins for JSON parsing / network jitter.
+        per_timeout = min(per_timeout, max(2.5, outer - 0.9))
+        total_budget = min(total_budget, max(3.0, outer - 0.4))
+
+    if per_timeout <= 0:
+        per_timeout = 6.0
+    if total_budget <= 0:
+        total_budget = max(3.0, per_timeout)
 
     last_via, last_reason = "none", "no_attempt"
     deadline = time.time() + max(3.0, float(total_budget))
@@ -385,6 +492,11 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
         for key in keys:
             if time.time() > deadline:
                 return False, 0.0, last_via, "timeout_total_budget"
+
+            # Do not exceed remaining total budget.
+            remaining = max(1.5, deadline - time.time())
+            timeout_sec = min(float(per_timeout), float(remaining))
+
             try:
                 ok, score, via, reason = await _classify_one(
                     img_bytes=img_bytes,
@@ -392,28 +504,44 @@ async def classify_lucky_pull_bytes(image_bytes: bytes):
                     sys_prompt=sys_prompt,
                     model=model,
                     api_key=key,
-                    timeout_sec=per_timeout,
+                    timeout_sec=timeout_sec,
                 )
             except Exception as e:
-                last_via, last_reason = "err", f"err:{type(e).__name__}"
-                continue
+                ok, score, via, reason = False, 0.0, f"gemini:{model}", f"error:{type(e).__name__}:{e}"
 
             last_via, last_reason = via, reason
             score = float(score or 0.0)
 
+            # Fast accept on very confident "lucky".
             if bool(ok) and score >= 0.9:
                 return True, score, via, reason or "early(ok)"
 
+            # Retry on transient/low-signal reasons.
             rlow = (reason or "").lower()
             if ("timeout" in rlow) or ("error" in rlow) or ("parse_error" in rlow):
                 continue
 
+            # First definitive answer.
             return bool(ok), score, via, reason or "early(ok)"
 
     return False, 0.0, last_via, last_reason or "parse_error"
 
 
-async def classify_lucky_pull_bytes_suspicious(image_bytes: bytes, max_bytes: int | None = None):
+
+# -----------------------------
+# Stable, overlay-safe entrypoints
+# -----------------------------
+# NOTE:
+# Some overlays monkeypatch classify_lucky_pull_bytes() with their own asyncio.wait_for timeouts.
+# LPG guard must be able to bypass those wrappers to avoid false classify_timeout.
+# Use classify_lucky_pull_bytes_raw() from guards; it calls the core implementation directly.
+async def classify_lucky_pull_bytes(image_bytes: bytes):
+    return await _classify_lucky_pull_bytes_core(image_bytes)
+
+# Guard/diagnostics should call this to bypass monkeypatch wrappers safely.
+classify_lucky_pull_bytes_raw = _classify_lucky_pull_bytes_core
+
+async def _classify_lucky_pull_bytes_suspicious_core(image_bytes: bytes, max_bytes: int | None = None):
     """
     Suspicious-gate variant for JPG/PNG/JPEG only.
 
@@ -522,3 +650,8 @@ def _shrink_for_gemini(image_bytes: bytes, max_bytes: int) -> tuple[bytes, str]:
 
 
 
+# Overlay-safe suspicious entrypoint
+async def classify_lucky_pull_bytes_suspicious(image_bytes: bytes):
+    return await _classify_lucky_pull_bytes_suspicious_core(image_bytes)
+
+classify_lucky_pull_bytes_suspicious_raw = _classify_lucky_pull_bytes_suspicious_core

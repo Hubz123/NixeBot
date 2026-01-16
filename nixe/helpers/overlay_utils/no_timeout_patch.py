@@ -48,12 +48,17 @@ def patch_shield_overlay():
             mod = __import__(modname, fromlist=["*"])
         except Exception:
             continue
-        target_names = ["classify_lucky_pull_bytes","classify_lucky_pull","_classify_lucky_pull_bytes"]
+        target_names = ["classify_lucky_pull_bytes", "classify_lucky_pull", "_classify_lucky_pull_bytes"]
         impl = getattr(mod, "_impl", None)
-        async def passthrough(*a, **kw):
-            if callable(impl):
-                return await impl(*a, **kw)
-            return (False, 0.0, "none", "no_result")
+
+        def _make_passthrough(_impl):
+            async def passthrough(*a, **kw):
+                if callable(_impl):
+                    return await _impl(*a, **kw)
+                return (False, 0.0, "none", "no_result")
+            return passthrough
+
+        passthrough = _make_passthrough(impl)
         for name in target_names:
             if hasattr(mod, name):
                 setattr(mod, name, passthrough)

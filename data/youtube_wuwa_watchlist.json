@@ -154,12 +154,6 @@
       "url": "https://www.youtube.com/@rokoko6693"
     },
     {
-      "name": "@sakuracofene",
-      "query": "@sakuracofene",
-      "handle": "@sakuracofene",
-      "url": "https://www.youtube.com/@sakuracofene"
-    },
-    {
       "name": "@seraalara",
       "query": "@seraalara",
       "handle": "@seraalara",
@@ -482,9 +476,10 @@
     },
     {
       "name": "桜狐フェネ",
-      "query": "桜狐フェネ",
+      "query": "@sakuracofene",
       "handle": "@sakuracofene",
-      "url": "https://www.youtube.com/@sakuracofene"
+      "url": "https://www.youtube.com/@sakuracofene",
+      "channel_id": ""
     },
     {
       "name": "汐音りさ【Sion Risa】",

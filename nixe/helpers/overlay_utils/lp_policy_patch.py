@@ -33,34 +33,40 @@ def _apply_rules(payload):
 
 def apply_policy_patch():
     targets = ["nixe.helpers.gemini_bridge","nixe.helpers.lp_gemini_helper","nixe.helpers.gemini_lpg_bridge"]
+
+    def _make_wrapped(_fn, _modname: str, _fn_name: str):
+        async def wrapped(*a, **kw):
+            res = await _fn(*a, **kw)
+            try:
+                if isinstance(res, (list, tuple)) and len(res) >= 4:
+                    ok, score, via, reason = res[:4]
+                    payload = None
+                    if len(res) >= 5 and isinstance(res[4], (str, bytes)):
+                        txt = res[4].decode("utf-8", errors="replace") if isinstance(res[4], bytes) else res[4]
+                        try:
+                            payload = json.loads(txt)
+                        except Exception:
+                            payload = None
+                    if payload is None:
+                        return res
+                    ok2, score2, via2, reason2 = _apply_rules(payload)
+                    return (ok2, float(score2), f"{via}:{via2}", reason2)
+            except Exception as e:
+                logger.warning("[nixe-policy] wrapper error in %s.%s: %s", _modname, _fn_name, e)
+            return res
+        return wrapped
+
     for modname in targets:
         try:
             mod = __import__(modname, fromlist=["*"])
         except Exception:
             continue
+
         for fn_name in dir(mod):
             fn = getattr(mod, fn_name, None)
             if not callable(fn) or not inspect.iscoroutinefunction(fn):
                 continue
             if "classify" in fn_name and "lucky" in fn_name:
-                async def wrapped(*a, **kw):
-                    res = await fn(*a, **kw)
-                    try:
-                        if isinstance(res, (list, tuple)) and len(res) >= 4:
-                            ok, score, via, reason = res[:4]
-                            payload = None
-                            if len(res) >= 5 and isinstance(res[4], (str, bytes)):
-                                txt = res[4].decode("utf-8") if isinstance(res[4], bytes) else res[4]
-                                try:
-                                    payload = json.loads(txt)
-                                except Exception:
-                                    payload = None
-                            if payload is None:
-                                return res
-                            ok2, score2, via2, reason2 = _apply_rules(payload)
-                            return (ok2, float(score2), f"{via}:{via2}", reason2)
-                    except Exception as e:
-                        logger.warning("[nixe-policy] wrapper error: %s", e)
-                    return res
+                wrapped = _make_wrapped(fn, mod.__name__, fn_name)
                 setattr(mod, fn_name, wrapped)
                 logger.info("[nixe-policy] wrapped (lpg/groq) %s.%s for LP policy", mod.__name__, fn_name)

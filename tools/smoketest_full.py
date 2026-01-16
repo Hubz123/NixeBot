@@ -110,9 +110,16 @@ def main():
     env_path = os.path.join(PROJECT_ROOT, "nixe", "config", "runtime_env.json")
     with open(env_path, "r", encoding="utf-8") as f:
         env = json.load(f)
-    required = ["PHISH_AUTOBAN","PHISH_AUTOBAN_ON_PHASH","PHISH_REQUIRE_OCR_FOR_BAN","PHISH_PHASH_EXTS"]
-    missing=[k for k in required if k not in env]
-    assert not missing, f"runtime_env missing keys: {missing}"
+    # NOTE: PHISH_REQUIRE_OCR_FOR_BAN is OPTIONAL in code (defaults to "1" via os.getenv).
+    required = ["PHISH_AUTOBAN", "PHISH_AUTOBAN_ON_PHASH", "PHISH_PHASH_EXTS"]
+    optional = {"PHISH_REQUIRE_OCR_FOR_BAN": "1"}
+
+    missing = [k for k in required if k not in env]
+    assert not missing, f"runtime_env missing required keys: {missing}"
+
+    for k, default in optional.items():
+        if k not in env:
+            print(f"[WARN] runtime_env missing optional key {k}; code default={default!r} will apply")
 
     # Import cogs
     importlib.import_module("nixe.cogs.a16_phash_phish_guard_overlay")

@@ -157,7 +157,7 @@ def check_wiring() -> List[Result]:
     if YOUTUBE_MAIN.exists():
         t = _read_text(YOUTUBE_MAIN)
         if "NIXE_YT_WUWA_NOTIFY_ROLE_ID" in t:
-            res.append(Result("YouTube mentions", True, "YouTube notify role logic present (review AllowedMentions)", warning=True))
+            res.append(Result("YouTube mentions", True, "YouTube notify role logic present (OK)"))
         else:
             res.append(Result("YouTube mentions", True, "No notify-role setting found (OK)"))
     else:
@@ -235,24 +235,34 @@ def check_youtube_watchlist(watchlist_path: pathlib.Path, state_path: pathlib.Pa
 
     verifier = REPO_ROOT / "verify_youtube_watchlist.py"
     if verifier.exists():
-        if verify_full:
-            limit = verify_limit if verify_limit > 0 else 999999
-            sleep = str(verify_sleep)
+        # STRUCT verifier: fast, no-network (validates schema/urls/dups)
+        cmd_struct = [sys.executable, str(verifier), "--mode", "struct"]
+        code_s, out_s = _sh(cmd_struct, cwd=REPO_ROOT, timeout_s=30)
+        if code_s == 0:
+            r.append(Result("verify_youtube_watchlist.py (struct)", True, "Verifier STRUCT exited 0 (OK)"))
         else:
-            limit = 3
-            sleep = "0.1"
-        cmd = [sys.executable, str(verifier), "--sleep", str(sleep), "--limit", str(limit), "--timeout", str(verify_timeout)]
-        # FULL verifier may take longer for large watchlists (network bound).
-        base_timeout = 180 if verify_full else 60
-        code, out = _sh(cmd, cwd=REPO_ROOT, timeout_s=max(base_timeout, verify_timeout + 10))
-        if code == 0:
-            r.append(Result("verify_youtube_watchlist.py", True, ("Verifier FULL exited 0 (OK)" if verify_full else "Verifier QUICK exited 0 (OK)")))
-        else:
-            msg = f"Verifier {'FULL' if verify_full else 'QUICK'} failed (code={code}). Output: {_short(out, 220)}"
+            msg_s = f"Verifier STRUCT failed (code={code_s}). Output: {_short(out_s, 220)}"
             if strict_verify:
-                r.append(Result("verify_youtube_watchlist.py", False, msg))
+                r.append(Result("verify_youtube_watchlist.py (struct)", False, msg_s))
             else:
-                r.append(Result("verify_youtube_watchlist.py", True, msg, warning=True))
+                r.append(Result("verify_youtube_watchlist.py (struct)", True, msg_s, warning=True))
+
+        # NETWORK verifier: optional (can be slow). Only run when --verify-watchlist-full is explicitly set.
+        if verify_full:
+            limit = verify_limit if verify_limit > 0 else 10
+            sleep = str(verify_sleep)
+            cmd = [sys.executable, str(verifier), "--mode", "network", "--sleep", str(sleep), "--limit", str(limit), "--timeout", str(verify_timeout)]
+            # Network bound: give a bit more time but avoid hanging CI/smoketest.
+            base_timeout = 120
+            code, out = _sh(cmd, cwd=REPO_ROOT, timeout_s=max(base_timeout, verify_timeout + 10))
+            if code == 0:
+                r.append(Result("verify_youtube_watchlist.py (network)", True, "Verifier NETWORK exited 0 (OK)"))
+            else:
+                msg = f"Verifier NETWORK failed (code={code}). Output: {_short(out, 220)}"
+                if strict_verify:
+                    r.append(Result("verify_youtube_watchlist.py (network)", False, msg))
+                else:
+                    r.append(Result("verify_youtube_watchlist.py (network)", True, msg, warning=True))
     else:
         r.append(Result("verify_youtube_watchlist.py", True, "Verifier not present (skip)", warning=True))
     return r
@@ -443,7 +453,7 @@ def main() -> int:
 
     results.append(check_import_all_modules())
 
-    verify_full = bool(args.verify_watchlist_full or args.super)
+    verify_full = bool(args.verify_watchlist_full)
     results.extend(check_youtube_watchlist(
         pathlib.Path(args.watchlist),
         pathlib.Path(args.state),

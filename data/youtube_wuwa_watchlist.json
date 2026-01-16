@@ -461,6 +461,13 @@
       "url": "https://www.youtube.com/@hoshimiyachoco"
     },
     {
+      "name": "月見みみ",
+      "query": "月見みみ",
+      "handle": "@tsukimi_mimi",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@tsukimi_mimi"
+    },
+    {
       "name": "朱坂あさ / Akasaka Asa",
       "query": "朱坂あさ / Akasaka Asa",
       "handle": "@akasakaasa",
@@ -475,11 +482,17 @@
       "url": "https://www.youtube.com/@Ya_na_gi"
     },
     {
+      "name": "桃乃華あこた / Akotaya Ch",
+      "query": "桃乃華あこた / Akotaya Ch",
+      "handle": "@Momonoha_Akota",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Momonoha_Akota"
+    },
+    {
       "name": "桜狐フェネ",
-      "query": "@sakuracofene",
+      "query": "桜狐フェネ",
       "handle": "@sakuracofene",
-      "url": "https://www.youtube.com/@sakuracofene",
-      "channel_id": ""
+      "url": "https://www.youtube.com/@sakuracofene"
     },
     {
       "name": "汐音りさ【Sion Risa】",

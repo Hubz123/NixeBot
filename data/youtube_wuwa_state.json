@@ -59,7 +59,10 @@
     "1LLUMI(いるみ)": "_vhG1B7dY-4",
     "https://www.youtube.com/@Konochannel": "Xek2Kf8ofWM",
     "@Konochannel": "Xek2Kf8ofWM",
-    "宮月コノ": "Xek2Kf8ofWM"
+    "宮月コノ": "Xek2Kf8ofWM",
+    "https://www.youtube.com/@tsuzura_nai": "PF97t_Ih-J8",
+    "@tsuzura_nai": "PF97t_Ih-J8",
+    "廿楽ない / Tsuzura Nai": "PF97t_Ih-J8"
   },
   "announced_vids": {
     "sGI9faVLJmQ": 1768467607,
@@ -80,7 +83,8 @@
     "_Vd3KHz_iNk": 1768483118,
     "UpUuTe2yTsI": 1768483118,
     "_vhG1B7dY-4": 1768483119,
-    "Xek2Kf8ofWM": 1768483119
+    "Xek2Kf8ofWM": 1768483119,
+    "PF97t_Ih-J8": 1768550003
   },
   "resolved": {
     "https://www.youtube.com/@fal_mika": {
@@ -1112,7 +1116,82 @@
     },
     "https://www.youtube.com/@puu_channel": "ぷうちゃんねる",
     "@puu_channel": "ぷうちゃんねる",
-    "ぷうちゃんねる": "ぷうちゃんねる"
+    "ぷうちゃんねる": "ぷうちゃんねる",
+    "https://www.youtube.com/@AmanoMiko": {
+      "channel_id": "",
+      "title": "あまのみこ",
+      "url": "https://www.youtube.com/@AmanoMiko"
+    },
+    "@AmanoMiko": {
+      "channel_id": "",
+      "title": "あまのみこ",
+      "url": "https://www.youtube.com/@AmanoMiko"
+    },
+    "あまのみこ": {
+      "channel_id": "",
+      "title": "あまのみこ",
+      "url": "https://www.youtube.com/@AmanoMiko"
+    },
+    "https://www.youtube.com/@erusha": {
+      "channel_id": "",
+      "title": "erushaVA / エルシャ Ch.",
+      "url": "https://www.youtube.com/@erusha"
+    },
+    "@erusha": {
+      "channel_id": "",
+      "title": "erushaVA / エルシャ Ch.",
+      "url": "https://www.youtube.com/@erusha"
+    },
+    "erushaVA / エルシャ Ch.": {
+      "channel_id": "",
+      "title": "erushaVA / エルシャ Ch.",
+      "url": "https://www.youtube.com/@erusha"
+    },
+    "https://www.youtube.com/@tsukimi_mimi": {
+      "channel_id": "",
+      "title": "月見みみ",
+      "url": "https://www.youtube.com/@tsukimi_mimi"
+    },
+    "@tsukimi_mimi": {
+      "channel_id": "",
+      "title": "月見みみ",
+      "url": "https://www.youtube.com/@tsukimi_mimi"
+    },
+    "月見みみ": {
+      "channel_id": "",
+      "title": "月見みみ",
+      "url": "https://www.youtube.com/@tsukimi_mimi"
+    },
+    "https://www.youtube.com/@Momonoha_Akota": {
+      "channel_id": "",
+      "title": "桃乃華あこた / Akotaya Ch",
+      "url": "https://www.youtube.com/@Momonoha_Akota"
+    },
+    "@Momonoha_Akota": {
+      "channel_id": "",
+      "title": "桃乃華あこた / Akotaya Ch",
+      "url": "https://www.youtube.com/@Momonoha_Akota"
+    },
+    "桃乃華あこた / Akotaya Ch": {
+      "channel_id": "",
+      "title": "桃乃華あこた / Akotaya Ch",
+      "url": "https://www.youtube.com/@Momonoha_Akota"
+    },
+    "https://www.youtube.com/@konoyami_neko": {
+      "channel_id": "",
+      "title": "恋ノ病ねこ / konoyami neko",
+      "url": "https://www.youtube.com/@konoyami_neko"
+    },
+    "@konoyami_neko": {
+      "channel_id": "",
+      "title": "恋ノ病ねこ / konoyami neko",
+      "url": "https://www.youtube.com/@konoyami_neko"
+    },
+    "恋ノ病ねこ / konoyami neko": {
+      "channel_id": "",
+      "title": "恋ノ病ねこ / konoyami neko",
+      "url": "https://www.youtube.com/@konoyami_neko"
+    }
   },
   "watchlist_store_mid": 1453679239814582355
 }

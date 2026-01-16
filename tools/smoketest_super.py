@@ -44,6 +44,172 @@ PHISH_MAIN = REPO_ROOT / "nixe" / "cogs" / "phish_groq_guard.py"
 YOUTUBE_MAIN = REPO_ROOT / "nixe" / "cogs" / "a21_youtube_wuwa_live_announce.py"
 LPA_BRIDGE = REPO_ROOT / "nixe" / "helpers" / "lpa_provider_bridge.py"
 
+
+def install_discord_stub() -> None:
+    """Install a minimal discord.py stub so offline imports can run without discord.py installed."""
+    import types
+    if 'discord' in sys.modules:
+        return
+    discord = types.ModuleType('discord')
+    class _Exc(Exception):
+        pass
+    class Forbidden(_Exc):
+        pass
+    class HTTPException(_Exc):
+        pass
+    class NotFound(_Exc):
+        pass
+    discord.Forbidden = Forbidden
+    discord.HTTPException = HTTPException
+    discord.NotFound = NotFound
+
+    class Intents:
+        @classmethod
+        def none(cls):
+            return cls()
+        @classmethod
+        def default(cls):
+            return cls()
+        def __init__(self):
+            self.message_content = False
+            self.guilds = False
+    discord.Intents = Intents
+
+    def __getattr__(name):
+        # Provide missing discord types (Guild, Message, TextChannel, Interaction, etc.) for offline imports.
+        ns = {}
+        if name == 'app_commands':
+            import types
+            m = types.ModuleType('discord.app_commands')
+            class Group:
+                def __init__(self, *a, **k):
+                    pass
+                def command(self, *a, **k):
+                    def wrap(fn):
+                        return fn
+                    return wrap
+            def _decorator(*a, **k):
+                def wrap(fn):
+                    def _err_deco(*aa, **kk):
+                        def _w(f):
+                            return f
+                        return _w
+                    fn.error = _err_deco
+                    return fn
+                return wrap
+            m.Group = Group
+            m.command = _decorator
+            m.describe = _decorator
+            m.check = _decorator
+            m.default_permissions = _decorator
+            setattr(discord, name, m)
+            sys.modules['discord.app_commands'] = m
+            return m
+        if name == 'abc':
+            import types
+            m = types.ModuleType('discord.abc')
+            m.Messageable = type('Messageable', (), {})
+            setattr(discord, name, m)
+            sys.modules['discord.abc'] = m
+            return m
+        if name == 'Guild':
+            async def ban(self, *a, **k):
+                return None
+            ns['ban'] = ban
+        if name == 'AllowedMentions':
+            def __init__(self, *a, **k):
+                return None
+            ns['__init__'] = __init__
+        if name == 'Message':
+            async def delete(self, *a, **k):
+                return None
+            ns['delete'] = delete
+        cls = type(name, (), ns)
+        setattr(discord, name, cls)
+        return cls
+    discord.__getattr__ = __getattr__
+
+    # discord.ext.commands minimal
+    ext = types.ModuleType('discord.ext')
+    commands = types.ModuleType('discord.ext.commands')
+    tasks = types.ModuleType('discord.ext.tasks')
+
+    class _LoopWrapper:
+        def __init__(self, fn):
+            self._fn = fn
+        def before_loop(self, *a, **k):
+            def deco(bfn):
+                # ignore in stub
+                return bfn
+            return deco
+        def after_loop(self, *a, **k):
+            def deco(afn):
+                return afn
+            return deco
+        def error(self, *a, **k):
+            def deco(efn):
+                return efn
+            return deco
+        # runtime methods (no-op)
+        async def start(self, *a, **k):
+            return None
+        def cancel(self):
+            return None
+
+    def _loop(*dargs, **dkwargs):
+        def wrap(fn):
+            return _LoopWrapper(fn)
+        return wrap
+    tasks.loop = _loop
+
+    class Bot:
+        def __init__(self, *args, **kwargs):
+            pass
+    class Cog:
+        @classmethod
+        def listener(cls, *args, **kwargs):
+            def wrap(fn):
+                return fn
+            return wrap
+
+    def _decorator(*dargs, **dkwargs):
+        def wrap(fn):
+            # Attach common discord.py command helpers used at import time.
+            def _err_deco(*a, **k):
+                def _w(f):
+                    return f
+                return _w
+            fn.error = _err_deco
+            fn.before_invoke = _err_deco
+            fn.after_invoke = _err_deco
+            return fn
+        return wrap
+
+    commands.Bot = Bot
+    commands.Cog = Cog
+    commands.Context = type('Context', (), {})
+    commands.command = _decorator
+    commands.hybrid_command = _decorator
+    commands.group = _decorator
+    commands.hybrid_group = _decorator
+    commands.has_permissions = _decorator
+    commands.has_guild_permissions = _decorator
+    commands.bot_has_permissions = _decorator
+    commands.bot_has_guild_permissions = _decorator
+    commands.cooldown = _decorator
+    commands.guild_only = _decorator
+    commands.is_owner = _decorator
+    commands.max_concurrency = _decorator
+    commands.check = _decorator
+
+    ext.commands = commands
+    ext.tasks = tasks
+
+    sys.modules['discord'] = discord
+    sys.modules['discord.ext'] = ext
+    sys.modules['discord.ext.commands'] = commands
+    sys.modules['discord.ext.tasks'] = tasks
+
 @dataclass
 class Result:
     name: str
@@ -286,6 +452,10 @@ def _iter_modules_under_nixe() -> List[str]:
 def check_import_all_modules() -> Result:
     if str(REPO_ROOT) not in sys.path:
         sys.path.insert(0, str(REPO_ROOT))
+    try:
+        import discord  # noqa:F401
+    except Exception:
+        install_discord_stub()
     mods = _iter_modules_under_nixe()
     failed: List[str] = []
     for m in mods:

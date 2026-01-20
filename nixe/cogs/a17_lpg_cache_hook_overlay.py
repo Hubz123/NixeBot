@@ -14,7 +14,7 @@ Env (optional):
 - LPG_CACHE_STORE_ERROR_RESULTS (default "0")    -> if "1", also store http_error/timeout/no_result results
 """
 from __future__ import annotations
-import os, asyncio, logging
+import os, asyncio, logging, hashlib
 from discord.ext import commands
 
 log = logging.getLogger(__name__)
@@ -44,14 +44,41 @@ class LPGCacheHook(commands.Cog):
         try:
             import nixe.helpers.gemini_bridge as gb
             self._orig = gb.classify_lucky_pull_bytes
+            self._orig_raw = getattr(gb, 'classify_lucky_pull_bytes_raw', None)
         except Exception as e:
             self._orig = None
+            self._orig_raw = None
             log.warning("[lpg-cache] cannot hook gemini_bridge: %r", e)
             return
 
-        async def patched(image_bytes: bytes, *args, **kwargs):
-            if not self.enable or not self._orig:
-                return await self._orig(image_bytes, *args, **kwargs)
+        async def _patched_core(orig_func, image_bytes: bytes, *args, **kwargs):
+            # HARD OVERRIDE: denylist must force NOT LUCKY before any provider/caches.
+            # This must apply even when LPG_CACHE_ENABLE=0.
+            sha1 = hashlib.sha1(image_bytes).hexdigest()
+            try:
+                from nixe.helpers import lpg_denylist
+                if lpg_denylist.is_denied_sha1(sha1):
+                    return False, 0.0, 'unlearn_deny', 'deny_sha1'
+            except Exception:
+                pass
+
+            # If we cannot call the provider, fail closed (NOT LUCKY).
+            if not orig_func:
+                return False, 0.0, 'orig_missing', 'orig_missing'
+
+            # If cache is disabled, just call provider (denylist already handled).
+            if not self.enable:
+                return await orig_func(image_bytes, *args, **kwargs)
+
+            # Optional aHash deny (best effort; ignored if PIL missing).
+            try:
+                from nixe.helpers import lpg_denylist
+                from nixe.helpers import lpg_cache_memory as _cache
+                ah, _wh = _cache._to_ahash_bytes(image_bytes)  # type: ignore[attr-defined]
+                if lpg_denylist.is_denied_ahash(str(ah)):
+                    return False, 0.0, 'unlearn_deny', 'deny_ahash'
+            except Exception:
+                pass
 
             # Preload cache handles and potential hits; do NOT raise if cache is broken.
             exact_ent = None
@@ -82,7 +109,7 @@ class LPGCacheHook(commands.Cog):
                 cache_hint = ""
 
             # Call provider (shield/burst pipeline under the hood)
-            ok, score, via, reason = await self._orig(image_bytes, *args, **kwargs)
+            ok, score, via, reason = await orig_func(image_bytes, *args, **kwargs)
             try:
                 if cache_hint and isinstance(reason, str) and reason:
                     reason = f"{reason};{cache_hint}"
@@ -114,16 +141,6 @@ class LPGCacheHook(commands.Cog):
                     if exact_ent and exact_ent.get("ok") and float(exact_ent.get("score", 0.0)) >= self.sim_ok_min:
                         return True, float(exact_ent.get("score", 0.0)), "cache:sha1-fallback", f"fallback({reason})"
 
-                    if sim_ent is None:
-                        sim = cache.get_similar(image_bytes, self.maxdist)
-                        if sim:
-                            sim_ent, sim_dist = sim
-                    if (
-                        sim_ent
-                        and sim_ent.get("ok")
-                        and float(sim_ent.get("score", 0.0)) >= self.sim_ok_min
-                    ):
-                        return True, float(sim_ent.get("score", 0.0)), "cache:ahash-fallback", f"fallback({reason});dist={sim_dist}"
                 except Exception:
                     # If cache lookup fails here, fall back to original provider result.
                     pass
@@ -172,10 +189,18 @@ class LPGCacheHook(commands.Cog):
 
             return ok, score, via, reason
 
+        async def patched(image_bytes: bytes, *args, **kwargs):
+            return await _patched_core(self._orig, image_bytes, *args, **kwargs)
+
+        async def patched_raw(image_bytes: bytes, *args, **kwargs):
+            return await _patched_core(self._orig_raw, image_bytes, *args, **kwargs)
+
         # inject
         try:
             import nixe.helpers.gemini_bridge as gb2
             gb2.classify_lucky_pull_bytes = patched  # type: ignore
+            if getattr(gb2, 'classify_lucky_pull_bytes_raw', None):
+                gb2.classify_lucky_pull_bytes_raw = patched_raw  # type: ignore
             log.warning(
                 "[lpg-cache] hook enabled (maxdist=%s, sim_ok_min=%.2f, store_error_results=%s)",
                 self.maxdist,

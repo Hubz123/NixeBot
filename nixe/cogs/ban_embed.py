@@ -76,6 +76,79 @@ def build_ban_embed(
     embed.add_field(name="Moderator:", value=mod_val, inline=False)
     embed.add_field(name="Reason:", value=(reason if (reason and str(reason).strip()) else "—"), inline=False)
 
+
+    # Optional: attach human-readable phishing evidence (URL / attachment / embed) if available.
+    # Best-effort; never raises and never affects ban flow.
+    try:
+        if guild and target and getattr(target, "id", None):
+            from nixe.helpers import phish_evidence_cache as _pec
+            ev = _pec.pop(int(getattr(guild, "id", 0) or 0), int(getattr(target, "id", 0) or 0))
+            if ev:
+                lines_ev = []
+                j = str(ev.get("jump_url") or "").strip()
+                if j:
+                    lines_ev.append(f"Message: {j}")
+                sn = str(ev.get("snippet") or "").strip()
+                if sn:
+                    # keep it short to fit embed limits
+                    if len(sn) > 220:
+                        sn = sn[:217] + "..."
+                    lines_ev.append(f"Text: {sn}")
+                # Primary samples: attachments / urls / embeds
+                atts = ev.get("attachments") or []
+                if isinstance(atts, list) and atts:
+                    for a in atts[:3]:
+                        try:
+                            s = str(a).strip()
+                            if not s:
+                                continue
+                            # accept "filename | url" or plain url
+                            if "|" in s and "http" in s:
+                                left, right = s.split("|", 1)
+                                fn = left.strip()[:80] or "file"
+                                url = right.strip()[:220]
+                                if url:
+                                    lines_ev.append(f"Attachment: {fn} | {url}")
+                            else:
+                                lines_ev.append(f"Attachment: {s[:220]}")
+                        except Exception:
+                            continue
+                urls = ev.get("urls") or []
+                if isinstance(urls, list) and urls:
+                    for u in urls[:3]:
+                        try:
+                            u = str(u).strip()
+                            if u:
+                                lines_ev.append(f"URL: {u[:220]}")
+                        except Exception:
+                            continue
+                ems = ev.get("embeds") or []
+                if isinstance(ems, list) and ems:
+                    for u in ems[:2]:
+                        try:
+                            u = str(u).strip()
+                            if u:
+                                lines_ev.append(f"Embed: {u[:220]}")
+                        except Exception:
+                            continue
+
+                # Compose field value (Discord field value max 1024)
+                val = "\n".join(lines_ev).strip()
+                if val:
+                    if len(val) > 1024:
+                        val = val[:1021] + "..."
+                    embed.add_field(name="Evidence:", value=val, inline=False)
+
+                # If we have an image URL, show preview to make review faster.
+                img = str(ev.get("image_url") or "").strip()
+                if img:
+                    try:
+                        embed.set_image(url=img)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     if is_sim:
         embed.description = "*Ini hanya simulasi. Tidak ada aksi ban yang dilakukan.*"
 

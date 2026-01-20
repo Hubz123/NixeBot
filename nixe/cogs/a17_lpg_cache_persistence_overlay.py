@@ -28,7 +28,7 @@ from discord.ext import commands, tasks
 
 log = logging.getLogger(__name__)
 
-# Hardcoded permanent-memory thread (per user requirement)
+# Permanent-memory thread (per user requirement)
 MEMORY_THREAD_ID = 1435924665615908965
 
 # Footer format (parseable):
@@ -123,8 +123,8 @@ class LPGCachePersistence(commands.Cog):
         self.purge_sleep_ms = _env_int('LPG_CACHE_PURGE_SLEEP_MS', 350)
 
 
-        # Map for delete=unlearn
-        self._msgid_to_sha1: Dict[int, str] = {}
+        # Map for delete=unlearn->deny (mid -> (sha1, ahash))
+        self._msgid_to_fp: Dict[int, Tuple[str, str]] = {}
 
         self.thread: Optional[discord.Thread] = None
 
@@ -269,7 +269,7 @@ class LPGCachePersistence(commands.Cog):
                                 "ts": float(msg.created_at.timestamp()) if getattr(msg, "created_at", None) else 0.0,
                             }
                         )
-                        self._msgid_to_sha1[int(msg.id)] = sha1
+                        self._msgid_to_fp[int(msg.id)] = (sha1, ah)
                         loaded += 1
                     except Exception:
                         continue
@@ -296,7 +296,7 @@ class LPGCachePersistence(commands.Cog):
                     sha1 = str(ent.get("sha1") or "")
                     ah = str(ent.get("ahash") or "")
                     if sha1:
-                        self._msgid_to_sha1[int(msg.id)] = sha1
+                        self._msgid_to_fp[int(msg.id)] = (sha1, ah)
                         loaded += 1
                     backfilled += 1
 
@@ -339,13 +339,14 @@ class LPGCachePersistence(commands.Cog):
             if not m:
                 return
             sha1 = m.group(1).lower()
+            ah = m.group(2).lower()
             mid = int(getattr(message, "id", 0) or 0)
             if mid <= 0 or not sha1:
                 return
-            self._msgid_to_sha1[mid] = sha1
+            self._msgid_to_fp[mid] = (sha1, ah)
             try:
                 from nixe.helpers import lpg_cache_memory as cache
-                cache.register_msgid_sha1(mid, sha1)
+                cache.register_msgid_fp(mid, sha1, ah)
             except Exception:
                 pass
         except Exception:
@@ -367,16 +368,18 @@ class LPGCachePersistence(commands.Cog):
                     mid_i = int(mid or 0)
                 except Exception:
                     continue
-                sha1 = self._msgid_to_sha1.pop(mid_i, None)
-                if not sha1:
+                fp = self._msgid_to_fp.pop(mid_i, None)
+                if not fp:
                     try:
-                        sha1 = cache.pop_msgid_sha1(mid_i)
+                        fp = cache.pop_msgid_fp(mid_i)
                     except Exception:
-                        sha1 = None
-                if sha1:
+                        fp = None
+                if fp:
+                    sha1, ah = str(fp[0] or ""), str(fp[1] or "")
                     try:
+                        # Persist denylist first (best-effort), then remove from cache.
+                        await self._unlearn_to_deny(mid_i, sha1, ah, ch_id)
                         cache.remove_sha1(str(sha1))
-                        log.warning("[lpgmem] unlearn(bulk) mid=%s sha1=%s", mid_i, sha1)
                     except Exception:
                         pass
         except Exception:
@@ -390,15 +393,25 @@ class LPGCachePersistence(commands.Cog):
             mid = int(getattr(payload, "message_id", 0) or 0)
 
             # Primary path: thread id match + msgid→sha1 map (fast)
-            sha1 = self._msgid_to_sha1.pop(mid, None)
-            if not sha1:
+            fp = self._msgid_to_fp.pop(mid, None)
+            if not fp:
                 try:
                     from nixe.helpers import lpg_cache_memory as _cache
-                    sha1 = _cache.pop_msgid_sha1(mid)
+                    fp = _cache.pop_msgid_fp(mid)
                 except Exception:
-                    sha1 = None
+                    fp = None
 
             # Fallback: if the message was cached, parse footer to recover sha1 (covers older entries / boot-scan gaps).
+            sha1 = None
+            ah = None
+            if fp:
+                try:
+                    sha1 = str(fp[0] or "").lower()
+                    ah = str(fp[1] or "").lower()
+                except Exception:
+                    sha1 = None
+                    ah = None
+
             if not sha1:
                 try:
                     cached = getattr(payload, "cached_message", None)
@@ -408,6 +421,7 @@ class LPGCachePersistence(commands.Cog):
                         m = _FOOTER_RE.search(str(ft or ""))
                         if m:
                             sha1 = m.group(1).lower()
+                            ah = m.group(2).lower()
                 except Exception:
                     sha1 = None
 
@@ -429,10 +443,37 @@ class LPGCachePersistence(commands.Cog):
                     return
 
             from nixe.helpers import lpg_cache_memory as cache
+            # Persist deny first, then unlearn.
+            try:
+                await self._unlearn_to_deny(mid, str(sha1), str(ah or ''), ch_id)
+            except Exception:
+                pass
             cache.remove_sha1(sha1)
-            log.warning("[lpgmem] unlearn mid=%s sha1=%s ch=%s", mid, sha1[:8], ch_id)
+            log.warning("[lpgmem] unlearn->deny mid=%s sha1=%s ch=%s", mid, str(sha1)[:8], ch_id)
         except Exception:
             return
+
+    async def _unlearn_to_deny(self, mid: int, sha1: str, ahash: str, ch_id: int) -> None:
+        """Push an unlearned sha1/ahash into the denylist thread manager (Render-safe)."""
+        try:
+            # Only act on the configured memory thread.
+            if int(ch_id) != int(MEMORY_THREAD_ID):
+                return
+        except Exception:
+            return
+        try:
+            mgr = self.bot.get_cog("LPGDenylistThreadManager")
+            if mgr and hasattr(mgr, "enqueue_deny"):
+                await mgr.enqueue_deny(str(sha1), str(ahash or ""), src="unlearn")
+                return
+        except Exception:
+            pass
+        # Fallback (non-persistent): at least deny in-process.
+        try:
+            from nixe.helpers import lpg_denylist
+            lpg_denylist.add(str(sha1), str(ahash or ""))
+        except Exception:
+            pass
 
     @tasks.loop(hours=24 * 7)
     async def _weekly(self):

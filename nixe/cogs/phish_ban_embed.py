@@ -147,6 +147,14 @@ class PhishBanEmbed(commands.Cog):
             reason = str(payload.get("reason") or "")
             evidence = payload.get("evidence") or []
 
+
+            # Best-effort: store human-readable evidence for BanTemplateUnifier embeds.
+            try:
+                from nixe.helpers import phish_evidence_cache as _pec
+                _pec.record_from_payload(payload, provider=str(provider or ""), reason=str(reason or "")[:180])
+            except Exception:
+                pass
+
             kind = str(payload.get("kind") or "").strip().lower()
             # IMPORTANT POLICY:
             # - Groq vision results are log-only (to avoid false positives).

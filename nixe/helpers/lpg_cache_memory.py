@@ -66,6 +66,19 @@ def hamming_hex64(a: str, b: str) -> int:
     except Exception:
         return 64
 
+def is_valid_ahash(ah: str) -> bool:
+    """Return True iff ah looks like a real 64-bit aHash (16 hex chars) and is not the all-zero sentinel."""
+    try:
+        s = str(ah or '').strip().lower()
+        if len(s) != 16:
+            return False
+        if s == '0' * 16:
+            return False
+        int(s, 16)
+        return True
+    except Exception:
+        return False
+
 
 # -----------------------------
 # Memory store
@@ -76,6 +89,9 @@ _INDEX_AHASH: Dict[str, List[str]] = {}  # ahash -> [sha1, ...]
 # msg_id -> sha1 mapping (for delete=unlearn without needing embed/footer)
 # Keep bounded to avoid leaks on long-running instances.
 _MSGID_TO_SHA1 = OrderedDict()  # type: ignore[var-annotated]
+
+# msg_id -> (sha1, ahash) mapping (for denylist persistence)
+_MSGID_TO_FP = OrderedDict()  # type: ignore[var-annotated]
 
 def _msgid_cap() -> int:
     # Tie cap loosely to cache size; keep a sensible upper bound.
@@ -111,12 +127,50 @@ def register_msgid_sha1(msg_id: int, sha1: str) -> None:
     except Exception:
         return
 
+
+def register_msgid_fp(msg_id: int, sha1: str, ahash: str) -> None:
+    """Register (sha1, ahash) for a message id (used for delete=unlearn->deny)."""
+    try:
+        mid = int(msg_id or 0)
+        if mid <= 0:
+            return
+        s = str(sha1 or "").strip()
+        a = str(ahash or "").strip()
+        if not s:
+            return
+        _MSGID_TO_FP[mid] = (s, a)
+        try:
+            _MSGID_TO_FP.move_to_end(mid)
+        except Exception:
+            pass
+        cap = _msgid_cap()
+        if len(_MSGID_TO_FP) > cap:
+            drop = max(1, int(cap * 0.10))
+            for _ in range(drop):
+                try:
+                    _MSGID_TO_FP.popitem(last=False)
+                except Exception:
+                    break
+    except Exception:
+        return
+
 def pop_msgid_sha1(msg_id: int) -> Optional[str]:
     try:
         mid = int(msg_id or 0)
         if mid <= 0:
             return None
         return _MSGID_TO_SHA1.pop(mid, None)
+    except Exception:
+        return None
+
+
+def pop_msgid_fp(msg_id: int):
+    """Pop (sha1, ahash) for a message id."""
+    try:
+        mid = int(msg_id or 0)
+        if mid <= 0:
+            return None
+        return _MSGID_TO_FP.pop(mid, None)
     except Exception:
         return None
 
@@ -141,6 +195,8 @@ def stats() -> dict:
 
 
 def _index_add(sha1: str, ah: str) -> None:
+    if not is_valid_ahash(ah):
+        return
     _INDEX_AHASH.setdefault(ah, []).append(sha1)
 
 
@@ -230,6 +286,8 @@ def get_exact(image_bytes: bytes) -> Optional[dict]:
 
 def get_similar(image_bytes: bytes, max_hamming: int = 6) -> Optional[Tuple[dict, int]]:
     ah, _ = _to_ahash_bytes(image_bytes)
+    if not is_valid_ahash(ah):
+        return None
     # exact bucket
     sha_list = _INDEX_AHASH.get(ah, [])
     for sha in sha_list:
@@ -242,7 +300,10 @@ def get_similar(image_bytes: bytes, max_hamming: int = 6) -> Optional[Tuple[dict
     bestd = 65
     count = 0
     for ent in _CACHE.values():
-        d = hamming_hex64(ah, str(ent.get("ahash") or ("0" * 16)))
+        ent_ah = str(ent.get("ahash") or ("0" * 16))
+        if not is_valid_ahash(ent_ah):
+            continue
+        d = hamming_hex64(ah, ent_ah)
         if d < bestd:
             bestd = d
             best = ent

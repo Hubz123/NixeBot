@@ -1267,6 +1267,7 @@ class TranslateCommands(commands.Cog):
         self._registered = False
         self._register_lock = asyncio.Lock()
         self._target_overrides: Dict[int, str] = {}
+        self._ensure_task: asyncio.Task | None = None
 
     def _cooldown_ok(self, user_id: int) -> Tuple[bool, float]:
         cd = _as_float("TRANSLATE_COOLDOWN_SEC", 5.0)
@@ -2243,6 +2244,7 @@ class TranslateCommands(commands.Cog):
                         full_text,
                         max_total_chars=int(_as_float("TRANSLATE_MAX_EMBED_CHARS", 4800) or 4800),
                     )
+                elif target_code.startswith("zh") and _as_bool("TRANSLATE_ZH_DUAL_ENABLE", True):
                     ok_multi, data = await _gemini_translate_text_zh_multi(text_to_translate)
                     if not ok_multi:
                         await message.channel.send(data.get("reason", "Gagal translate ke Chinese."), reference=message)
@@ -2280,19 +2282,31 @@ class TranslateCommands(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        # ensure commands registered after ready (Render-safe)
-        if not self._registered:
-            self._ensure_task = None
-        # scheduled in on_ready to keep dry-run safe
+        """Register app commands after the bot is ready.
+
+        Some deployments (Render) may start before guild cache is populated;
+        we schedule registration as a background task and avoid duplicate runs.
+        """
+        if self._registered:
+            return
+        # Avoid stacking tasks across reconnects
+        t = getattr(self, '_ensure_task', None)
+        if t is not None and not t.done():
+            return
+        self._ensure_task = asyncio.create_task(self._ensure_registered())
+
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild):
+        # If user configured explicit guild IDs, don't auto-add/sync new guilds.
         if _translate_guild_ids():
-            return  # explicit list; don't auto-add
+            return
+        # Mark as dirty and schedule a re-register/sync.
         self._registered = False
-        self._ensure_task = None
-
-        # scheduled in on_ready to keep dry-run safe
+        t = getattr(self, '_ensure_task', None)
+        if t is not None and not t.done():
+            return
+        self._ensure_task = asyncio.create_task(self._ensure_registered())
 
 async def setup(bot: commands.Bot):
     cog = TranslateCommands(bot)

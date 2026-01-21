@@ -13,7 +13,7 @@ import html as _html
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 import aiohttp
 import discord
@@ -439,7 +439,14 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             pass
 
-
+    async def cog_load(self) -> None:
+        # Register persistent watchlist pager buttons (Render-safe).
+        try:
+            if _YTWatchlistPager is not None:
+                # total_pages is irrelevant for dispatch; only custom_id mapping matters.
+                self.bot.add_view(_YTWatchlistPager(self, page=1, total_pages=2))
+        except Exception:
+            pass
 
     def cog_unload(self):
         try:
@@ -451,6 +458,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 asyncio.create_task(self.session.close())
         except Exception:
             pass
+
 
     def _reload_watchlist(self):
         cfg = _read_json_any(WATCHLIST_PATH) or {}
@@ -466,26 +474,52 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
         self.template = str(tpl)
 
-        tlist = cfg.get("targets") or []
+        # Canonicalize/dedupe targets for stable runtime & display.
+        tlist_raw = cfg.get("targets") or []
+        try:
+            merged, _, _ = self._merge_targets([], tlist_raw)
+            tlist: List[Dict[str, str]] = [t for t in merged if isinstance(t, dict)]
+            cfg["targets"] = tlist
+        except Exception:
+            tlist = [t for t in tlist_raw if isinstance(t, dict)]
+
         out: List[Target] = []
         for t in tlist:
-            if isinstance(t, str):
-                name = t.strip()
-                if name:
-                    out.append(Target(name=name, query=name))
+            if not isinstance(t, dict):
                 continue
-            if isinstance(t, dict):
-                name = str(t.get("name") or "").strip()
-                if not name:
-                    continue
-                out.append(Target(
-                    name=name,
-                    query=str(t.get("query") or name),
-                    handle=str(t.get("handle") or ""),
-                    channel_id=str(t.get("channel_id") or ""),
-                    url=str(t.get("url") or ""),
-                ))
+
+            name = str(t.get("name") or t.get("channel_name") or "").strip()
+            handle = str(t.get("handle") or "").strip()
+            channel_id = str(t.get("channel_id") or "").strip()
+            url = str(t.get("url") or "").strip()
+
+            if name.startswith("@"):
+                name = name[1:].strip()
+
+            if not name:
+                if handle:
+                    name = handle.lstrip("@").strip()
+                elif channel_id:
+                    name = channel_id
+                elif url:
+                    name = url
+
+            if not name:
+                continue
+
+            url = self._canonicalize_youtube_channel_url(url) if url else ""
+            query = str(t.get("query") or handle or channel_id or name)
+
+            out.append(Target(
+                name=name,
+                query=query,
+                handle=handle,
+                channel_id=channel_id,
+                url=url,
+            ))
+
         self.targets = out
+
 
 
     @staticmethod
@@ -522,34 +556,116 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 out.append(t)
         return out
 
+
+    @staticmethod
+    def _canonicalize_youtube_channel_url(url: str) -> str:
+        """Return canonical channel URL (no query/fragment, no /videos suffix).
+        Best-effort; never raises.
+        """
+        u = (url or "").strip()
+        if not u:
+            return ""
+
+        # Normalize scheme
+        if u.startswith("//"):
+            u = "https:" + u
+        if not re.match(r"^https?://", u, re.IGNORECASE):
+            u = "https://" + u.lstrip("/")
+
+        try:
+            pu = urlparse(u)
+            netloc = (pu.netloc or "").lower()
+            if netloc in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+                netloc = "www.youtube.com"
+
+            path = pu.path or ""
+            # strip trailing slashes
+            path = re.sub(r"/+$", "", path)
+
+            # common suffix pages
+            for suf in ("/videos", "/featured", "/streams", "/live", "/community", "/about", "/playlists", "/shorts"):
+                if path.lower().endswith(suf):
+                    path = path[: -len(suf)]
+                    path = re.sub(r"/+$", "", path)
+                    break
+
+            # keep only the primary identifier segment
+            m = re.match(r"^/(@[0-9A-Za-z_\.\-]+)(?:/.*)?$", path, re.IGNORECASE)
+            if m:
+                path = "/" + m.group(1)
+
+            m = re.match(r"^/channel/(UC[0-9A-Za-z_\-]+)(?:/.*)?$", path, re.IGNORECASE)
+            if m:
+                path = "/channel/" + m.group(1)
+
+            m = re.match(r"^/(c|user)/([^/]+)(?:/.*)?$", path, re.IGNORECASE)
+            if m:
+                path = f"/{m.group(1)}/{m.group(2)}"
+
+            return urlunparse(("https", netloc, path, "", "", ""))
+        except Exception:
+            return u.split("?")[0].split("#")[0].rstrip("/")
+
+    @classmethod
+    def _target_dedupe_key(cls, t: Dict[str, str]) -> str:
+        """Compute stable dedupe key for watchlist targets."""
+        cid = (t.get("channel_id") or "").strip()
+        if cid:
+            return f"cid:{cid}"
+
+        h = (t.get("handle") or "").strip()
+        if h.startswith("@"):
+            h = h[1:]
+        h = h.strip().lower()
+        if h:
+            return f"h:{h}"
+
+        u = cls._canonicalize_youtube_channel_url(t.get("url") or "").lower()
+        if u:
+            return f"u:{u}"
+
+        nm = (t.get("name") or t.get("channel_name") or "").strip()
+        if nm.startswith("@"):
+            nm = nm[1:]
+        nm = unicodedata.normalize("NFKC", nm).casefold()
+        return f"n:{nm}"
+
     @classmethod
     def _token_to_target(cls, token: str) -> Optional[Dict[str, str]]:
-        """Convert a token into a watchlist target dict compatible with youtube_wuwa_watchlist.json."""
+        """Convert a token into a watchlist target dict compatible with youtube_wuwa_watchlist.json.
+        Notes:
+        - Never returns a name that begins with '@' (for cleaner embeds).
+        - Canonicalizes YouTube channel URLs to reduce duplicates (e.g., /videos, /featured).
+        """
         if not token:
             return None
         t = token.strip()
+        if not t:
+            return None
 
         handle = ""
         url = ""
         channel_id = ""
 
-        # handle
+        # handle token
         if t.startswith("@"):
             handle = t
             url = f"https://www.youtube.com/{handle}"
         elif "youtube.com" in t.lower():
-            url = t.split("?")[0].rstrip("/")
-            low = url.lower()
+            raw = t.split("?")[0].split("#")[0].rstrip("/")
+            low = raw.lower()
 
             # channel id
-            m = re.search(r"/channel/(UC[0-9A-Za-z_\-]+)", url, re.IGNORECASE)
+            m = re.search(r"/channel/(UC[0-9A-Za-z_\-]+)", raw, re.IGNORECASE)
             if m:
                 channel_id = m.group(1)
 
             # handle url
-            m = re.search(r"/(@[0-9A-Za-z_\.\-]+)$", url, re.IGNORECASE)
+            m = re.search(r"/(@[0-9A-Za-z_\.\-]+)(?:/.*)?$", raw, re.IGNORECASE)
             if m:
                 handle = m.group(1)
+
+            url = cls._canonicalize_youtube_channel_url(raw)
 
             # accept only likely channel URLs
             if not ("/channel/" in low or "/@" in low or "/c/" in low or "/user/" in low):
@@ -560,7 +676,23 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         else:
             return None
 
-        name = handle or channel_id or url
+        # Prefer canonical URL if we can derive it from handle/channel_id
+        if handle:
+            url = f"https://www.youtube.com/{handle}"
+        elif channel_id:
+            url = f"https://www.youtube.com/channel/{channel_id}"
+        else:
+            url = cls._canonicalize_youtube_channel_url(url)
+
+        # Name: never start with '@'
+        name = ""
+        if handle:
+            name = handle.lstrip("@").strip()
+        elif channel_id:
+            name = channel_id.strip()
+        elif url:
+            name = url
+
         query = handle or channel_id or name
 
         return {
@@ -572,68 +704,104 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         }
 
     @classmethod
-    def _merge_targets(cls, existing: List[Any], new_targets: List[Dict[str, str]]) -> Tuple[List[Any], int, List[Dict[str, str]]]:
-        """Merge target dicts into existing targets list (skip dupes).
+
+
+    @classmethod
+
+    def _merge_targets(cls, existing: List[Any], new_targets: List[Any]) -> Tuple[List[Any], int, List[Dict[str, str]]]:
+        """Merge target dicts into existing targets list (skip dupes + upgrade fields).
 
         Returns:
           merged_list, added_count, added_items
         """
-        def norm_handle(h: str) -> str:
-            return (h or "").strip().lower()
 
-        def norm_url(u: str) -> str:
-            return (u or "").strip().rstrip("/").lower()
+        def as_dict(x: Any) -> Optional[Dict[str, str]]:
+            if isinstance(x, dict):
+                return {k: str(v) for k, v in x.items() if v is not None}
+            if isinstance(x, str):
+                t = cls._token_to_target(x)
+                return t
+            return None
 
-        def norm_cid(c: str) -> str:
-            return (c or "").strip()
-
-        seen_h = set()
-        seen_u = set()
-        seen_c = set()
-
-        for item in existing or []:
-            if isinstance(item, dict):
-                seen_h.add(norm_handle(str(item.get("handle") or "")))
-                seen_u.add(norm_url(str(item.get("url") or "")))
-                seen_c.add(norm_cid(str(item.get("channel_id") or "")))
-            elif isinstance(item, str):
-                s = item.strip()
-                if s.startswith("@"):
-                    seen_h.add(norm_handle(s))
-                elif "youtube.com" in s.lower():
-                    seen_u.add(norm_url(s))
-
-        merged = list(existing or [])
+        merged: List[Any] = list(existing or [])
         added = 0
         added_items: List[Dict[str, str]] = []
 
-        for t in new_targets:
-            h = norm_handle(t.get("handle", ""))
-            u = norm_url(t.get("url", ""))
-            c = norm_cid(t.get("channel_id", ""))
+        # Build index for fast dedupe
+        index: Dict[str, Dict[str, str]] = {}
+        for it in merged:
+            d = as_dict(it)
+            if not d:
+                continue
+            # normalize url for stable keys
+            if d.get("url"):
+                d["url"] = cls._canonicalize_youtube_channel_url(d.get("url") or "")
+            key = cls._target_dedupe_key(d)
+            index[key] = d
 
-            is_dupe = False
-            if h and h in seen_h:
-                is_dupe = True
-            if u and u in seen_u:
-                is_dupe = True
-            if c and c in seen_c:
-                is_dupe = True
+        def is_better_name(cur: str, new: str) -> bool:
+            cur = (cur or "").strip()
+            new = (new or "").strip()
+            if not new:
+                return False
+            if not cur:
+                return True
+            # If current looks like a handle (or channel_id), prefer real name
+            if cur.startswith("@"):
+                return True
+            if _UC_ID_LIKE_RE.match(cur):
+                return True
+            return False
 
-            if is_dupe:
+        for raw in new_targets or []:
+            d = as_dict(raw)
+            if not d:
                 continue
 
-            merged.append(t)
-            added_items.append(t)
+            # Canonicalize
+            if d.get("url"):
+                d["url"] = cls._canonicalize_youtube_channel_url(d.get("url") or "")
+            if d.get("handle") and d["handle"].startswith("@@"):
+                d["handle"] = "@" + d["handle"].lstrip("@")
+
+            key = cls._target_dedupe_key(d)
+            exist = index.get(key)
+
+            # Also attempt cross-key match: cid/handle/url variants
+            if not exist:
+                cid = (d.get("channel_id") or "").strip()
+                if cid:
+                    exist = index.get(f"cid:{cid}")
+                if not exist:
+                    h = (d.get("handle") or "").strip()
+                    if h.startswith("@"):
+                        h = h[1:]
+                    if h:
+                        exist = index.get(f"h:{h.lower()}")
+                if not exist:
+                    u = (d.get("url") or "").strip().lower()
+                    if u:
+                        exist = index.get(f"u:{u}")
+
+            if exist:
+                # upgrade missing fields on the existing dict
+                if is_better_name(exist.get("name", ""), d.get("name", "")):
+                    exist["name"] = d.get("name", "")
+                for fld in ("query", "handle", "channel_id", "url"):
+                    if not (exist.get(fld) or "").strip() and (d.get(fld) or "").strip():
+                        exist[fld] = d.get(fld) or ""
+                # ensure key index updated (in case url/handle became available)
+                index[cls._target_dedupe_key(exist)] = exist
+                continue
+
+            # brand new entry
+            merged.append(d)
+            index[key] = d
+            added_items.append(d)
             added += 1
-            if h:
-                seen_h.add(h)
-            if u:
-                seen_u.add(u)
-            if c:
-                seen_c.add(c)
 
         return merged, added, added_items
+
 
     async def _ensure_watchlist_thread(self) -> Optional[discord.Thread]:
         """Ensure a public thread exists under WATCHLIST_PARENT_CHANNEL_ID and return it."""
@@ -827,28 +995,72 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             return None
 
+
     def _format_watchlist_entry(self, t: Dict[str, str]) -> str:
+        # Display name: prefer proper channel name; never show '@handle' as the name.
         name = (t.get("name") or t.get("channel_name") or "").strip()
         handle = (t.get("handle") or "").strip()
-        url = (t.get("url") or "").strip()
         cid = (t.get("channel_id") or "").strip()
+        url = (t.get("url") or "").strip()
 
-        ident = handle or (url or "") or (cid or "")
-        if name and ident:
-            return f"{name} — {ident}"
-        return name or ident or "unknown"
+        if name.startswith("@"):
+            name = name[1:].strip()
 
-    def _build_watchlist_embed(self, targets: List[Dict[str, str]]) -> discord.Embed:
-        # Keep it in ONE embed; truncate if somehow exceeds limits.
+        if not name:
+            if handle:
+                name = handle.lstrip("@").strip()
+            elif cid:
+                name = cid
+            else:
+                name = "unknown"
+
+        # Link: prefer canonical URL; fallback to handle/channel_id.
+        link = self._canonicalize_youtube_channel_url(url) if url else ""
+        if not link:
+            if handle:
+                link = f"https://www.youtube.com/{handle}"
+            elif cid:
+                link = f"https://www.youtube.com/channel/{cid}"
+
+        return f"{name} — {link}" if link else name
+
+
+
+    def _build_watchlist_embed(self, targets: List[Dict[str, str]], page: int = 1) -> discord.Embed:
+        # Canonicalize + dedupe + sort for stable display (and to avoid dupes from URL variants).
+        try:
+            merged, _, _ = self._merge_targets([], targets or [])
+            targets2 = [t for t in merged if isinstance(t, dict)]
+        except Exception:
+            targets2 = list(targets or [])
+
+        def sort_key(d: Dict[str, str]) -> str:
+            nm = (d.get("name") or d.get("channel_name") or d.get("handle") or d.get("channel_id") or "").strip()
+            if nm.startswith("@"):
+                nm = nm[1:]
+            nm = unicodedata.normalize("NFKC", nm).casefold()
+            return nm
+
+        targets2.sort(key=sort_key)
+
+        page_size = 60
+        total = len(targets2)
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        page = max(1, min(int(page or 1), total_pages))
+
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_items = targets2[start:end]
+
         lines: List[str] = []
-        for i, t in enumerate(targets, start=1):
-            lines.append(f"{i}. {self._format_watchlist_entry(t)}")
-        desc = "\n".join(lines)
-        if len(desc) > 4000:
-            desc = desc[:3980] + "\n… (truncated)"
+        for t in page_items:
+            lines.append(self._format_watchlist_entry(t))
+
+        desc = "\n".join(lines) if lines else "(empty)"
+
         emb = discord.Embed(
             title="YouTube WuWa Watchlist",
-            description=desc or "(empty)",
+            description=desc,
         )
 
         # Show config (must match the JSON attachment).
@@ -858,7 +1070,6 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             conc = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", CONCURRENCY)
             ch_id = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", ANNOUNCE_CHANNEL_ID)
             native = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
-
             emb.add_field(
                 name="Config",
                 value=(
@@ -873,8 +1084,26 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             pass
 
-        emb.set_footer(text=f"{len(targets)} channel(s) • Auto-synced from thread")
+        emb.set_footer(text=f"Page {page}/{total_pages} • {total} channel(s) • Auto-synced from thread")
         return emb
+
+
+    def _build_watchlist_view_for_targets(self, targets: List[Dict[str, str]], page: int = 1) -> Optional[discord.ui.View]:
+        """Return a pager view if watchlist exceeds one page; otherwise None."""
+        if _YTWatchlistPager is None:
+            return None
+        try:
+            merged, _, _ = self._merge_targets([], targets or [])
+            total = len([t for t in merged if isinstance(t, dict)])
+        except Exception:
+            total = len(targets or [])
+
+        page_size = 60
+        total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+        if total_pages <= 1:
+            return None
+        return _YTWatchlistPager(self, page=page, total_pages=total_pages)
+
 
     def _build_watchlist_attachment_bytes(self, cfg: Dict[str, Any]) -> bytes:
         """Serialize watchlist cfg to bytes for Discord attachment (persistent across restarts)."""
@@ -986,7 +1215,13 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Create new store message
         try:
             targets = self.watch.get("targets") or []
-            emb = self._build_watchlist_embed(targets)
+            try:
+                merged, _, _ = self._merge_targets([], targets or [])
+                targets = [t for t in merged if isinstance(t, dict)]
+            except Exception:
+                targets = list(targets or [])
+            emb = self._build_watchlist_embed(targets, page=1)
+            view = self._build_watchlist_view_for_targets(targets, page=1)
             cfg = _read_json_any(WATCHLIST_PATH) or {}
 
             try:
@@ -1007,7 +1242,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             payload = self._build_watchlist_attachment_bytes(cfg_out)
             fp = io.BytesIO(payload)
             file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
-            m = await th.send(WATCHLIST_STORE_MARKER, embed=emb, file=file, allowed_mentions=discord.AllowedMentions.none())
+            m = await th.send(WATCHLIST_STORE_MARKER, embed=emb, view=view, file=file, allowed_mentions=discord.AllowedMentions.none())
             self.state["watchlist_store_mid"] = m.id
             _write_json_best_effort(STATE_PATH, self.state)
             return m
@@ -1035,7 +1270,8 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             store = await self._find_or_create_watchlist_store_message(th)
             if not store:
                 return
-            emb = self._build_watchlist_embed(targets)
+            emb = self._build_watchlist_embed(targets, page=1)
+            view = self._build_watchlist_view_for_targets(targets, page=1)
 
             # Persist canonical watchlist into the store message attachment so it survives restarts / ephemeral disk.
             try:
@@ -1060,10 +1296,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             try:
                 # discord.py 2.x supports replacing attachments via Message.edit(attachments=[...])
-                await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
+                await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, view=view, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
             except TypeError:
                 # Fallback: cannot edit attachments; create a new store message (do NOT delete the old one).
-                m2 = await th.send(WATCHLIST_STORE_MARKER, embed=emb, file=file, allowed_mentions=discord.AllowedMentions.none())
+                m2 = await th.send(WATCHLIST_STORE_MARKER, embed=emb, view=view, file=file, allowed_mentions=discord.AllowedMentions.none())
                 self.state["watchlist_store_mid"] = m2.id
                 _write_json_best_effort(STATE_PATH, self.state)
 
@@ -1152,9 +1388,16 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                         t["name"] = nm
                         qcur = (t.get("query") or "").strip()
                         qnorm = _norm(qcur)
-                        if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (handle_norm and qnorm == handle_norm):
-                            t["query"] = nm
+                        # Keep query stable: prefer @handle when available; never replace a handle/channel_id query with display name.
+                        preferred = (t.get("handle") or "").strip()
+                        if preferred and not preferred.startswith("@"):
+                            preferred = "@" + preferred
+                        if not preferred:
+                            preferred = (t.get("channel_id") or "").strip() or nm
 
+                        # Only rewrite query if it is empty / generic (URL-like/UC-like) or already equals the display name.
+                        if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (_norm(nm) and qnorm == _norm(nm)):
+                            t["query"] = preferred
                         changed = True
 
             if changed:
@@ -1257,8 +1500,17 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     qcur = (t.get("query") or "").strip()
                     qnorm = qcur.strip().rstrip("/").lower()
                     # Keep query stable unless it is also generic.
-                    if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (handle_norm and qnorm == handle_norm):
-                        t["query"] = nm
+                    # Keep query stable: prefer @handle when available; never replace a handle/channel_id query with display name.
+                    preferred = (t.get("handle") or "").strip()
+                    if preferred and not preferred.startswith("@"):
+                        preferred = "@" + preferred
+                    if not preferred:
+                        preferred = (t.get("channel_id") or "").strip() or nm
+
+                    nm_norm = (nm or "").strip().rstrip("/").lower()
+                    # Only rewrite query if it is empty / generic (URL-like/UC-like) or already equals the display name.
+                    if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (nm_norm and qnorm == nm_norm):
+                        t["query"] = preferred
             except Exception:
                 pass
 
@@ -1883,17 +2135,27 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
     async def before_loop(self):
         await self.bot.wait_until_ready()
         await self._ensure_session()
-
-        # Seed local watchlist from the persistent store message attachment before doing any cleanup.
-        try:
-            th0 = await self._ensure_watchlist_thread()
-            if th0:
-                sc0 = await self._load_watchlist_from_store_attachment(th0)
-                if isinstance(sc0, dict) and sc0.get("targets"):
-                    _write_json_best_effort(WATCHLIST_PATH, sc0)
-                    self._reload_watchlist()
-        except Exception:
-            pass
+# Merge local watchlist with the persistent store message attachment (do not overwrite deploy watchlist).
+try:
+    th0 = await self._ensure_watchlist_thread()
+    if th0:
+        sc0 = await self._load_watchlist_from_store_attachment(th0)
+        if isinstance(sc0, dict) and sc0.get("targets"):
+            cfg_local = _read_json_any(WATCHLIST_PATH) or {}
+            local_targets = list(cfg_local.get("targets") or [])
+            merged, added, _ = self._merge_targets(local_targets, list(sc0.get("targets") or []))
+            # Keep deploy config as primary; backfill missing keys from store.
+            for k in ("enabled", "title_whitelist_regex", "message_template", "max_age_minutes"):
+                if (k not in cfg_local) or (cfg_local.get(k) in (None, "")):
+                    if sc0.get(k) not in (None, ""):
+                        cfg_local[k] = sc0.get(k)
+            cfg_local["targets"] = merged
+            _write_json_best_effort(WATCHLIST_PATH, cfg_local)
+            self._reload_watchlist()
+            if added:
+                log.info("[yt-wuwa] merged %d target(s) from store attachment into local watchlist", added)
+except Exception as e:
+    log.warning("[yt-wuwa] watchlist store attachment merge failed: %r", e)
         try:
             await self._bootstrap_watchlist_from_thread()
         except Exception as e:
@@ -1913,3 +2175,60 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(YouTubeWuWaLiveAnnouncer(bot))
+
+# --- Watchlist pager UI (safe under offline smoketest stubs) ---
+try:
+    _NIXE_UI_VIEW = getattr(getattr(discord, "ui", None), "View", None)
+    _NIXE_UI_BUTTON = getattr(getattr(discord, "ui", None), "button", None)
+    _NIXE_BUTTONSTYLE = getattr(discord, "ButtonStyle", None)
+    _NIXE_HAS_UI = bool(_NIXE_UI_VIEW) and bool(_NIXE_UI_BUTTON) and bool(_NIXE_BUTTONSTYLE) and hasattr(_NIXE_BUTTONSTYLE, "secondary")
+except Exception:
+    _NIXE_HAS_UI = False
+
+if _NIXE_HAS_UI:
+    class _YTWatchlistPager(discord.ui.View):
+        def __init__(self, cog: "YouTubeWuWaLiveAnnouncer", page: int = 1, total_pages: int = 1):
+            super().__init__(timeout=None)
+            self.cog = cog
+            self._sync_buttons(page=page, total_pages=total_pages)
+
+        def _parse_footer(self, emb: Optional[discord.Embed]) -> Tuple[int, int]:
+            try:
+                if not emb or not emb.footer or not emb.footer.text:
+                    return 1, 1
+                m = re.search(r"Page\s+(\d+)\s*/\s*(\d+)", emb.footer.text)
+                if not m:
+                    return 1, 1
+                return int(m.group(1)), int(m.group(2))
+            except Exception:
+                return 1, 1
+
+        def _sync_buttons(self, page: int, total_pages: int) -> None:
+            page = max(1, int(page or 1))
+            total_pages = max(1, int(total_pages or 1))
+            for child in self.children:
+                if isinstance(child, discord.ui.Button):
+                    if child.custom_id == "nixe:ytwl_prev":
+                        child.disabled = page <= 1
+                    elif child.custom_id == "nixe:ytwl_next":
+                        child.disabled = page >= total_pages
+
+        @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, custom_id="nixe:ytwl_prev")
+        async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+            cur_page, total_pages = self._parse_footer(getattr(interaction.message, "embeds", [None])[0] if interaction.message else None)
+            new_page = max(1, cur_page - 1)
+            targets = (getattr(self.cog, "watch", {}) or {}).get("targets") or []
+            emb = self.cog._build_watchlist_embed(targets, page=new_page)
+            self._sync_buttons(new_page, total_pages)
+            await interaction.response.edit_message(embed=emb, view=self)
+
+        @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="nixe:ytwl_next")
+        async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+            cur_page, total_pages = self._parse_footer(getattr(interaction.message, "embeds", [None])[0] if interaction.message else None)
+            new_page = min(total_pages, cur_page + 1)
+            targets = (getattr(self.cog, "watch", {}) or {}).get("targets") or []
+            emb = self.cog._build_watchlist_embed(targets, page=new_page)
+            self._sync_buttons(new_page, total_pages)
+            await interaction.response.edit_message(embed=emb, view=self)
+else:
+    _YTWatchlistPager = None

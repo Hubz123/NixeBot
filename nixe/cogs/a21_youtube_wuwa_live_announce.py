@@ -21,6 +21,142 @@ from discord.ext import commands, tasks
 
 log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 
+# ---------------------------------------------------------------------------
+# Cross-task de-dupe guard
+# Prevents duplicate announce posts when the loop is accidentally started twice
+# (e.g., cog double-load) or when overlapping targets resolve to the same video.
+# ---------------------------------------------------------------------------
+_ANNOUNCE_LOCK = asyncio.Lock()
+_INFLIGHT_VIDS: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# Persistent watchlist pager (optional)
+# If something goes wrong, the cog falls back to "no view" and still works.
+# ---------------------------------------------------------------------------
+_WATCHLIST_BTN_PREV = "ytwuwa:watchlist:prev"
+_WATCHLIST_BTN_NEXT = "ytwuwa:watchlist:next"
+
+
+class _YTWatchlistPager(discord.ui.View):
+    """Persistent Prev/Next buttons for the watchlist store message.
+
+    Notes:
+      - Uses stable custom_id so it continues to work after restart
+      - Computes current page from the message embed footer
+      - Loads targets from the store attachment first (best), then falls back to WATCHLIST_PATH
+    """
+
+    def __init__(self, cog: "YouTubeWuWaLiveAnnouncer", page: int = 1, total_pages: int = 1):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.page = max(1, int(page or 1))
+        self.total_pages = max(1, int(total_pages or 1))
+
+        prev_disabled = self.page <= 1
+        next_disabled = self.page >= self.total_pages
+
+        prev_btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Prev",
+            custom_id=_WATCHLIST_BTN_PREV,
+            disabled=prev_disabled,
+        )
+        next_btn = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="Next",
+            custom_id=_WATCHLIST_BTN_NEXT,
+            disabled=next_disabled,
+        )
+
+        prev_btn.callback = self._on_prev  # type: ignore[attr-defined]
+        next_btn.callback = self._on_next  # type: ignore[attr-defined]
+
+        self.add_item(prev_btn)
+        self.add_item(next_btn)
+
+    @staticmethod
+    def _parse_page_footer(msg: Optional[discord.Message]) -> Tuple[int, int]:
+        try:
+            if not msg or not getattr(msg, "embeds", None):
+                return 1, 1
+            emb = msg.embeds[0]
+            ft = (getattr(getattr(emb, "footer", None), "text", "") or "").strip()
+            # expected: "Page x/y • ..." but tolerate variants
+            m = re.search(r"(?:page\s*)?(\d+)\s*/\s*(\d+)", ft, re.IGNORECASE)
+            if not m:
+                return 1, 1
+            return max(1, int(m.group(1))), max(1, int(m.group(2)))
+        except Exception:
+            return 1, 1
+
+    async def _load_targets_from_message(self, msg: Optional[discord.Message]) -> List[Dict[str, str]]:
+        # Prefer JSON attachment on the store message (survives restarts / ephemeral disk).
+        try:
+            if msg:
+                atts = list(getattr(msg, "attachments", []) or [])
+                for a in atts:
+                    try:
+                        if (a.filename or "").lower() == WATCHLIST_STORE_ATTACHMENT_NAME.lower():
+                            raw = await a.read()
+                            obj = json.loads(raw.decode("utf-8", errors="replace"))
+                            if isinstance(obj, dict):
+                                t = obj.get("targets") or []
+                                if isinstance(t, list):
+                                    return list(t)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # Fallback: local JSON (if present)
+        try:
+            cfg = _read_json_any(WATCHLIST_PATH) or {}
+            t = cfg.get("targets") or []
+            if isinstance(t, list):
+                return list(t)
+        except Exception:
+            pass
+        return []
+
+    async def _turn(self, interaction: discord.Interaction, delta: int) -> None:
+        try:
+            msg = getattr(interaction, "message", None)
+            cur_page, _ = self._parse_page_footer(msg)
+            targets = await self._load_targets_from_message(msg)
+
+            # Recompute total pages from targets for correctness.
+            try:
+                merged, _, _ = self.cog._merge_targets([], targets or [])
+                total = len([t for t in merged if isinstance(t, dict)])
+            except Exception:
+                total = len(targets or [])
+
+            page_size = 60
+            total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+            new_page = max(1, min(total_pages, int(cur_page) + int(delta)))
+
+            emb = self.cog._build_watchlist_embed(targets, page=new_page)
+            view = self.cog._build_watchlist_view_for_targets(targets, page=new_page)
+
+            try:
+                await interaction.response.edit_message(embed=emb, view=view)
+            except discord.InteractionResponded:
+                await interaction.edit_original_response(embed=emb, view=view)
+        except Exception:
+            try:
+                # best-effort: do not spam; just ack silently if possible
+                if interaction and interaction.response and not interaction.response.is_done():
+                    await interaction.response.defer()
+            except Exception:
+                pass
+
+    async def _on_prev(self, interaction: discord.Interaction) -> None:
+        await self._turn(interaction, -1)
+
+    async def _on_next(self, interaction: discord.Interaction) -> None:
+        await self._turn(interaction, +1)
+
+
 
 def _env_int(name: str, default: int) -> int:
     """Parse integer env var robustly.
@@ -1931,6 +2067,15 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         else:
             allowed_mentions = discord.AllowedMentions.none()
 
+        # If we are using custom embeds, prevent Discord from also unfurling the raw URL in the message content.
+        # Wrapping the URL in angle brackets suppresses native embeds while keeping it clickable.
+        if not ANNOUNCE_NATIVE_EMBED:
+            try:
+                if video_link and f"<{video_link}>" not in content:
+                    content = content.replace(video_link, f"<{video_link}>")
+            except Exception:
+                pass
+
         # Native embed mode: do NOT attach a custom embed/image; let Discord unfurl the YouTube link.
         if ANNOUNCE_NATIVE_EMBED:
             try:
@@ -2060,7 +2205,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             ann_vids = self.state.setdefault("announced_vids", {})  # video_id -> unix_ts (or 1)
 
             # Hard de-dupe by video id (covers key changes across restarts).
-            if str(vid) in ann_vids or str(vid) in set(str(v) for v in ann_map.values()):
+            if str(vid) in ann_vids or str(vid) in _INFLIGHT_VIDS or str(vid) in set(str(v) for v in ann_map.values()):
                 # keep keys aligned to the vid to prevent future re-announce with a new key
                 for k in keys:
                     ann_map[k] = vid
@@ -2099,7 +2244,24 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 if not creator_name:
                     log.warning("[yt-wuwa] cannot resolve channel display name (target=%s vid=%s). Set NIXE_YT_WUWA_YT_API_KEY (YouTube API v3) or set an explicit display name in watchlist.", getattr(t, "name", "unknown"), vid)
                     continue
-                await self._post(ch, creator_name, title, vid)
+                # In-flight de-dupe: prevents double-post if multiple loop instances race on the same video_id.
+                vid_s = str(vid)
+                try:
+                    async with _ANNOUNCE_LOCK:
+                        if vid_s in _INFLIGHT_VIDS:
+                            continue
+                        _INFLIGHT_VIDS.add(vid_s)
+                except Exception:
+                    pass
+
+                try:
+                    await self._post(ch, creator_name, title, vid)
+                finally:
+                    try:
+                        async with _ANNOUNCE_LOCK:
+                            _INFLIGHT_VIDS.discard(vid_s)
+                    except Exception:
+                        pass
                 # write to all keys to prevent key-change dupes after restart/resolve
                 ann_map = self.state.setdefault("announced", {})
                 ann_vids = self.state.setdefault("announced_vids", {})

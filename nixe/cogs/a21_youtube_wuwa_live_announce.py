@@ -697,12 +697,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             "url": url,
         }
 
-    @classmethod
-
-
-    @classmethod
-
-    def _merge_targets(cls, existing: List[Any], new_targets: List[Any]) -> Tuple[List[Any], int, List[Dict[str, str]]]:
+    def _merge_targets(self, existing: List[Any], new_targets: List[Any]) -> Tuple[List[Any], int, List[Dict[str, str]]]:
         """Merge target dicts into existing targets list (skip dupes + upgrade fields).
 
         Returns:
@@ -713,7 +708,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if isinstance(x, dict):
                 return {k: str(v) for k, v in x.items() if v is not None}
             if isinstance(x, str):
-                t = cls._token_to_target(x)
+                t = self._token_to_target(x)
                 return t
             return None
 
@@ -729,8 +724,8 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 continue
             # normalize url for stable keys
             if d.get("url"):
-                d["url"] = cls._canonicalize_youtube_channel_url(d.get("url") or "")
-            key = cls._target_dedupe_key(d)
+                d["url"] = self._canonicalize_youtube_channel_url(d.get("url") or "")
+            key = self._target_dedupe_key(d)
             index[key] = d
 
         def is_better_name(cur: str, new: str) -> bool:
@@ -754,11 +749,11 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
             # Canonicalize
             if d.get("url"):
-                d["url"] = cls._canonicalize_youtube_channel_url(d.get("url") or "")
+                d["url"] = self._canonicalize_youtube_channel_url(d.get("url") or "")
             if d.get("handle") and d["handle"].startswith("@@"):
                 d["handle"] = "@" + d["handle"].lstrip("@")
 
-            key = cls._target_dedupe_key(d)
+            key = self._target_dedupe_key(d)
             exist = index.get(key)
 
             # Also attempt cross-key match: cid/handle/url variants
@@ -785,7 +780,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     if not (exist.get(fld) or "").strip() and (d.get(fld) or "").strip():
                         exist[fld] = d.get(fld) or ""
                 # ensure key index updated (in case url/handle became available)
-                index[cls._target_dedupe_key(exist)] = exist
+                index[self._target_dedupe_key(exist)] = exist
                 continue
 
             # brand new entry

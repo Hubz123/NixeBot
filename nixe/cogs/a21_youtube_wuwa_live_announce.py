@@ -37,7 +37,17 @@ _WATCHLIST_BTN_PREV = "ytwuwa:watchlist:prev"
 _WATCHLIST_BTN_NEXT = "ytwuwa:watchlist:next"
 
 
-class _YTWatchlistPager(discord.ui.View):
+# Resolve discord.ui.* safely for offline smoke tools that stub discord.
+# In production (discord.py installed) we get full UI buttons.
+try:
+    _ui = getattr(discord, "ui", None)
+    _DISCORD_VIEW_BASE = _ui.View  # type: ignore[attr-defined]
+    _DISCORD_HAS_UI = True
+except Exception:
+    _DISCORD_VIEW_BASE = object
+    _DISCORD_HAS_UI = False
+
+class _YTWatchlistPager(_DISCORD_VIEW_BASE):
     """Persistent Prev/Next buttons for the watchlist store message.
 
     Notes:
@@ -47,6 +57,9 @@ class _YTWatchlistPager(discord.ui.View):
     """
 
     def __init__(self, cog: "YouTubeWuWaLiveAnnouncer", page: int = 1, total_pages: int = 1):
+        # Offline smoke tools may stub discord without discord.ui; keep imports working.
+        if not _DISCORD_HAS_UI:
+            return
         super().__init__(timeout=None)
         self.cog = cog
         self.page = max(1, int(page or 1))

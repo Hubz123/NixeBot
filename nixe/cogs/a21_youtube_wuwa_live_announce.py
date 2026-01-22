@@ -497,14 +497,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 name = name[1:].strip()
 
             if not name:
-                if handle:
-                    name = handle.lstrip("@").strip()
-                elif channel_id:
-                    name = channel_id
-                elif url:
-                    name = url
+                # Leave blank: name must be the channel display name (resolved later).
+                name = ""
 
-            if not name:
+            if (not name) and (not handle) and (not channel_id) and (not url):
                 continue
 
             url = self._canonicalize_youtube_channel_url(url) if url else ""
@@ -684,16 +680,14 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         else:
             url = cls._canonicalize_youtube_channel_url(url)
 
-        # Name: never start with '@'
+        # Name: MUST be the channel display name (resolved later). Do not store handle/channel_id as name.
         name = ""
-        if handle:
-            name = handle.lstrip("@").strip()
-        elif channel_id:
-            name = channel_id.strip()
-        elif url:
-            name = url
 
-        query = handle or channel_id or name
+        # Query drives lookups/dedupe; prefer @handle, else UC channel id.
+        query = handle or channel_id or ""
+        if not query:
+            # As a last resort keep something stable (canonical URL) so the target isn't dropped.
+            query = url
 
         return {
             "name": name,
@@ -2135,100 +2129,53 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
     async def before_loop(self):
         await self.bot.wait_until_ready()
         await self._ensure_session()
-# Merge local watchlist with the persistent store message attachment (do not overwrite deploy watchlist).
-try:
-    th0 = await self._ensure_watchlist_thread()
-    if th0:
-        sc0 = await self._load_watchlist_from_store_attachment(th0)
-        if isinstance(sc0, dict) and sc0.get("targets"):
-            cfg_local = _read_json_any(WATCHLIST_PATH) or {}
-            local_targets = list(cfg_local.get("targets") or [])
-            merged, added, _ = self._merge_targets(local_targets, list(sc0.get("targets") or []))
-            # Keep deploy config as primary; backfill missing keys from store.
-            for k in ("enabled", "title_whitelist_regex", "message_template", "max_age_minutes"):
-                if (k not in cfg_local) or (cfg_local.get(k) in (None, "")):
-                    if sc0.get(k) not in (None, ""):
-                        cfg_local[k] = sc0.get(k)
-            cfg_local["targets"] = merged
-            _write_json_best_effort(WATCHLIST_PATH, cfg_local)
-            self._reload_watchlist()
-            if added:
-                log.info("[yt-wuwa] merged %d target(s) from store attachment into local watchlist", added)
-except Exception as e:
-    log.warning("[yt-wuwa] watchlist store attachment merge failed: %r", e)
+
+        # Merge local watchlist with the persistent store message attachment (do not overwrite deploy watchlist).
+        try:
+            th0 = await self._ensure_watchlist_thread()
+            if th0:
+                sc0 = await self._load_watchlist_from_store_attachment(th0)
+                if isinstance(sc0, dict) and sc0.get("targets"):
+                    cfg_local = _read_json_any(WATCHLIST_PATH) or {}
+                    local_targets = list(cfg_local.get("targets") or [])
+
+                    # Sanitize store targets: never keep '@...' as name; prefer enrichment.
+                    store_targets = []
+                    for t in list(sc0.get("targets") or []):
+                        if not isinstance(t, dict):
+                            continue
+                        nm = (t.get("name") or "").strip()
+                        if nm.startswith(("@", "＠")):
+                            t = dict(t)
+                            t["name"] = ""
+                        store_targets.append(t)
+
+                    merged, added, added_items = self._merge_targets(local_targets, store_targets)
+
+                    # Keep deploy config as primary; backfill missing keys from store.
+                    for k in ("enabled", "title_whitelist_regex", "message_template", "max_age_minutes"):
+                        if (k not in cfg_local) or (cfg_local.get(k) in (None, "")):
+                            if sc0.get(k) not in (None, ""):
+                                cfg_local[k] = sc0.get(k)
+
+                    cfg_local["targets"] = merged
+                    _write_json_best_effort(WATCHLIST_PATH, cfg_local)
+                    self._reload_watchlist()
+
+                    # Best-effort: resolve display names for any store-added items so embeds don't show handles as names.
+                    if added_items:
+                        await self._enrich_watchlist_names(added_items)
+
+                    if added:
+                        log.info("[yt-wuwa] merged %d target(s) from store attachment into local watchlist", added)
+        except Exception as e:
+            log.warning("[yt-wuwa] watchlist store attachment merge failed: %r", e)
+
         try:
             await self._bootstrap_watchlist_from_thread()
         except Exception as e:
             log.warning("[yt-wuwa] watchlist bootstrap failed: %r", e)
 
-        # Ensure the canonical watchlist embed exists immediately after boot.
-        try:
-            th = await self._ensure_watchlist_thread()
-            if th:
-                await self._sync_watchlist_store_message(th)
-                store_mid = int(self.state.get("watchlist_store_mid") or 0)
-                if store_mid:
-                    await self._cleanup_watchlist_thread(th, store_mid)
-        except Exception as e:
-            log.warning("[yt-wuwa] watchlist store sync failed: %r", e)
 
-
-async def setup(bot: commands.Bot):
+async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(YouTubeWuWaLiveAnnouncer(bot))
-
-# --- Watchlist pager UI (safe under offline smoketest stubs) ---
-try:
-    _NIXE_UI_VIEW = getattr(getattr(discord, "ui", None), "View", None)
-    _NIXE_UI_BUTTON = getattr(getattr(discord, "ui", None), "button", None)
-    _NIXE_BUTTONSTYLE = getattr(discord, "ButtonStyle", None)
-    _NIXE_HAS_UI = bool(_NIXE_UI_VIEW) and bool(_NIXE_UI_BUTTON) and bool(_NIXE_BUTTONSTYLE) and hasattr(_NIXE_BUTTONSTYLE, "secondary")
-except Exception:
-    _NIXE_HAS_UI = False
-
-if _NIXE_HAS_UI:
-    class _YTWatchlistPager(discord.ui.View):
-        def __init__(self, cog: "YouTubeWuWaLiveAnnouncer", page: int = 1, total_pages: int = 1):
-            super().__init__(timeout=None)
-            self.cog = cog
-            self._sync_buttons(page=page, total_pages=total_pages)
-
-        def _parse_footer(self, emb: Optional[discord.Embed]) -> Tuple[int, int]:
-            try:
-                if not emb or not emb.footer or not emb.footer.text:
-                    return 1, 1
-                m = re.search(r"Page\s+(\d+)\s*/\s*(\d+)", emb.footer.text)
-                if not m:
-                    return 1, 1
-                return int(m.group(1)), int(m.group(2))
-            except Exception:
-                return 1, 1
-
-        def _sync_buttons(self, page: int, total_pages: int) -> None:
-            page = max(1, int(page or 1))
-            total_pages = max(1, int(total_pages or 1))
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    if child.custom_id == "nixe:ytwl_prev":
-                        child.disabled = page <= 1
-                    elif child.custom_id == "nixe:ytwl_next":
-                        child.disabled = page >= total_pages
-
-        @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary, custom_id="nixe:ytwl_prev")
-        async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
-            cur_page, total_pages = self._parse_footer(getattr(interaction.message, "embeds", [None])[0] if interaction.message else None)
-            new_page = max(1, cur_page - 1)
-            targets = (getattr(self.cog, "watch", {}) or {}).get("targets") or []
-            emb = self.cog._build_watchlist_embed(targets, page=new_page)
-            self._sync_buttons(new_page, total_pages)
-            await interaction.response.edit_message(embed=emb, view=self)
-
-        @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary, custom_id="nixe:ytwl_next")
-        async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-            cur_page, total_pages = self._parse_footer(getattr(interaction.message, "embeds", [None])[0] if interaction.message else None)
-            new_page = min(total_pages, cur_page + 1)
-            targets = (getattr(self.cog, "watch", {}) or {}).get("targets") or []
-            emb = self.cog._build_watchlist_embed(targets, page=new_page)
-            self._sync_buttons(new_page, total_pages)
-            await interaction.response.edit_message(embed=emb, view=self)
-else:
-    _YTWatchlistPager = None

@@ -29,6 +29,15 @@ log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 _ANNOUNCE_LOCK = asyncio.Lock()
 _INFLIGHT_VIDS: set[str] = set()
 
+
+# ---------------------------------------------------------------------------
+# Channel-history de-dupe + self-heal cleanup
+# Guarantees that at most ONE announce message per video_id remains in the
+# announce channel, even if multiple bot instances race and double-post.
+# ---------------------------------------------------------------------------
+_DEDUP_HISTORY_LIMIT = 60  # number of recent messages to scan in announce channel
+_YT_VIDEO_ID_RX = re.compile(r"(?:v=|youtu\.be/|/shorts/)([A-Za-z0-9_-]{6,})")
+
 # ---------------------------------------------------------------------------
 # Persistent watchlist pager (optional)
 # If something goes wrong, the cog falls back to "no view" and still works.
@@ -577,6 +586,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
         self._reload_watchlist()
         self._loop_started = False
+        self._dedupe_sweep_done = False
     @commands.Cog.listener()
     async def on_ready(self):
         if getattr(self, '_loop_started', False):
@@ -2067,6 +2077,142 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         msg = msg.replace("{video.link}", video_link)
         return msg
 
+    def _extract_video_id_from_text(self, s: str) -> Optional[str]:
+        try:
+            if not s:
+                return None
+            s = str(s)
+            # Undo angle-bracket suppression and HTML entities
+            s = s.replace("<", " ").replace(">", " ")
+            s = _html.unescape(s)
+            m = _YT_VIDEO_ID_RX.search(s)
+            if not m:
+                return None
+            return m.group(1)
+        except Exception:
+            return None
+
+    def _extract_video_id_from_message(self, msg: discord.Message) -> Optional[str]:
+        # Try content first
+        try:
+            vid = self._extract_video_id_from_text(getattr(msg, "content", "") or "")
+            if vid:
+                return vid
+        except Exception:
+            pass
+        # Try embed URLs (native unfurl uses embeds)
+        try:
+            for emb in list(getattr(msg, "embeds", []) or []):
+                vid = self._extract_video_id_from_text(getattr(emb, "url", "") or "")
+                if vid:
+                    return vid
+                vid = self._extract_video_id_from_text(getattr(emb, "title", "") or "")
+                if vid:
+                    return vid
+        except Exception:
+            pass
+        return None
+
+    async def _announce_channel_has_video(self, channel: discord.TextChannel, video_id: str) -> bool:
+        """Return True if this bot has already announced video_id in channel (recent history scan)."""
+        try:
+            me = getattr(self.bot, "user", None)
+            me_id = getattr(me, "id", None)
+            if not me_id:
+                return False
+            async for msg in channel.history(limit=_DEDUP_HISTORY_LIMIT):
+                try:
+                    if not msg or not getattr(msg, "author", None):
+                        continue
+                    if getattr(msg.author, "id", None) != me_id:
+                        continue
+                    vid = self._extract_video_id_from_message(msg)
+                    if vid and str(vid) == str(video_id):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            # Missing perms / transient errors -> do not block announcements
+            return False
+        return False
+
+    async def _cleanup_duplicate_announcements(self, channel: discord.TextChannel, video_id: str) -> None:
+        """Delete duplicate announce messages for video_id, keeping the oldest one."""
+        try:
+            me = getattr(self.bot, "user", None)
+            me_id = getattr(me, "id", None)
+            if not me_id:
+                return
+            matches: List[discord.Message] = []
+            async for msg in channel.history(limit=_DEDUP_HISTORY_LIMIT):
+                try:
+                    if not msg or not getattr(msg, "author", None):
+                        continue
+                    if getattr(msg.author, "id", None) != me_id:
+                        continue
+                    vid = self._extract_video_id_from_message(msg)
+                    if vid and str(vid) == str(video_id):
+                        matches.append(msg)
+                        # small cap; we only need a handful
+                        if len(matches) >= 6:
+                            break
+                except Exception:
+                    continue
+            if len(matches) <= 1:
+                return
+            # Keep oldest (smallest snowflake id), delete the rest.
+            matches.sort(key=lambda m: int(getattr(m, "id", 0) or 0))
+            keep_id = matches[0].id
+            for m in matches[1:]:
+                if m.id == keep_id:
+                    continue
+                try:
+                    await m.delete()
+                except Exception:
+                    # If we cannot delete, we cannot guarantee cleanup, but keep loop alive.
+                    continue
+        except Exception:
+            return
+
+
+
+
+    async def _dedupe_sweep_recent(self, channel: discord.TextChannel) -> None:
+        """Best-effort cleanup of duplicates already present in the announce channel (recent window)."""
+        try:
+            me = getattr(self.bot, "user", None)
+            me_id = getattr(me, "id", None)
+            if not me_id:
+                return
+
+            bucket: Dict[str, List[Any]] = {}
+            async for msg in channel.history(limit=_DEDUP_HISTORY_LIMIT * 2):
+                try:
+                    if not msg or not getattr(msg, "author", None):
+                        continue
+                    if getattr(msg.author, "id", None) != me_id:
+                        continue
+                    vid = self._extract_video_id_from_message(msg)
+                    if not vid:
+                        continue
+                    bucket.setdefault(str(vid), []).append(msg)
+                except Exception:
+                    continue
+
+            for _vid, msgs in bucket.items():
+                if len(msgs) <= 1:
+                    continue
+                msgs.sort(key=lambda m: int(getattr(m, "id", 0) or 0))
+                keep_id = getattr(msgs[0], "id", None)
+                for m in msgs[1:]:
+                    try:
+                        if getattr(m, "id", None) == keep_id:
+                            continue
+                        await m.delete()
+                    except Exception:
+                        continue
+        except Exception:
+            return
 
     async def _post(self, channel: discord.TextChannel, creator_name: str, title: str, video_id: str):
         # Use the canonical watch URL so Discord is more likely to render the native YouTube player-style embed.
@@ -2089,13 +2235,26 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             except Exception:
                 pass
 
+
+        # Hard guarantee: if the video is already present in channel history (e.g., other instance posted),
+        # do not send again.
+        try:
+            if await self._announce_channel_has_video(channel, str(video_id)):
+                return
+        except Exception:
+            pass
+
         # Native embed mode: do NOT attach a custom embed/image; let Discord unfurl the YouTube link.
         if ANNOUNCE_NATIVE_EMBED:
             try:
-                await channel.send(
+                msg = await channel.send(
                     content=content,
                     allowed_mentions=allowed_mentions,
                 )
+                try:
+                    await self._cleanup_duplicate_announcements(channel, str(video_id))
+                except Exception:
+                    pass
             except Exception as e:
                 # Never let the announce loop die due to a send error.
                 if DEBUG:
@@ -2112,12 +2271,16 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Watch", url=video_link))
 
         try:
-            await channel.send(
+            msg = await channel.send(
                 content=content,
                 embed=embed,
                 view=view,
                 allowed_mentions=allowed_mentions,
             )
+            try:
+                await self._cleanup_duplicate_announcements(channel, str(video_id))
+            except Exception:
+                pass
         except Exception as e:
             # Never let the announce loop die due to a send error.
             if DEBUG:
@@ -2253,6 +2416,21 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     age_min = int((now - start_ts).total_seconds() // 60)
                     log.info("[yt-wuwa] suppress stale-live: %s vid=%s age_min=%s", t.name, vid, age_min)
                     continue
+
+            # Cross-instance de-dupe: if another instance already announced this video_id, align local state and skip.
+            try:
+                vid_s = str(vid)
+                if await self._announce_channel_has_video(ch, vid_s):
+                    ann_map = self.state.setdefault("announced", {})
+                    ann_vids = self.state.setdefault("announced_vids", {})
+                    for k in keys:
+                        ann_map[k] = vid
+                    ann_vids[vid_s] = int(datetime.now(timezone.utc).timestamp())
+                    _write_json_best_effort(STATE_PATH, self.state)
+                    continue
+            except Exception:
+                pass
+
             try:
                 if not creator_name:
                     log.warning("[yt-wuwa] cannot resolve channel display name (target=%s vid=%s). Set NIXE_YT_WUWA_YT_API_KEY (YouTube API v3) or set an explicit display name in watchlist.", getattr(t, "name", "unknown"), vid)
@@ -2299,6 +2477,22 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
     async def before_loop(self):
         await self.bot.wait_until_ready()
         await self._ensure_session()
+
+        # One-time startup cleanup: remove duplicate announce messages already present (best-effort).
+        try:
+            if (os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1") and (not getattr(self, "_dedupe_sweep_done", False)):
+                ch = self.bot.get_channel(ANNOUNCE_CHANNEL_ID)
+                if not isinstance(ch, discord.TextChannel):
+                    try:
+                        ch = await self.bot.fetch_channel(ANNOUNCE_CHANNEL_ID)
+                    except Exception:
+                        ch = None
+                if isinstance(ch, discord.TextChannel):
+                    await self._dedupe_sweep_recent(ch)
+                self._dedupe_sweep_done = True
+        except Exception:
+            pass
+
 
         # Merge local watchlist with the persistent store message attachment (do not overwrite deploy watchlist).
         try:

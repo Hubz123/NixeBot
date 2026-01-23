@@ -973,6 +973,14 @@ class LPGThreadBridgeGuard(commands.Cog):
         LPG_MAX_FETCH = _env_int("LPG_MAX_FETCH_BYTES", 8000000)
         LPG_SEEN_TTL = _env_int("LPG_SEEN_TTL_SEC", 600)
 
+        # Hard de-dupe per Discord message id (prevents double-processing on reconnect/cog reload).
+        try:
+            mid = int(getattr(message, "id", 0) or 0)
+            if mid and (not _once(f"lpg:msg:{mid}", ttl=LPG_SEEN_TTL)):
+                return
+        except Exception:
+            pass
+
         selected = None
         try:
             for a in (message.attachments or []):

@@ -19,6 +19,8 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 
+from nixe.helpers.once import once_sync as _once
+
 log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 
 # ---------------------------------------------------------------------------
@@ -28,6 +30,16 @@ log = logging.getLogger("nixe.cogs.a21_youtube_wuwa_live_announce")
 # ---------------------------------------------------------------------------
 _ANNOUNCE_LOCK = asyncio.Lock()
 _INFLIGHT_VIDS: set[str] = set()
+
+
+# ---------------------------------------------------------------------------
+# Watchlist ingest de-dupe + IO lock
+# - Prevents double-ingest when Discord dispatches on_message twice (cog
+#   double-load, reconnect duplication, etc.)
+# - Prevents race/lost-update on WATCHLIST_PATH when multiple tasks touch it
+#   (startup bootstrap, store-attachment merge, moderator ingest)
+# ---------------------------------------------------------------------------
+_WATCHLIST_IO_LOCK = asyncio.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1200,8 +1212,6 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         if not th:
             return
 
-        cfg = _read_json_any(WATCHLIST_PATH) or {}
-
         # Prefer canonical store attachment (survives restarts even if local disk is wiped).
         store_cfg: Optional[Dict[str, Any]] = None
         try:
@@ -1209,20 +1219,9 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             store_cfg = None
 
-        disk_targets = cfg.get("targets") or []
         store_targets = (store_cfg.get("targets") if isinstance(store_cfg, dict) else None) or []
 
-        # Render semantics: THREAD STORE is the source of truth. Disk is cache/mirror only.
-        if store_targets:
-            try:
-                merged0, _, _ = self._merge_targets(store_targets, disk_targets)
-                cfg["targets"] = merged0
-                _write_json_best_effort(WATCHLIST_PATH, cfg)
-                self._reload_watchlist()
-            except Exception:
-                pass
-
-        existing_targets = cfg.get("targets") or []
+        # Build new_targets from thread history (network) without holding the IO lock.
         new_targets: List[Dict[str, str]] = []
 
         try:
@@ -1239,16 +1238,32 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             log.warning("[yt-wuwa] watchlist thread history scan failed: %r", e)
             return
 
-        merged, added, _added_items = self._merge_targets(existing_targets, new_targets)
-        if added > 0 or self._targets_changed(existing_targets, merged):
-            cfg.setdefault("enabled", True)
-            cfg["targets"] = merged
-            _write_json_best_effort(WATCHLIST_PATH, cfg)
-            if added > 0:
-                log.info("[yt-wuwa] watchlist updated from thread: +%d targets", added)
 
-        # Reload in-memory list
-        self._reload_watchlist()
+        # Merge (store_targets/disk_targets/new_targets) under lock so we don't lose updates
+        # or accidentally double-apply targets when bootstrap overlaps ingest.
+        try:
+            async with _WATCHLIST_IO_LOCK:
+                cfg = _read_json_any(WATCHLIST_PATH) or {}
+                disk_targets = cfg.get("targets") or []
+
+                base = list(store_targets) if store_targets else list(disk_targets)
+                # If the store has targets, merge disk into store (disk is only a cache/mirror).
+                if store_targets:
+                    base, _, _ = self._merge_targets(base, list(disk_targets))
+
+                merged, added, _added_items = self._merge_targets(base, new_targets)
+                existing_targets = cfg.get("targets") or []
+                if added > 0 or self._targets_changed(existing_targets, merged):
+                    cfg.setdefault("enabled", True)
+                    cfg["targets"] = merged
+                    _write_json_best_effort(WATCHLIST_PATH, cfg)
+                    if added > 0:
+                        log.info("[yt-wuwa] watchlist updated from thread: +%d targets", added)
+
+                # Reload in-memory list
+                self._reload_watchlist()
+        except Exception:
+            pass
 
         # Always refresh the canonical store message on bootstrap (restart-safe).
         try:
@@ -1584,26 +1599,51 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 th = await self._ensure_watchlist_thread()
             if not th:
                 return
-            cfg = _read_json_any(WATCHLIST_PATH) or {}
-            targets = cfg.get("targets") or []
-            # Self-heal: de-duplicate + canonicalize before rendering/writing back to thread attachment.
-            try:
-                merged2, _, _ = self._merge_targets([], list(targets))
-                targets2 = [t for t in merged2 if isinstance(t, dict)]
-            except Exception:
-                targets2 = list(targets)
-            if self._targets_changed(targets, targets2):
-                cfg.setdefault("enabled", True)
-                cfg["targets"] = list(targets2)
-                _write_json_best_effort(WATCHLIST_PATH, cfg)
-            targets = targets2
-            # stable sort for readability: by name then handle/url
-            def _k(x: Dict[str, str]) -> str:
-                return ((x.get("name") or "") + "|" + (x.get("handle") or "") + "|" + (x.get("url") or "")).lower()
-            try:
-                targets = sorted(list(targets), key=_k)
-            except Exception:
-                targets = list(targets)
+            # Keep WATCHLIST_PATH consistent under concurrency (bootstrap/ingest/sync may overlap).
+            async with _WATCHLIST_IO_LOCK:
+                cfg = _read_json_any(WATCHLIST_PATH) or {}
+                targets = cfg.get("targets") or []
+
+                # Self-heal: de-duplicate + canonicalize before rendering/writing back to thread attachment.
+                try:
+                    merged2, _, _ = self._merge_targets([], list(targets))
+                    targets2 = [t for t in merged2 if isinstance(t, dict)]
+                except Exception:
+                    targets2 = list(targets)
+
+                if self._targets_changed(targets, targets2):
+                    cfg.setdefault("enabled", True)
+                    cfg["targets"] = list(targets2)
+                    _write_json_best_effort(WATCHLIST_PATH, cfg)
+
+                targets = targets2
+
+                # stable sort for readability: by name then handle/url
+                def _k(x: Dict[str, str]) -> str:
+                    return ((x.get("name") or "") + "|" + (x.get("handle") or "") + "|" + (x.get("url") or "")).lower()
+                try:
+                    targets = sorted(list(targets), key=_k)
+                except Exception:
+                    targets = list(targets)
+
+                # Persist canonical watchlist into the store message attachment so it survives restarts / ephemeral disk.
+                try:
+                    cfg_out = dict(cfg)
+                except Exception:
+                    cfg_out = {}
+                cfg_out["targets"] = list(targets)
+
+                # Force cfg values to follow current runtime env (so thread JSON + embed stay consistent).
+                try:
+                    cfg_out["enabled"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
+                    cfg_out["poll_seconds"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", POLL_SECONDS)
+                    cfg_out["concurrency"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", CONCURRENCY)
+                    cfg_out["announce_channel_id"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", ANNOUNCE_CHANNEL_ID)
+                    cfg_out["announce_native_embed"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
+                except Exception:
+                    pass
+
+                payload = self._build_watchlist_attachment_bytes(cfg_out)
 
             store = await self._find_or_create_watchlist_store_message(th)
             if not store:
@@ -1611,24 +1651,6 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             emb = self._build_watchlist_embed(targets, page=1)
             view = self._build_watchlist_view_for_targets(targets, page=1)
 
-            # Persist canonical watchlist into the store message attachment so it survives restarts / ephemeral disk.
-            try:
-                cfg_out = dict(cfg)
-            except Exception:
-                cfg_out = {}
-            cfg_out["targets"] = list(targets)
-
-            # Force cfg values to follow current runtime env (so thread JSON + embed stay consistent).
-            try:
-                cfg_out["enabled"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
-                cfg_out["poll_seconds"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", POLL_SECONDS)
-                cfg_out["concurrency"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", CONCURRENCY)
-                cfg_out["announce_channel_id"] = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", ANNOUNCE_CHANNEL_ID)
-                cfg_out["announce_native_embed"] = os.getenv("NIXE_YT_WUWA_ANNOUNCE_NATIVE_EMBED", "1").strip() == "1"
-            except Exception:
-                pass
-
-            payload = self._build_watchlist_attachment_bytes(cfg_out)
             fp = io.BytesIO(payload)
             file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
 
@@ -1673,15 +1695,13 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Best-effort: resolve channel display names for newly added items so the embed/logs are clearer.
         if not items:
             return
-        try:
-            cfg = _read_json_any(WATCHLIST_PATH) or {}
-            targets = cfg.get("targets") or []
-            changed = False
+        def _norm(x: str) -> str:
+            return (x or "").strip().rstrip("/").lower()
 
-            def _norm(x: str) -> str:
-                return (x or "").strip().rstrip("/").lower()
-
-            for it in items:
+        # 1) Resolve names first (network) without holding the IO lock.
+        updates: List[Tuple[str, str, str, str]] = []  # (url_norm, handle_norm, cid, name)
+        for it in items:
+            try:
                 url_norm = _norm(it.get("url") or "")
                 handle_norm = (it.get("handle") or "").strip().lower()
                 cid = (it.get("channel_id") or "").strip()
@@ -1689,59 +1709,73 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     url_norm = _norm(f"https://www.youtube.com/{handle_norm}")
                 if not url_norm and cid:
                     url_norm = _norm(f"https://www.youtube.com/channel/{cid}")
-
                 if not url_norm:
                     continue
 
                 nm = await self._try_fetch_channel_name_oembed(url_norm)
                 if not nm:
                     nm = await self._try_fetch_channel_name_from_channel_page(url_norm)
+                nm = (nm or "").strip()
                 if not nm:
                     continue
+                updates.append((url_norm, handle_norm, cid, nm))
+            except Exception:
+                continue
 
-                for t in targets:
-                    if not isinstance(t, dict):
-                        continue
+        if not updates:
+            return
 
-                    t_url_norm = _norm(t.get("url") or "")
-                    t_handle_norm = (t.get("handle") or "").strip().lower()
-                    t_cid = (t.get("channel_id") or "").strip()
+        # 2) Apply resolved names to watchlist under lock (no network).
+        try:
+            async with _WATCHLIST_IO_LOCK:
+                cfg = _read_json_any(WATCHLIST_PATH) or {}
+                targets = cfg.get("targets") or []
+                changed = False
 
-                    if (url_norm and t_url_norm and url_norm == t_url_norm) or (handle_norm and t_handle_norm and handle_norm == t_handle_norm) or (cid and t_cid and cid == t_cid):
-                        cur = (t.get("name") or "").strip()
-                        cur_norm = _norm(cur)
-                        url_match_norm = _norm(t.get("url") or "")
-
-                        need = (
-                            (not cur)
-                            or (handle_norm and cur_norm == handle_norm)
-                            or (cur.startswith(("@", "＠")) and handle_norm and cur_norm == handle_norm)
-                            or (_UC_ID_LIKE_RE.match(cur) and t_cid and cur == t_cid)
-                            or (cur_norm.startswith("http"))
-                            or (url_match_norm and cur_norm == url_match_norm)
-                        )
-                        if not need:
+                for url_norm, handle_norm, cid, nm in updates:
+                    for t in targets:
+                        if not isinstance(t, dict):
                             continue
 
-                        t["name"] = nm
-                        qcur = (t.get("query") or "").strip()
-                        qnorm = _norm(qcur)
-                        # Keep query stable: prefer @handle when available; never replace a handle/channel_id query with display name.
-                        preferred = (t.get("handle") or "").strip()
-                        if preferred and not preferred.startswith("@"):
-                            preferred = "@" + preferred
-                        if not preferred:
-                            preferred = (t.get("channel_id") or "").strip() or nm
+                        t_url_norm = _norm(t.get("url") or "")
+                        t_handle_norm = (t.get("handle") or "").strip().lower()
+                        t_cid = (t.get("channel_id") or "").strip()
 
-                        # Only rewrite query if it is empty / generic (URL-like/UC-like) or already equals the display name.
-                        if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (_norm(nm) and qnorm == _norm(nm)):
-                            t["query"] = preferred
-                        changed = True
+                        if (url_norm and t_url_norm and url_norm == t_url_norm) or (handle_norm and t_handle_norm and handle_norm == t_handle_norm) or (cid and t_cid and cid == t_cid):
+                            cur = (t.get("name") or "").strip()
+                            cur_norm = _norm(cur)
+                            url_match_norm = _norm(t.get("url") or "")
 
-            if changed:
-                cfg["targets"] = list(targets)
-                _write_json_best_effort(WATCHLIST_PATH, cfg)
-                self._reload_watchlist()
+                            need = (
+                                (not cur)
+                                or (handle_norm and cur_norm == handle_norm)
+                                or (cur.startswith(("@", "＠")) and handle_norm and cur_norm == handle_norm)
+                                or (_UC_ID_LIKE_RE.match(cur) and t_cid and cur == t_cid)
+                                or (cur_norm.startswith("http"))
+                                or (url_match_norm and cur_norm == url_match_norm)
+                            )
+                            if not need:
+                                continue
+
+                            t["name"] = nm
+                            qcur = (t.get("query") or "").strip()
+                            qnorm = _norm(qcur)
+                            # Keep query stable: prefer @handle when available; never replace a handle/channel_id query with display name.
+                            preferred = (t.get("handle") or "").strip()
+                            if preferred and not preferred.startswith("@"):
+                                preferred = "@" + preferred
+                            if not preferred:
+                                preferred = (t.get("channel_id") or "").strip() or nm
+
+                            # Only rewrite query if it is empty / generic (URL-like/UC-like) or already equals the display name.
+                            if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (_norm(nm) and qnorm == _norm(nm)):
+                                t["query"] = preferred
+                            changed = True
+
+                if changed:
+                    cfg["targets"] = list(targets)
+                    _write_json_best_effort(WATCHLIST_PATH, cfg)
+                    self._reload_watchlist()
         except Exception:
             pass
 
@@ -1790,79 +1824,26 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         if not new_targets:
             return 0, []
 
-        cfg = _read_json_any(WATCHLIST_PATH) or {}
-        existing_targets = cfg.get("targets") or []
-        merged, added, added_items = self._merge_targets(existing_targets, new_targets)
-        if added <= 0:
-            # Self-heal existing duplicates/canonicalization even when nothing new was added.
-            if self._targets_changed(existing_targets, merged):
-                cfg.setdefault("enabled", True)
-                cfg["targets"] = merged
-                _write_json_best_effort(WATCHLIST_PATH, cfg)
-                self._reload_watchlist()
-            return 0, []
+        # Serialize all watchlist read/merge/write to prevent race (double ingest / lost update).
+        async with _WATCHLIST_IO_LOCK:
+            cfg = _read_json_any(WATCHLIST_PATH) or {}
+            existing_targets = cfg.get("targets") or []
+            merged, added, added_items = self._merge_targets(existing_targets, new_targets)
 
-        cfg.setdefault("enabled", True)
-        # Best-effort: resolve channel name for new additions so logs + embed use the YouTube
-        # display name (not @handle/UC.../URL tokens). Must never block ingest.
-        for t in added_items:
-            if not isinstance(t, dict):
-                continue
-            cur = (t.get("name") or t.get("channel_name") or "").strip()
-            handle = (t.get("handle") or "").strip()
-            handle_norm = handle.strip().lower()
-            cid = (t.get("channel_id") or "").strip()
-            url = (t.get("url") or "").strip()
+            if added <= 0:
+                # Self-heal existing duplicates/canonicalization even when nothing new was added.
+                if self._targets_changed(existing_targets, merged):
+                    cfg.setdefault("enabled", True)
+                    cfg["targets"] = merged
+                    _write_json_best_effort(WATCHLIST_PATH, cfg)
+                    self._reload_watchlist()
+                return 0, []
 
-            cur_norm = cur.strip().rstrip("/").lower()
-            url_norm = url.strip().rstrip("/").lower()
-
-            need = (
-                (not cur)
-                or (handle_norm and cur_norm == handle_norm)
-                or (cur.startswith(("@", "＠")) and handle_norm and cur_norm == handle_norm)
-                or (_UC_ID_LIKE_RE.match(cur) and cid and cur == cid)
-                or (cur_norm.startswith("http"))
-                or (url_norm and cur_norm == url_norm)
-            )
-            if not need:
-                continue
-
-            if not url and handle.strip().startswith("@"):
-                url = f"https://www.youtube.com/{handle.strip()}"
-            if not url and cid:
-                url = f"https://www.youtube.com/channel/{cid}"
-            if not url:
-                continue
-
-            try:
-                nm = await self._try_fetch_channel_name_oembed(url)
-                if not nm:
-                    nm = await self._try_fetch_channel_name_from_channel_page(url)
-                if nm:
-                    t["name"] = nm
-                    qcur = (t.get("query") or "").strip()
-                    qnorm = qcur.strip().rstrip("/").lower()
-                    # Keep query stable unless it is also generic.
-                    # Keep query stable: prefer @handle when available; never replace a handle/channel_id query with display name.
-                    preferred = (t.get("handle") or "").strip()
-                    if preferred and not preferred.startswith("@"):
-                        preferred = "@" + preferred
-                    if not preferred:
-                        preferred = (t.get("channel_id") or "").strip() or nm
-
-                    nm_norm = (nm or "").strip().rstrip("/").lower()
-                    # Only rewrite query if it is empty / generic (URL-like/UC-like) or already equals the display name.
-                    if (not qcur) or (qnorm.startswith("http")) or (_UC_ID_LIKE_RE.match(qcur)) or (nm_norm and qnorm == nm_norm):
-                        t["query"] = preferred
-            except Exception:
-                pass
-
-        cfg["targets"] = merged
-
-        _write_json_best_effort(WATCHLIST_PATH, cfg)
-        self._reload_watchlist()
-        return added, added_items
+            cfg.setdefault("enabled", True)
+            cfg["targets"] = merged
+            _write_json_best_effort(WATCHLIST_PATH, cfg)
+            self._reload_watchlist()
+            return added, added_items
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         # Auto-ingest watchlist additions from the dedicated thread, keep the thread clean,
@@ -1894,6 +1875,21 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 self.watchlist_thread = ch
             else:
                 return
+
+            # Hard guard: if Discord dispatches this message twice, process it once.
+            # Use the shared once-cache so dupes are prevented even after auto-restart.
+            try:
+                seen_ttl = _env_int("NIXE_YT_WUWA_WATCHLIST_INGEST_SEEN_TTL_SEC", 6 * 60 * 60)
+                mid = int(getattr(message, "id", 0) or 0)
+                if mid and (not _once(f"ytwuwa:watchlist:msg:{mid}", ttl=seen_ttl)):
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                # If once-cache fails for any reason, we still proceed (best-effort).
+                pass
 
             # Collect text from message content and small text/json attachments
             texts: List[str] = []
@@ -2696,8 +2692,9 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if th0:
                 sc0 = await self._load_watchlist_from_store_attachment(th0)
                 if isinstance(sc0, dict) and sc0.get("targets"):
-                    cfg_local = _read_json_any(WATCHLIST_PATH) or {}
-                    local_targets = list(cfg_local.get("targets") or [])
+                    cfg_local = None
+                    added = 0
+                    added_items: List[Dict[str, str]] = []
 
                     # Sanitize store targets: never keep '@...' as name; prefer enrichment.
                     store_targets = []
@@ -2710,17 +2707,22 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                             t["name"] = ""
                         store_targets.append(t)
 
-                    merged, added, added_items = self._merge_targets(local_targets, store_targets)
+                    # Serialize watchlist file IO so we don't race ingest/bootstrap.
+                    async with _WATCHLIST_IO_LOCK:
+                        cfg_local = _read_json_any(WATCHLIST_PATH) or {}
+                        local_targets = list(cfg_local.get("targets") or [])
 
-                    # Keep deploy config as primary; backfill missing keys from store.
-                    for k in ("enabled", "title_whitelist_regex", "message_template", "max_age_minutes"):
-                        if (k not in cfg_local) or (cfg_local.get(k) in (None, "")):
-                            if sc0.get(k) not in (None, ""):
-                                cfg_local[k] = sc0.get(k)
+                        merged, added, added_items = self._merge_targets(local_targets, store_targets)
 
-                    cfg_local["targets"] = merged
-                    _write_json_best_effort(WATCHLIST_PATH, cfg_local)
-                    self._reload_watchlist()
+                        # Keep deploy config as primary; backfill missing keys from store.
+                        for k in ("enabled", "title_whitelist_regex", "message_template", "max_age_minutes"):
+                            if (k not in cfg_local) or (cfg_local.get(k) in (None, "")):
+                                if sc0.get(k) not in (None, ""):
+                                    cfg_local[k] = sc0.get(k)
+
+                        cfg_local["targets"] = merged
+                        _write_json_best_effort(WATCHLIST_PATH, cfg_local)
+                        self._reload_watchlist()
 
                     # Best-effort: resolve display names for any store-added items so embeds don't show handles as names.
                     if added_items:

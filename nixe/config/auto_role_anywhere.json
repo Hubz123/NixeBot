@@ -1,0 +1,11 @@
+{
+  "text_channels": {
+    "1293199776824692766": 1371351189224030258
+  },
+  "threads": {},
+  "restrict_to_role_ids": [
+    1371351189224030258
+  ],
+  "grant_on_thread_member_join": false,
+  "thread_join_cooldown_s": 3600
+}

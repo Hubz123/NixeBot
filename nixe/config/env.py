@@ -43,7 +43,7 @@ class Settings:
     PHASH_DB_BOARD_MARKER: str = os.getenv("PHASH_DB_BOARD_MARKER", "[phash-db-board]")
     PHASH_DB_BOARD_EVERY_SEC: int = int(os.getenv("PHASH_DB_BOARD_EVERY_SEC", "300"))
     PHASH_DB_SCAN_LIMIT: int = int(os.getenv("PHASH_DB_SCAN_LIMIT", "12000"))
-    PHASH_MATCH_THRESHOLD: int = int(os.getenv("PHASH_MATCH_THRESHOLD", "10"))
+    PHASH_MATCH_THRESHOLD: float = float(os.getenv("PHASH_MATCH_THRESHOLD", "0.92"))
     PHASH_BAN_ON_MATCH: bool = os.getenv("PHASH_BAN_ON_MATCH", "1") not in {"0","false","False"}
 
     def token(self) -> Optional[str]:

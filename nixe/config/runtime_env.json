@@ -1,5 +1,12 @@
 {
   "NIXE_ALLOW_JSON_SECRETS": "1",
+  "--- RENDER 512MB RAM GUARD ---": "---------------------------------------",
+  "NIXE_RAM_CAP_MB": "512",
+  "NIXE_RAM_TRIM_MB": "440",
+  "NIXE_RAM_TRIM_AGGRESSIVE_MB": "480",
+  "NIXE_RAM_CHECK_SEC": "20",
+  "NIXE_MAX_MESSAGES": "200",
+  "NIXE_MAX_IMAGE_PIXELS": "12000000",
   "--- LOGGING & CORE ---": "---------------------------------------",
   "LOG_CHANNEL_ID": "1431178130155896882",
   "LOG_LEVEL": "DEBUG",

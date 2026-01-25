@@ -9,6 +9,27 @@ except Exception:
 
 _CACHE: Dict[str, Tuple[float, float, str]] = {}  # key -> (ts, score, provider)
 
+def clear() -> None:
+    """Drop all cached entries (best-effort)."""
+    try:
+        _CACHE.clear()
+    except Exception:
+        pass
+
+def prune_to(limit: int) -> None:
+    """Prune cache to at most `limit` entries by dropping oldest."""
+    try:
+        lim = int(limit or 0)
+        if lim <= 0:
+            return
+        if len(_CACHE) <= lim:
+            return
+        items = sorted(_CACHE.items(), key=lambda kv: kv[1][0])
+        for kk, _ in items[: max(0, len(_CACHE) - lim)]:
+            _CACHE.pop(kk, None)
+    except Exception:
+        pass
+
 def _ttl_seconds() -> int:
     return int(os.getenv("LPG_CACHE_TTL_SEC","86400"))  # 24h default
 

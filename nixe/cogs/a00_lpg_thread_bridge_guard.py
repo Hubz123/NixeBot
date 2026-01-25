@@ -11,6 +11,39 @@ classify_lucky_pull_bytes = gb.classify_lucky_pull_bytes  # resolved via gemini_
 
 log = logging.getLogger("nixe.cogs.a00_lpg_thread_bridge_guard")
 
+# --- Groq rate-limit guard (avoid 429 storms on Render) ---
+LPG_GROQ_MAX_CONCURRENCY = int(os.getenv('LPG_GROQ_MAX_CONCURRENCY', '1') or '1')
+LPG_GROQ_MAX_RPM = int(os.getenv('LPG_GROQ_MAX_RPM', '8') or '8')
+LPG_GROQ_429_COOLDOWN_SEC = int(os.getenv('LPG_GROQ_429_COOLDOWN_SEC', '900') or '900')
+_LPG_GROQ_SEM = asyncio.Semaphore(max(1, LPG_GROQ_MAX_CONCURRENCY))
+_LPG_GROQ_LOCK = asyncio.Lock()
+_LPG_GROQ_LAST_CALL = 0.0
+_LPG_GROQ_COOLDOWN_UNTIL = 0.0
+
+async def _lpg_groq_gate():
+    global _LPG_GROQ_LAST_CALL, _LPG_GROQ_COOLDOWN_UNTIL
+    now = asyncio.get_running_loop().time()
+    if _LPG_GROQ_COOLDOWN_UNTIL and now < _LPG_GROQ_COOLDOWN_UNTIL:
+        await asyncio.sleep((_LPG_GROQ_COOLDOWN_UNTIL - now) + 0.05)
+    rpm = max(1, LPG_GROQ_MAX_RPM)
+    min_interval = 60.0 / float(rpm)
+    async with _LPG_GROQ_LOCK:
+        now = asyncio.get_running_loop().time()
+        wait = (_LPG_GROQ_LAST_CALL + min_interval) - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _LPG_GROQ_LAST_CALL = asyncio.get_running_loop().time()
+
+def _lpg_groq_mark_429():
+    global _LPG_GROQ_COOLDOWN_UNTIL
+    try:
+        now = asyncio.get_running_loop().time()
+    except RuntimeError:
+        import time as _t; now = _t.monotonic()
+    cd = max(1, int(LPG_GROQ_429_COOLDOWN_SEC))
+    _LPG_GROQ_COOLDOWN_UNTIL = now + float(cd)
+
+
 
 from nixe.helpers.once import once_sync as _once
 
@@ -498,15 +531,22 @@ async def _ocr_neg_text(image_bytes: bytes, timeout_ms: int = 3500) -> tuple[boo
         for key in keys:
             try:
                 async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.post(
-                        url,
-                        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                        json=payload,
-                    ) as resp:
-                        if resp.status != 200:
-                            last_err = f"http_{resp.status}"
-                            continue
-                        js = await resp.json()
+                    async with _LPG_GROQ_SEM:
+                        await _lpg_groq_gate()
+                        async with session.post(
+                            url,
+                            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                            json=payload,
+                        ) as resp:
+                            if resp.status == 429:
+                                _lpg_groq_mark_429()
+                                last_err = 'http_429'
+                                log.warning('[lpg] 429 rate-limited; cooldown=%ss', LPG_GROQ_429_COOLDOWN_SEC)
+                                continue
+                            if resp.status != 200:
+                                last_err = f"http_{resp.status}"
+                                continue
+                            js = await resp.json()
             except asyncio.TimeoutError:
                 # OCR timeout: fail open (no veto) but keep the return signature stable.
                 return False, "", "timeout"

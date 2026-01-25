@@ -15,6 +15,40 @@ PHISH_IMAGE_MAX_BYTES = int(os.getenv("PHISH_IMAGE_MAX_BYTES", os.getenv("PHISH_
 PHISH_SNIFF_FAKE_WEBP = (os.getenv("PHISH_SNIFF_FAKE_WEBP", "1") == "1")
 PHISH_GROQ_SEEN_TTL_SEC = int(os.getenv("PHISH_GROQ_SEEN_TTL_SEC", "300"))
 
+# --- Groq rate-limit guard (avoid 429 storms on Render) ---
+PHISH_GROQ_MAX_CONCURRENCY = int(os.getenv('PHISH_GROQ_MAX_CONCURRENCY', '1') or '1')
+PHISH_GROQ_MAX_RPM = int(os.getenv('PHISH_GROQ_MAX_RPM', '10') or '10')
+PHISH_GROQ_429_COOLDOWN_SEC = int(os.getenv('PHISH_GROQ_429_COOLDOWN_SEC', '900') or '900')
+_GROQ_SEM = asyncio.Semaphore(max(1, PHISH_GROQ_MAX_CONCURRENCY))
+_GROQ_LOCK = asyncio.Lock()
+_GROQ_LAST_CALL = 0.0
+_GROQ_COOLDOWN_UNTIL = 0.0
+
+async def _groq_gate():
+    global _GROQ_LAST_CALL, _GROQ_COOLDOWN_UNTIL
+    # cooldown after 429
+    now = asyncio.get_running_loop().time()
+    if _GROQ_COOLDOWN_UNTIL and now < _GROQ_COOLDOWN_UNTIL:
+        await asyncio.sleep((_GROQ_COOLDOWN_UNTIL - now) + 0.05)
+    rpm = max(1, PHISH_GROQ_MAX_RPM)
+    min_interval = 60.0 / float(rpm)
+    async with _GROQ_LOCK:
+        now = asyncio.get_running_loop().time()
+        wait = (_GROQ_LAST_CALL + min_interval) - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _GROQ_LAST_CALL = asyncio.get_running_loop().time()
+
+def _groq_mark_429():
+    global _GROQ_COOLDOWN_UNTIL
+    try:
+        now = asyncio.get_running_loop().time()
+    except RuntimeError:
+        import time as _t; now = _t.monotonic()
+    cd = max(1, int(PHISH_GROQ_429_COOLDOWN_SEC))
+    _GROQ_COOLDOWN_UNTIL = now + float(cd)
+
+
 # URL dedupe across messages (avoid rescanning the same CDN URL repeatedly)
 _SEEN_URL_EXP: dict[str, float] = {}
 
@@ -355,8 +389,19 @@ class GroqPhishGuard(commands.Cog):
                         ],
                     }
                     try:
-                        async with sess.post(url, headers=headers, json=payload) as resp:
-                            data = await resp.json(content_type=None)
+                        async with _GROQ_SEM:
+                            await _groq_gate()
+                            async with sess.post(url, headers=headers, json=payload) as resp:
+
+                                if resp.status == 429:
+
+                                    _groq_mark_429()
+
+                                    log.warning('[phish-groq] 429 rate-limited; cooldown=%ss', PHISH_GROQ_429_COOLDOWN_SEC)
+
+                                    continue
+
+                                data = await resp.json(content_type=None)
                     except Exception as e:
                         log.debug("[phish-groq] http err: %r", e)
                         continue

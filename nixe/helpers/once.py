@@ -22,6 +22,20 @@ _PERSIST_GC_EVERY_SEC = int(os.getenv("ONCE_PERSIST_GC_EVERY_SEC", "300") or "30
 _store: Optional[object] = None
 
 
+def purge_memory() -> None:
+    """Clear in-memory dedupe map (best-effort).
+
+    Intended for emergency memory relief on constrained platforms.
+    """
+    global _seen, _last_gc
+    try:
+        with _lock:
+            _seen.clear()
+            _last_gc = 0.0
+    except Exception:
+        return
+
+
 def _get_store():
     global _store
     if _store is not None:

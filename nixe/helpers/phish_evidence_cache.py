@@ -101,6 +101,14 @@ def _cleanup() -> None:
         return
 
 
+def clear_all() -> None:
+    """Drop all in-memory evidence (best-effort)."""
+    try:
+        _CACHE.clear()
+    except Exception:
+        return
+
+
 def record(
     guild_id: int,
     user_id: int,

@@ -215,6 +215,103 @@ def _squash_blank_lines(s: str, max_consecutive: int = 2) -> str:
     return s.strip()
 
 
+
+# -------------------------
+# WuWa VTuber greeting helpers (JP)
+# -------------------------
+
+_WUWA_GREETINGS_MAP_PATH = _env("TRANSLATE_WUWA_GREETINGS_MAP_PATH", "nixe/config/translate_wuwa_greetings_map.json")
+_WUWA_GREET_LOCK_RE = re.compile(r"(こん[ぁ-んァ-ン一-龥A-Za-z0-9_ー]{1,16})")
+_WUWA_KON_HANDLE_RE = re.compile(r"(?i)\bkon[_ ]?@?([a-z0-9_]{2,32})\b")
+_WUWA_BUAYA_WORD_RE = re.compile(r"(?i)\bbuaya\b")
+_WUWA_WANI_PRESENT_RE = re.compile(r"(わに|ワニ|鰐)")
+_WUWA_INJECTION_RE = re.compile(r"(配信|stream|live|WuWa|Wuther|Wuthering)", re.IGNORECASE)
+
+_WUWA_GREET_MAP_CACHE: Optional[Dict[str, Any]] = None
+
+def _load_wuwa_greetings_map() -> Dict[str, Any]:
+    """Load greeting map generated from youtube_wuwa_watchlist (if present)."""
+    global _WUWA_GREET_MAP_CACHE
+    if isinstance(_WUWA_GREET_MAP_CACHE, dict):
+        return _WUWA_GREET_MAP_CACHE
+    try:
+        with open(_WUWA_GREETINGS_MAP_PATH, "r", encoding="utf-8") as f:
+            _WUWA_GREET_MAP_CACHE = json.load(f) or {}
+    except Exception:
+        _WUWA_GREET_MAP_CACHE = {}
+    return _WUWA_GREET_MAP_CACHE
+
+def _wuwa_pre_normalize_input(text: str) -> str:
+    """
+    Normalize common VTuber greetings before sending to model.
+    - 'buaya' nickname becomes わに (default hiragana), unless user already used わに/ワニ/鰐.
+    - 'kon{handle}' (e.g., konpekora) becomes 'こん{nickname}' if handle in watchlist map.
+    - extra aliases (kontora/kontra) become 'こんとら'.
+    """
+    gm = _load_wuwa_greetings_map()
+    handles = (gm.get("handles") or {})
+    extra = (gm.get("extra_aliases") or {})
+    prefer = (gm.get("prefer_script") or "hiragana").lower().strip()
+
+    # hard alias normalization first
+    for k, v in extra.items():
+        try:
+            text = re.sub(rf"(?i)\b{re.escape(k)}\b", str(v), text)
+        except Exception:
+            continue
+
+    # map kon+handle => こん+nickname
+    def _repl_kon_handle(m: re.Match) -> str:
+        key = (m.group(1) or "").strip().lower()
+        if key in handles:
+            ent = handles.get(key) or {}
+            nick = str(ent.get("hira") if prefer.startswith("hira") else ent.get("kana") or ent.get("hira") or "")
+            nick = nick.strip()
+            if nick:
+                return "こん" + nick
+        return m.group(0)
+
+    text = _WUWA_KON_HANDLE_RE.sub(_repl_kon_handle, text)
+
+    # nickname: buaya => わに
+    if _WUWA_BUAYA_WORD_RE.search(text) and not _WUWA_WANI_PRESENT_RE.search(text):
+        text = _WUWA_BUAYA_WORD_RE.sub("わに", text)
+
+    return text
+
+def _wuwa_lock_greetings(text: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Replace こんX greetings with placeholders so the model can't rewrite them.
+    Returns (text_with_placeholders, placeholder_map).
+    """
+    locked: Dict[str, str] = {}
+
+    def _repl(m: re.Match) -> str:
+        token = m.group(1)
+        ph = f"[[WUWA_GREET_{len(locked)}]]"
+        locked[ph] = token
+        return ph
+
+    out = _WUWA_GREET_LOCK_RE.sub(_repl, text)
+    return out, locked
+
+def _wuwa_restore_locked(text: str, locked: Dict[str, str]) -> str:
+    for ph, token in locked.items():
+        text = text.replace(ph, token)
+    return text
+
+def _wuwa_strip_injection_line(line: str, src_text: str) -> str:
+    """If src_text doesn't mention streaming/WuWa, trim common injected phrases from WuWa line."""
+    if not line:
+        return line
+    # Only enforce if source didn't ask about streaming/game explicitly.
+    if _WUWA_INJECTION_RE.search(src_text or ""):
+        return line
+    m = _WUWA_INJECTION_RE.search(line)
+    if not m:
+        return line
+    # Cut from first injected keyword onward.
+    return line[: m.start()].rstrip(" 　、。!！?？")
 def _normalize_for_compare(s: str) -> str:
     s = re.sub(r"https?://\S+", " ", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
@@ -605,6 +702,10 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
             "raw": "",
         }
 
+    src_text = text
+    text = _wuwa_pre_normalize_input(text)
+    text, _wuwa_locked = _wuwa_lock_greetings(text)
+
     model = _env("TRANSLATE_GEMINI_MODEL", "gemini-2.5-flash-lite")
     schema = _env(
         "TRANSLATE_JA_SCHEMA",
@@ -673,7 +774,7 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
         except Exception:
             # Non-JSON; treat whole output as "formal" best-effort.
             return True, {
-                "formal": out.strip(),
+                "formal": _wuwa_restore_locked(out, _wuwa_locked).strip(),
                 "casual": "",
                 "romaji": "",
                 "reason": "non_json_output",
@@ -710,6 +811,23 @@ async def _gemini_translate_text_ja_multi(text: str) -> Tuple[bool, Dict[str, st
             or ""
         )
         reason = str(jj.get("reason") or "")
+
+        # --- WuWa VTuber strictness: preserve greetings & avoid injection ---
+        formal = _wuwa_restore_locked(formal, _wuwa_locked)
+        casual = _wuwa_restore_locked(casual, _wuwa_locked)
+        romaji = _wuwa_restore_locked(romaji, _wuwa_locked)
+        wuwa = _wuwa_restore_locked(wuwa, _wuwa_locked)
+        wuwa = _wuwa_strip_injection_line(wuwa, src_text)
+        wuwa_romaji = _wuwa_restore_locked(wuwa_romaji, _wuwa_locked)
+
+        # If user used 'buaya' as a nickname but model dropped it, force わに prefix for WuWa line.
+        if _WUWA_BUAYA_WORD_RE.search(src_text or "") and not _WUWA_WANI_PRESENT_RE.search(wuwa or ""):
+            if wuwa:
+                wuwa = "わに、" + wuwa.lstrip(" 　、。!！?？")
+            else:
+                wuwa = "わに"
+            if wuwa_romaji and "wani" not in wuwa_romaji.lower():
+                wuwa_romaji = "Wani, " + wuwa_romaji.lstrip()
 
         return True, {
             "formal": formal.strip(),

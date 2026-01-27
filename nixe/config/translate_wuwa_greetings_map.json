@@ -1,0 +1,420 @@
+{
+  "name": "wuwa_vtuber_greetings_map",
+  "version": 1,
+  "generated_from": "data/youtube_wuwa_watchlist.json",
+  "prefer_script": "hiragana",
+  "handles": {
+    "1llumi3": {
+      "kana": "いるみ",
+      "hira": "いるみ"
+    },
+    "bellmona": {
+      "kana": "ベルモナ",
+      "hira": "べるもな"
+    },
+    "erusha": {
+      "kana": "エルシャ",
+      "hira": "えるしゃ"
+    },
+    "fal_mika": {
+      "kana": "ファルミカ",
+      "hira": "ふぁるみか"
+    },
+    "333lisa_vtuber": {
+      "kana": "リサ",
+      "hira": "りさ"
+    },
+    "lulebel": {
+      "kana": "ルルベル",
+      "hira": "るるべる"
+    },
+    "lunon_azu": {
+      "kana": "あず",
+      "hira": "あず"
+    },
+    "natsuiromatsuri": {
+      "kana": "まつり",
+      "hira": "まつり"
+    },
+    "merin0402": {
+      "kana": "めりん",
+      "hira": "めりん"
+    },
+    "chiyono_mero": {
+      "kana": "メロ",
+      "hira": "めろ"
+    },
+    "misaki_hizakura": {
+      "kana": "みさき",
+      "hira": "みさき"
+    },
+    "nanomaemuki": {
+      "kana": "なの",
+      "hira": "なの"
+    },
+    "negi846": {
+      "kana": "ねぎ",
+      "hira": "ねぎ"
+    },
+    "petrpetrichorch": {
+      "kana": "ペトリコール",
+      "hira": "ぺとりこーる"
+    },
+    "anonremu": {
+      "kana": "れむ",
+      "hira": "れむ"
+    },
+    "shinotsukiyona": {
+      "kana": "ヨナ",
+      "hira": "よな"
+    },
+    "yusurarenoa": {
+      "kana": "れのあ",
+      "hira": "れのあ"
+    },
+    "touzukiyo": {
+      "kana": "ユオ",
+      "hira": "ゆお"
+    },
+    "amanomiko": {
+      "kana": "あまのみこ",
+      "hira": "あまのみこ"
+    },
+    "kerousagiii": {
+      "kana": "けろうさぎ",
+      "hira": "けろうさぎ"
+    },
+    "shizukinia": {
+      "kana": "しづきにあ",
+      "hira": "しづきにあ"
+    },
+    "tama_00x00": {
+      "kana": "たま",
+      "hira": "たま"
+    },
+    "naa_vt": {
+      "kana": "なぁぁ",
+      "hira": "なぁぁ"
+    },
+    "あいどるにに": {
+      "kana": "ににに",
+      "hira": "ににに"
+    },
+    "fuwari_nene": {
+      "kana": "ねね",
+      "hira": "ねね"
+    },
+    "pinemaru0408": {
+      "kana": "ぱいん",
+      "hira": "ぱいん"
+    },
+    "puu_channel": {
+      "kana": "ぷうちゃんねる",
+      "hira": "ぷうちゃんねる"
+    },
+    "ぷくしう": {
+      "kana": "ぷくしう",
+      "hira": "ぷくしう"
+    },
+    "0_hokori": {
+      "kana": "ほこり",
+      "hira": "ほこり"
+    },
+    "mtunakang": {
+      "kana": "つなかん",
+      "hira": "つなかん"
+    },
+    "mafel.v.p": {
+      "kana": "ぴぴ",
+      "hira": "ぴぴ"
+    },
+    "manmaruch-onigami": {
+      "kana": "まんまる",
+      "hira": "まんまる"
+    },
+    "yukky__neko": {
+      "kana": "ゆっきー",
+      "hira": "ゆっきー"
+    },
+    "rokoko6693": {
+      "kana": "ろここ",
+      "hira": "ろここ"
+    },
+    "wanuta_v": {
+      "kana": "わぬ",
+      "hira": "わぬ"
+    },
+    "nico_saboriya": {
+      "kana": "ニコ",
+      "hira": "にこ"
+    },
+    "charlottelilyvt": {
+      "kana": "リリー",
+      "hira": "りりー"
+    },
+    "milimirror": {
+      "kana": "ミラー",
+      "hira": "みらー"
+    },
+    "lucedoll": {
+      "kana": "ルーチェ",
+      "hira": "るーちぇ"
+    },
+    "kujo_rei": {
+      "kana": "レイ",
+      "hira": "れい"
+    },
+    "lunakoyoi16": {
+      "kana": "こよい",
+      "hira": "こよい"
+    },
+    "fuyubi06": {
+      "kana": "リッカ",
+      "hira": "りっか"
+    },
+    "itebareyuki": {
+      "kana": "ユキ",
+      "hira": "ゆき"
+    },
+    "naginomashiro": {
+      "kana": "ましろ",
+      "hira": "ましろ"
+    },
+    "uisatohazuki": {
+      "kana": "はずき",
+      "hira": "はずき"
+    },
+    "togamitetora": {
+      "kana": "テトラ",
+      "hira": "てとら"
+    },
+    "sakumakurumi": {
+      "kana": "くるみ",
+      "hira": "くるみ"
+    },
+    "saka1_ky0ka": {
+      "kana": "きょうか",
+      "hira": "きょうか"
+    },
+    "nanagisamahalo": {
+      "kana": "パレプロ",
+      "hira": "ぱれぷろ"
+    },
+    "yomi_vtuber": {
+      "kana": "ちゃんねる",
+      "hira": "ちゃんねる"
+    },
+    "amagami_rika": {
+      "kana": "りか",
+      "hira": "りか"
+    },
+    "nekoluna000x": {
+      "kana": "るな",
+      "hira": "るな"
+    },
+    "naoto_nawatari": {
+      "kana": "ナオト",
+      "hira": "なおと"
+    },
+    "amayoutxt": {
+      "kana": "あまゆ",
+      "hira": "あまゆ"
+    },
+    "konochannel": {
+      "kana": "コノ",
+      "hira": "この"
+    },
+    "nhlala": {
+      "kana": "しララ",
+      "hira": "しらら"
+    },
+    "kogumaneko_hina": {
+      "kana": "ひな",
+      "hira": "ひな"
+    },
+    "tsuzura_nai": {
+      "kana": "ない",
+      "hira": "ない"
+    },
+    "ruihazuki": {
+      "kana": "るい",
+      "hira": "るい"
+    },
+    "haikai_111": {
+      "kana": "カイ",
+      "hira": "かい"
+    },
+    "cocone_sera": {
+      "kana": "せら",
+      "hira": "せら"
+    },
+    "konoyami_neko": {
+      "kana": "ねこ",
+      "hira": "ねこ"
+    },
+    "paola666": {
+      "kana": "ぱおら",
+      "hira": "ぱおら"
+    },
+    "hoshizonoyui": {
+      "kana": "ゆい",
+      "hira": "ゆい"
+    },
+    "hoshimiyachoco": {
+      "kana": "ちょこ",
+      "hira": "ちょこ"
+    },
+    "tsukimi_mimi": {
+      "kana": "みみ",
+      "hira": "みみ"
+    },
+    "ririka_tsukimia": {
+      "kana": "りりか",
+      "hira": "りりか"
+    },
+    "akasakaasa": {
+      "kana": "あさ",
+      "hira": "あさ"
+    },
+    "momonoha_akota": {
+      "kana": "あこた",
+      "hira": "あこた"
+    },
+    "sakuracofene": {
+      "kana": "フェネ",
+      "hira": "ふぇね"
+    },
+    "sion_risa": {
+      "kana": "りさ",
+      "hira": "りさ"
+    },
+    "suzuka_minase": {
+      "kana": "みなせ",
+      "hira": "みなせ"
+    },
+    "minase_moco": {
+      "kana": "もこ",
+      "hira": "もこ"
+    },
+    "koyoiyura": {
+      "kana": "ゆら",
+      "hira": "ゆら"
+    },
+    "nekonosemugi": {
+      "kana": "むぎ",
+      "hira": "むぎ"
+    },
+    "nekomiya_leo": {
+      "kana": "れお",
+      "hira": "れお"
+    },
+    "nek0t0_neru": {
+      "kana": "ネル",
+      "hira": "ねる"
+    },
+    "nekogumorei": {
+      "kana": "レイ",
+      "hira": "れい"
+    },
+    "amaneoyu": {
+      "kana": "おゆ",
+      "hira": "おゆ"
+    },
+    "shirakabaruruha": {
+      "kana": "るるは",
+      "hira": "るるは"
+    },
+    "shirakumoravi": {
+      "kana": "らびぃ",
+      "hira": "らびぃ"
+    },
+    "kurenomiyako": {
+      "kana": "みやこ",
+      "hira": "みやこ"
+    },
+    "tsumugimei_ch": {
+      "kana": "めい",
+      "hira": "めい"
+    },
+    "riz_lvv": {
+      "kana": "リズ",
+      "hira": "りず"
+    },
+    "yuruneuni": {
+      "kana": "うに",
+      "hira": "うに"
+    },
+    "anzu_orisaki": {
+      "kana": "あんず",
+      "hira": "あんず"
+    },
+    "seraalara": {
+      "kana": "セーラ",
+      "hira": "せーら"
+    },
+    "minaneko_mai": {
+      "kana": "まい",
+      "hira": "まい"
+    },
+    "gunjoroman": {
+      "kana": "ロマン",
+      "hira": "ろまん"
+    },
+    "suicho_nayusa": {
+      "kana": "なゆさ",
+      "hira": "なゆさ"
+    },
+    "nago38nayori": {
+      "kana": "なごみ",
+      "hira": "なごみ"
+    },
+    "cohakuhina": {
+      "kana": "ひな",
+      "hira": "ひな"
+    },
+    "spica_aoi": {
+      "kana": "すぴか",
+      "hira": "すぴか"
+    },
+    "kunue-ri-yt": {
+      "kana": "りぃ",
+      "hira": "りぃ"
+    },
+    "shinoyakushino": {
+      "kana": "しの",
+      "hira": "しの"
+    },
+    "kosuzu_totora": {
+      "kana": "ととら",
+      "hira": "ととら"
+    },
+    "togaharajin": {
+      "kana": "ジン",
+      "hira": "じん"
+    },
+    "amane_alice": {
+      "kana": "ありす",
+      "hira": "ありす"
+    },
+    "yukisaki_yuuka": {
+      "kana": "ゆうか",
+      "hira": "ゆうか"
+    },
+    "setsureimashiro": {
+      "kana": "ましろ",
+      "hira": "ましろ"
+    },
+    "mutsuki_yukine": {
+      "kana": "ムツキ",
+      "hira": "むつき"
+    },
+    "hinanoshimotsuki": {
+      "kana": "ひなの",
+      "hira": "ひなの"
+    }
+  },
+  "extra_aliases": {
+    "kontora": "こんとら",
+    "kontra": "こんとら"
+  }
+}

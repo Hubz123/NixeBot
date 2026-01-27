@@ -35,7 +35,8 @@ def _merge_env_from_json(path: str, *, prefer_env: bool = True) -> Dict[str, str
 
 async def setup(bot):
     # Allow override path via ENV_HYBRID_JSON_PATH, default to nixe/config/runtime_env.json
-    path = os.getenv("ENV_HYBRID_JSON_PATH", "nixe/config/runtime_env.json")
+    # Allow override path via NIXE_RUNTIME_ENV_PATH or ENV_HYBRID_JSON_PATH, default to nixe/config/runtime_env.json
+    path = os.getenv("NIXE_RUNTIME_ENV_PATH") or os.getenv("ENV_HYBRID_JSON_PATH") or "nixe/config/runtime_env.json"
     prefer_env = (os.getenv("ENV_HYBRID_PREFER_ENV", "1") == "1")
     exported = _merge_env_from_json(path, prefer_env=prefer_env)
     # LPG key rename compatibility:

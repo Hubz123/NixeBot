@@ -345,5 +345,14 @@
   "PHASH_HOURLY_EVERY_SEC": "1800",
   "PHASH_HOURLY_FIRST_DELAY_SEC": "30",
   "PHASH_HOURLY_LOG_WHEN_ZERO": "0",
-  "PHASH_STRICT_EDIT": "1"
+  "PHASH_STRICT_EDIT": "1",
+  "DICT_ENABLE": "1",
+  "DICT_GDRIVE_ENABLE": "1",
+  "DICT_GDRIVE_FOLDER_ID": "1cL_AZ5NxM4BLDK1SfKrMj45oLRZtR0XE",
+  "DICT_GDRIVE_AUTOCREATE": "1",
+  "DICT_MAP_ID_JA_FILE": "ja-extract.jsonl.gz",
+  "DICT_MAP_ID_KO_FILE": "ko-extract.jsonl.gz",
+  "DICT_MAP_ID_ZH_FILE": "zh-extract.jsonl.gz",
+  "DICT_MAP_ID_ID_FILE": "id-extract.jsonl.gz",
+  "DICT_MAP_ID_EN_FILE": "raw-wiktextract-data.jsonl.gz"
 }

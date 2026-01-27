@@ -45,6 +45,7 @@ from urllib import parse as urllib_parse
 import discord
 import aiohttp
 from nixe.translate import resolve_lang
+from nixe.translate.local_dict_store import LocalDictStore, is_short_input
 from discord import app_commands
 from discord.ext import commands
 
@@ -1265,6 +1266,7 @@ class TranslateCommands(commands.Cog):
         self._last_call: Dict[int, float] = {}
         self._last_call_rev: Dict[int, float] = {}
         self._registered = False
+        self._dict_store = LocalDictStore()  # offline short-input lookup (optional)
         self._register_lock = asyncio.Lock()
         self._target_overrides: Dict[int, str] = {}
         self._ensure_task: asyncio.Task | None = None
@@ -1746,8 +1748,58 @@ class TranslateCommands(commands.Cog):
                     text_for_chat = f"{text_for_chat}\n\n{emb_text}"
 
         text_for_chat = (text_for_chat or "").strip()
+
         # -------------------------
-        # 2) Collect images (attachments + embed images)
+        # 1.5) Offline dict shortcut for very short inputs (no images)
+        # -------------------------
+        if text_for_chat and is_short_input(text_for_chat):
+            try:
+                # target is a language code or display; normalize to code if possible
+                tcode = str(target).strip().lower()
+                if len(tcode) > 4:  # maybe display name; try resolve_lang
+                    try:
+                        tcode = resolve_lang(tcode).code
+                    except Exception:
+                        tcode = str(target).strip().lower()
+                # Only shortcut when there are no images to OCR/translate
+                if not (getattr(src_msg, 'attachments', None) or []) and not (getattr(src_msg, 'embeds', None) or []):
+                    hit = await self._dict_store.lookup(text_for_chat, target_code=tcode)
+                    if hit:
+                        await interaction.followup.send(hit, ephemeral=ephemeral)
+                        return
+            except Exception:
+                pass
+        # -------------------------
+        
+        # -------------------------
+        # 1.6) Offline dict sentence assembly (ID/EN -> JA)
+        # -------------------------
+        if text_for_chat and _as_bool("DICT_SENTENCE_ENABLE", True):
+            try:
+                tcode = str(target).strip().lower()
+                if len(tcode) > 4:
+                    try:
+                        tcode = resolve_lang(tcode).code
+                    except Exception:
+                        tcode = str(target).strip().lower()
+
+                if tcode == "ja":
+                    # Only when there are no images/embeds (pure text)
+                    if not (getattr(src_msg, 'attachments', None) or []) and not (getattr(src_msg, 'embeds', None) or []):
+                        try:
+                            maxc = int(float(_env("DICT_SENTENCE_MAX_CHARS", "500")))
+                        except Exception:
+                            maxc = 200
+                        if maxc <= 0:
+                            maxc = 200
+                        if len(text_for_chat) <= maxc:
+                            assembled = await self._dict_store.sentence_translate_assemble(text_for_chat, target_code="ja")
+                            if assembled:
+                                await interaction.followup.send(assembled, ephemeral=ephemeral)
+                                return
+            except Exception:
+                pass
+# 2) Collect images (attachments + embed images)
         # -------------------------
         try:
             max_images = int(float(_env("TRANSLATE_MAX_IMAGES", "3")))
@@ -2303,6 +2355,7 @@ class TranslateCommands(commands.Cog):
             return
         # Mark as dirty and schedule a re-register/sync.
         self._registered = False
+        self._dict_store = LocalDictStore()  # offline short-input lookup (optional)
         t = getattr(self, '_ensure_task', None)
         if t is not None and not t.done():
             return

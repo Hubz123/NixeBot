@@ -17,6 +17,9 @@ log = logging.getLogger(__name__)
 
 _ID_RE = re.compile(r".*_ID$|.*_CHAN_ID$|.*_CHANNEL_ID$|.*_THREAD_ID$|.*_GUILD_ID$", re.IGNORECASE)
 
+# Google Drive IDs are non-numeric; validate separately.
+_GDRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{10,}$")
+
 def _is_section_key(k: str) -> bool:
     return k.strip().startswith("---") and k.strip().endswith("---")
 
@@ -28,6 +31,12 @@ def validate_env() -> List[str]:
         if _is_section_key(k):
             continue
         if k.upper().startswith("RENDER_"):
+            continue
+        ku = k.upper()
+        if ku == "DICT_GDRIVE_FOLDER_ID":
+            sv = str(v).strip()
+            if not sv or not _GDRIVE_ID_RE.match(sv):
+                issues.append(f"{k} invalid_gdrive_id='{sv}'")
             continue
         if _ID_RE.match(k):
             sv = str(v).strip()

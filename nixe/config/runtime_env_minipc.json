@@ -37,9 +37,8 @@
   "LPG_REDIRECT_CHANNEL_ID": "1293200121063936052",
   "LPG_GEMINI_ENABLE": "1",
   "GEMINI_MODEL": "gemini-2.5-flash-lite",
-  "GEMINI_LUCKY_THRESHOLD": "0.9",
-  "GEMINI_LUCKY_HINTS": "10-pull results grid, NEW!!, star icons, gold/orange/rainbow beam",
   "GEMINI_LUCKY_THRESHOLD": "0.90",
+  "GEMINI_LUCKY_HINTS": "10-pull results grid, NEW!!, star icons, gold/orange/rainbow beam",
   "LUCKYPULL_GEM_TIMEOUT_MS": "9000",
   "LPG_GUARD_LASTCHANCE_MS": "8000",
   "LPG_BURST_TIMEOUT_MS": "8000",
@@ -267,5 +266,11 @@
   "PHISH_CELEB_BAIT_WORDS": "(?i)(mr\\s*beast|elon\\s+musk|giveaway)",
   "PHISH_TEXT_STRONG_MIN_TOKENS": "3",
   "PHISH_TEXT_AUTO_BAN_TOKENS": "5",
-  "LPG_WHITELIST_THREAD_NAME": "Whitelist LPG (FP)"
+  "LPG_WHITELIST_THREAD_NAME": "Whitelist LPG (FP)",
+  "DICT_GDRIVE_LANGS": "id",
+  "DICT_GDRIVE_SPLIT_ONLY": "1",
+  "DICT_GDRIVE_REFRESH": "1",
+  "GDRIVE_HTTP_TIMEOUT_SEC": "30",
+  "GDRIVE_DOWNLOAD_TIMEOUT_SEC": "300",
+  "DICT_DIR": "./data/dicts"
 }

@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-from nixe.storage.gdrive import ensure_file_id
+from nixe.storage.gdrive import ensure_file_id, find_folder_id_by_name
 from nixe.translate.local_dict_store import LocalDictStore
 
 
@@ -52,6 +52,23 @@ LANG_SAMPLES: Dict[str, List[Tuple[str, str]]] = {
 }
 
 
+
+_DEFAULT_SPLIT_FOLDERS = {
+    "ja": "JP",
+    "ko": "KR",
+    "zh": "CN",
+    "id": "ID",
+    "en": "EN",
+}
+
+def _split_folder_for(lang_code: str) -> str:
+    code = (lang_code or "").strip().lower()
+    return _DEFAULT_SPLIT_FOLDERS.get(code, code.upper() or "EN")
+
+def _has_split_local(dict_dir: Path, lang_code: str) -> bool:
+    man = dict_dir / _split_folder_for(lang_code) / "manifest.json"
+    return man.exists() and man.stat().st_size > 0
+
 def _dict_files_from_env() -> Dict[str, str]:
     return {
         "ja": _env("DICT_MAP_ID_JA_FILE", "ja-extract.jsonl.gz"),
@@ -62,13 +79,13 @@ def _dict_files_from_env() -> Dict[str, str]:
     }
 
 
-async def _check_drive_presence(folder_id: str, fname: str) -> Tuple[bool, Optional[str]]:
-    """Returns (ok, file_id). No downloads."""
-    fid = await ensure_file_id(folder_id=folder_id, name=fname, create=False)
-    if not fid:
-        return False, None
-    return True, fid
-
+async def _check_drive_presence(folder_id: str, name_or_folder: str, *, want_folder: bool) -> Tuple[bool, Optional[str]]:
+    """Returns (ok, id). No downloads."""
+    if want_folder:
+        fid = await find_folder_id_by_name(parent_folder_id=folder_id, name=name_or_folder)
+        return (bool(fid), fid)
+    fid = await ensure_file_id(folder_id=folder_id, name=name_or_folder, create=False)
+    return (bool(fid), fid)
 
 def _check_local_file(dict_dir: Path, fname: str) -> Tuple[bool, Path]:
     p = dict_dir / fname
@@ -112,6 +129,7 @@ async def main() -> int:
     os.environ.setdefault("DICT_GDRIVE_ENABLE", "1")
     os.environ.setdefault("DICT_GDRIVE_FOLDER_ID", args.folder_id)
     os.environ.setdefault("DICT_DIR", args.dict_dir)
+    os.environ.setdefault("DICT_GDRIVE_NO_DOWNLOAD", "1")
 
     dict_dir = Path(args.dict_dir)
     files = _dict_files_from_env()
@@ -123,34 +141,48 @@ async def main() -> int:
     print(f"[INFO] folder_id={args.folder_id}")
     print(f"[INFO] dict_dir={dict_dir} (NO-DOWNLOAD) include_en={args.include_en} strict_local={args.strict_local}")
 
-    # 1) Presence in Drive
+    # 1) Presence in Drive (file OR split-folder layout)
     ok_all = True
     for lang in langs:
         fname = files.get(lang, "")
-        ok, fid = await _check_drive_presence(args.folder_id, fname)
-        if ok:
-            print(f"[OK] drive presence: {lang} file='{fname}' id={fid}")
+        ok_file = False
+        fid_file: Optional[str] = None
+        if fname:
+            ok_file, fid_file = await _check_drive_presence(args.folder_id, fname, want_folder=False)
+        folder_name = _split_folder_for(lang)
+        ok_folder, fid_folder = await _check_drive_presence(args.folder_id, folder_name, want_folder=True)
+
+        if ok_file:
+            print(f"[OK] drive presence: {lang} file='{fname}' id={fid_file}")
+        elif ok_folder:
+            print(f"[OK] drive presence: {lang} folder='{folder_name}' id={fid_folder}")
         else:
-            print(f"[FAIL] drive presence: {lang} file='{fname}' NOT FOUND in folder")
+            print(f"[FAIL] drive presence: {lang} neither file='{fname}' nor folder='{folder_name}' found")
             ok_all = False
 
     if not ok_all:
         return 3
 
-    # 2) Local files must exist for offline lookup (except EN if not present and not strict_local)
+    # 2) Local data must exist for offline lookup (monolithic file OR split-folder manifest).
     local_ok = True
     local_paths: Dict[str, Path] = {}
+    local_split: Dict[str, bool] = {}
     for lang in langs:
         fname = files.get(lang, "")
-        ok, p = _check_local_file(dict_dir, fname)
-        if ok:
+        ok_file, p = _check_local_file(dict_dir, fname) if fname else (False, dict_dir / fname)
+        ok_split = _has_split_local(dict_dir, lang)
+        local_split[lang] = ok_split
+        if ok_file:
             local_paths[lang] = p
             print(f"[OK] local file: {lang} {p} size={p.stat().st_size}")
+        elif ok_split:
+            man = dict_dir / _split_folder_for(lang) / "manifest.json"
+            print(f"[OK] local split: {lang} {man}")
         else:
             if lang == "en" and args.include_en and not args.strict_local:
-                print(f"[SKIP] local file: en missing (ok) {p}")
+                print(f"[SKIP] local data: en missing (ok) expected file={p} or split={dict_dir / _split_folder_for(lang)}")
                 continue
-            print(f"[FAIL] local file missing: {lang} {p}")
+            print(f"[FAIL] local data missing: {lang} expected file={p} or split={dict_dir / _split_folder_for(lang)}")
             local_ok = False
 
     if not local_ok:

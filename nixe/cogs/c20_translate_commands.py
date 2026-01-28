@@ -615,7 +615,7 @@ def _pick_groq_qc_key() -> str:
 # Gemini / Groq text translate
 # -------------------------
 
-async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str]:
+async def _gemini_translate_text(text: str, target_lang: str, glossary: str = "") -> Tuple[bool, str]:
     key = _pick_gemini_key()
     if not key:
         return False, "missing TRANSLATE_GEMINI_API_KEY"
@@ -640,7 +640,7 @@ async def _gemini_translate_text(text: str, target_lang: str) -> Tuple[bool, str
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         payload = {
             "contents": [
-                {"role": "user", "parts": [{"text": sys_msg + "\n\nTEXT:\n" + text}]}
+                {"role": "user", "parts": [{"text": (sys_msg + ("\n\n" + glossary if glossary else "")) + "\n\nTEXT:\n" + text}]}
             ],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
         }
@@ -2062,6 +2062,19 @@ class TranslateCommands(commands.Cog):
 
 
         if text_for_chat:
+            # Build optional glossary block from LangNixe dictionaries (if enabled in env).
+            glossary_block = ""
+            try:
+                tcode = str(target).strip().lower()
+                if len(tcode) > 4:
+                    try:
+                        tcode = resolve_lang(tcode).code
+                    except Exception:
+                        tcode = str(target).strip().lower()
+                glossary_block = await self._dict_store.build_glossary_block(text_for_chat, target_code=tcode)
+            except Exception:
+                glossary_block = ""
+
             # chunking seperti sebelumnya
             try:
                 try:
@@ -2091,7 +2104,7 @@ class TranslateCommands(commands.Cog):
                                     res.get("reason"),
                                 )
                             # fallback: single-mode translate seluruh teks supaya hasil tetap ada
-                            ok_single, out_single = await _gemini_translate_text(text_for_chat, target)
+                            ok_single, out_single = await _gemini_translate_text(text_for_chat, target, glossary_block)
                             if not ok_single:
                                 await interaction.followup.send(out_single, ephemeral=ephemeral)
                                 return
@@ -2124,7 +2137,7 @@ class TranslateCommands(commands.Cog):
                     out_parts = []
                     for ch in chunks:
                         # provider untuk translate dikunci ke Gemini; Groq hanya untuk phishing.
-                        ok, out = await _gemini_translate_text(ch, target)
+                        ok, out = await _gemini_translate_text(ch, target, glossary_block)
                         if not ok:
                             await interaction.followup.send(out, ephemeral=ephemeral)
                             return
@@ -2372,6 +2385,14 @@ class TranslateCommands(commands.Cog):
             provider = _pick_provider()  # saat ini selalu "gemini"
             files: List[discord.File] = []
 
+            # Optional glossary hinting (LangNixe) for single-mode translate.
+            glossary_block = ""
+            try:
+                glossary_block = await self._dict_store.build_glossary_block(text_to_translate, target_code=target_code)
+            except Exception:
+                glossary_block = ""
+
+
             # Jalur multi-style untuk JA/KO/ZH jika diaktifkan.
             try:
                 if target_code.startswith("ja") and _as_bool("TRANSLATE_JA_DUAL_ENABLE", True):
@@ -2425,7 +2446,7 @@ class TranslateCommands(commands.Cog):
                     embed.add_field(name="Formal", value=(formal or "(empty)")[:1024], inline=False)
                     embed.add_field(name="Casual", value=(casual or "(empty)")[:1024], inline=False)
                 else:
-                    ok_single, out_single = await _gemini_translate_text(text_to_translate, target_lang)
+                    ok_single, out_single = await _gemini_translate_text(text_to_translate, target_lang, glossary_block)
                     if not ok_single:
                         await message.channel.send(out_single, reference=message)
                         return

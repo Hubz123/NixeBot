@@ -23,9 +23,15 @@ Drive API reference: https://developers.google.com/drive/api/v3/reference/
 from __future__ import annotations
 
 import os, json, time
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 import aiohttp
+
+
+def _client_timeout(total_sec: float) -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=float(total_sec))
+
 
 _TOKEN_CACHE: Tuple[str, float] = ("", 0.0)  # (token, expiry_ts)
 
@@ -50,7 +56,7 @@ async def _refresh_access_token() -> Optional[Tuple[str, float]]:
         "grant_type": "refresh_token",
     }
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
         async with session.post(url, data=data) as r:
             if r.status != 200:
                 txt = await r.text()
@@ -106,7 +112,7 @@ async def fetch_meta(file_id: str) -> Dict[str, Any]:
         f"{file_id}?fields=id,name,mimeType,size,md5Checksum,modifiedTime"
     )
     headers = await _api_headers()
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
         async with session.get(url) as r:
             if r.status != 200:
                 txt = await r.text()
@@ -119,7 +125,7 @@ async def download_to_path(file_id: str, out_path: str) -> None:
         raise ValueError("file_id kosong")
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
     headers = await _api_headers()
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_DOWNLOAD_TIMEOUT_SEC','300')))) as session:
         async with session.get(url) as r:
             if r.status != 200:
                 txt = await r.text()
@@ -137,7 +143,7 @@ async def upload_bytes_overwrite(file_id: str, data: bytes, mime_type: str = "ap
     headers = await _api_headers()
     headers = dict(headers)
     headers["Content-Type"] = mime_type
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
         async with session.patch(url, data=data) as r:
             if r.status not in (200, 201):
                 txt = await r.text()
@@ -155,7 +161,7 @@ async def find_file_id_by_name(folder_id: str, name: str) -> Optional[str]:
     params = {"q": q, "pageSize": 1, "fields": "files(id,name)"}
 
     headers = await _api_headers()
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
         async with session.get(url, params=params) as r:
             if r.status != 200:
                 txt = await r.text()
@@ -180,7 +186,7 @@ async def create_file_in_folder(folder_id: str, name: str, mime_type: str = "app
     headers = dict(headers)
     headers["Content-Type"] = "application/json"
 
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
         async with session.post(url, data=json.dumps(body).encode("utf-8")) as r:
             if r.status not in (200, 201):
                 txt = await r.text()
@@ -199,3 +205,87 @@ async def ensure_file_id(folder_id: str, name: str, create: bool = False, mime_t
     if not create:
         return None
     return await create_file_in_folder(folder_id, name, mime_type=mime_type)
+
+# ---------------------------------------------------------------------------
+# Folder helpers (for split dictionary layouts)
+# ---------------------------------------------------------------------------
+
+_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+async def list_children(folder_id: str, page_size: int = 1000) -> list[dict]:
+    """List direct children of a folder (files + subfolders)."""
+    if not folder_id:
+        raise ValueError("folder_id kosong")
+    url = "https://www.googleapis.com/drive/v3/files"
+    headers = await _api_headers()
+
+    q = f"'{_escape_q(folder_id)}' in parents and trashed=false"
+    fields = "nextPageToken,files(id,name,mimeType,size,modifiedTime)"
+    out: list[dict] = []
+    page_token: str | None = None
+
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
+        while True:
+            params = {"q": q, "pageSize": page_size, "fields": fields}
+            if page_token:
+                params["pageToken"] = page_token
+            async with session.get(url, params=params) as r:
+                if r.status != 200:
+                    txt = await r.text()
+                    raise RuntimeError(f"Drive list gagal ({r.status}): {txt[:500]}")
+                data = await r.json()
+                out.extend(data.get("files") or [])
+                page_token = (data.get("nextPageToken") or "").strip() or None
+                if not page_token:
+                    break
+    return out
+
+
+async def find_folder_id_by_name(parent_folder_id: str, name: str) -> Optional[str]:
+    """Find a subfolder by name inside parent folder."""
+    if not parent_folder_id:
+        raise ValueError("folder_id kosong")
+    if not name:
+        raise ValueError("name kosong")
+
+    q = (
+        f"name='{_escape_q(name)}' and "
+        f"'{_escape_q(parent_folder_id)}' in parents and "
+        f"mimeType='{_FOLDER_MIME}' and trashed=false"
+    )
+    url = "https://www.googleapis.com/drive/v3/files"
+    params = {"q": q, "pageSize": 1, "fields": "files(id,name)"}
+
+    headers = await _api_headers()
+    async with aiohttp.ClientSession(headers=headers, timeout=_client_timeout(float(_env('GDRIVE_HTTP_TIMEOUT_SEC','30')))) as session:
+        async with session.get(url, params=params) as r:
+            if r.status != 200:
+                txt = await r.text()
+                raise RuntimeError(f"Drive list folder gagal ({r.status}): {txt[:500]}")
+            data = await r.json()
+            files = data.get("files") or []
+            if not files:
+                return None
+            return (files[0].get("id") or "").strip() or None
+
+
+async def download_folder_recursive(folder_id: str, out_dir: str) -> None:
+    """Recursively download a Drive folder tree into out_dir."""
+    if not folder_id:
+        raise ValueError("folder_id kosong")
+    outp = Path(out_dir)
+    outp.mkdir(parents=True, exist_ok=True)
+
+    children = await list_children(folder_id)
+    for ch in children:
+        cid = (ch.get("id") or "").strip()
+        name = (ch.get("name") or "").strip()
+        mime = (ch.get("mimeType") or "").strip()
+        if not (cid and name):
+            continue
+        if mime == _FOLDER_MIME:
+            await download_folder_recursive(cid, str(outp / name))
+        else:
+            # download file
+            await download_to_path(file_id=cid, out_path=str(outp / name))

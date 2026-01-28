@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nixe.storage.gdrive import ensure_file_id, download_to_path
+from nixe.storage.gdrive import ensure_file_id, download_to_path, find_folder_id_by_name, download_folder_recursive
 from nixe.translate.local_dict_store import LocalDictStore
 
 
@@ -60,16 +60,83 @@ def _dict_files_from_env() -> Dict[str, str]:
     }
 
 
-async def _download_from_drive(folder_id: str, fname: str, out_dir: Path) -> Path:
+
+_DEFAULT_SPLIT_FOLDERS = {
+    "ja": "JP",
+    "ko": "KR",
+    "zh": "CN",
+    "id": "ID",
+    "en": "EN",
+}
+
+def _split_folder_for(lang_code: str) -> str:
+    code = (lang_code or "").strip().lower()
+    if code == "ja":
+        return _env("DICT_MAP_ID_JA_FOLDER", _DEFAULT_SPLIT_FOLDERS["ja"])
+    if code == "ko":
+        return _env("DICT_MAP_ID_KO_FOLDER", _DEFAULT_SPLIT_FOLDERS["ko"])
+    if code == "zh":
+        return _env("DICT_MAP_ID_ZH_FOLDER", _DEFAULT_SPLIT_FOLDERS["zh"])
+    if code == "id":
+        return _env("DICT_MAP_ID_ID_FOLDER", _DEFAULT_SPLIT_FOLDERS["id"])
+    if code == "en":
+        return _env("DICT_MAP_ID_EN_FOLDER", _DEFAULT_SPLIT_FOLDERS["en"])
+    return _DEFAULT_SPLIT_FOLDERS.get(code, code.upper() or "EN")
+
+
+async def _download_from_drive(folder_id: str, src_code: str, fname: str, out_dir: Path, max_mb: int = 0) -> Path:
+    """Download either:
+    - legacy monolithic file `fname` from root folder, OR
+    - split-folder layout (e.g. ID/manifest.json + parts) into out_dir/<FOLDER_NAME>.
+
+    Returns a path that exists (for logging/size checks): the downloaded file path, or the manifest path for split layout.
+    """
+    # 1) Try legacy monolithic file
     fid = await ensure_file_id(folder_id=folder_id, name=fname, create=False)
-    if not fid:
-        raise RuntimeError(f"Drive file not found: '{fname}' in folder {folder_id}")
-    out_path = out_dir / fname
-    out_dir.mkdir(parents=True, exist_ok=True)
-    await download_to_path(file_id=fid, out_path=str(out_path))
-    if not out_path.exists() or out_path.stat().st_size <= 0:
-        raise RuntimeError(f"Download failed or empty: {out_path}")
-    return out_path
+    if fid:
+        out_path = out_dir / fname
+        out_dir.mkdir(parents=True, exist_ok=True)
+        await download_to_path(file_id=fid, out_path=str(out_path))
+        if not out_path.exists() or out_path.stat().st_size <= 0:
+            raise RuntimeError(f"Download failed or empty: {out_path}")
+        return out_path
+
+    # 2) Fallback: split folder layout
+    folder_name = _split_folder_for(src_code)
+    sub_id = None
+    try:
+        sub_id = await find_folder_id_by_name(parent_folder_id=folder_id, name=folder_name)
+    except Exception:
+        sub_id = None
+    if not sub_id:
+        raise RuntimeError(
+            f"Drive dict not found as file '{fname}' and also no split folder '{folder_name}' under {folder_id}"
+        )
+
+    out_sub = out_dir / folder_name
+    out_sub.mkdir(parents=True, exist_ok=True)
+    await download_folder_recursive(folder_id=sub_id, out_dir=str(out_sub))
+
+    man = out_sub / "manifest.json"
+    if not man.exists() or man.stat().st_size <= 0:
+        raise RuntimeError(f"Split folder downloaded but manifest missing/empty: {man}")
+
+    # Optional safety: check total size
+    if max_mb and max_mb > 0:
+        total = 0
+        for p in out_sub.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except Exception:
+                    continue
+        size_mb = total / (1024 * 1024)
+        if size_mb > max_mb:
+            raise RuntimeError(
+                f"Downloaded split folder too large ({size_mb:.1f}MB > {max_mb}MB): {folder_name}"
+            )
+
+    return man
 
 
 # ------------------- deterministic rules for ID -> JA -------------------
@@ -280,8 +347,8 @@ async def main() -> int:
         print("[FAIL] DICT_GDRIVE_FOLDER_ID not set and --folder-id not provided.")
         return 2
     if not _have_drive_auth():
-        print("[FAIL] Drive auth not available. Set GDRIVE_ACCESS_TOKEN or (GDRIVE_REFRESH_TOKEN + GDRIVE_CLIENT_ID + GDRIVE_CLIENT_SECRET).")
-        return 3
+        print("[SKIP] Drive auth not available. Set GDRIVE_ACCESS_TOKEN or (GDRIVE_REFRESH_TOKEN + GDRIVE_CLIENT_ID + GDRIVE_CLIENT_SECRET).")
+        return 0
 
     if not args.sentence.strip():
         args.sentence = "Saya suka kucing dan anjing." if args.src == "id" else "I like cats and dogs."
@@ -299,11 +366,27 @@ async def main() -> int:
         print(f"[INFO] src={args.src} tgt={args.tgt} file={fname}")
         print(f"[INPUT] {args.sentence}")
 
-        p = await _download_from_drive(args.folder_id, fname, temp_root)
-        size_mb = p.stat().st_size / (1024 * 1024)
-        if args.max_mb > 0 and size_mb > args.max_mb:
-            raise RuntimeError(f"Downloaded file too large ({size_mb:.1f}MB > {args.max_mb}MB): {p.name}")
-        print(f"[OK] downloaded: {p.name} size={int(p.stat().st_size)}")
+        p = await _download_from_drive(args.folder_id, args.src, fname, temp_root, max_mb=args.max_mb)
+        if p.name == fname:
+            size_mb = p.stat().st_size / (1024 * 1024)
+            if args.max_mb > 0 and size_mb > args.max_mb:
+                raise RuntimeError(f"Downloaded file too large ({size_mb:.1f}MB > {args.max_mb}MB): {p.name}")
+            print(f"[OK] downloaded: {p.name} size={int(p.stat().st_size)}")
+        else:
+            # split-folder layout: p points to manifest.json inside temp_root/<FOLDER>
+            total = 0
+            nfiles = 0
+            for fp in p.parent.rglob('*'):
+                if fp.is_file():
+                    try:
+                        total += fp.stat().st_size
+                        nfiles += 1
+                    except Exception:
+                        pass
+            total_mb = total / (1024 * 1024)
+            if args.max_mb > 0 and total_mb > args.max_mb:
+                raise RuntimeError(f"Downloaded split folder too large ({total_mb:.1f}MB > {args.max_mb}MB): {p.parent.name}")
+            print(f"[OK] downloaded split folder: {p.parent.name} files={nfiles} total_bytes={total}")
 
         os.environ["DICT_ENABLE"] = "1"
         os.environ["DICT_DIR"] = str(temp_root)

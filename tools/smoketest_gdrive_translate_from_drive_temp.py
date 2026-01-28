@@ -114,8 +114,8 @@ async def main() -> int:
         return 2
 
     if not _have_drive_auth():
-        print("[FAIL] Drive auth not available. Set GDRIVE_ACCESS_TOKEN or (GDRIVE_REFRESH_TOKEN + GDRIVE_CLIENT_ID + GDRIVE_CLIENT_SECRET).")
-        return 3
+        print("[SKIP] Drive auth not available. Set GDRIVE_ACCESS_TOKEN or (GDRIVE_REFRESH_TOKEN + GDRIVE_CLIENT_ID + GDRIVE_CLIENT_SECRET).")
+        return 0
 
     langs = [s.strip() for s in args.langs.split(",") if s.strip()]
     if args.include_en and "en" not in langs:

@@ -358,5 +358,11 @@
   "DICT_MAP_ID_KO_FILE": "ko-extract.jsonl.gz",
   "DICT_MAP_ID_ZH_FILE": "zh-extract.jsonl.gz",
   "DICT_MAP_ID_ID_FILE": "id-extract.jsonl.gz",
-  "DICT_MAP_ID_EN_FILE": "raw-wiktextract-data.jsonl.gz"
+  "DICT_MAP_ID_EN_FILE": "raw-wiktextract-data.jsonl.gz",
+  "DICT_GDRIVE_LANGS": "id",
+  "DICT_GDRIVE_SPLIT_ONLY": "1",
+  "DICT_GDRIVE_REFRESH": "1",
+  "GDRIVE_HTTP_TIMEOUT_SEC": "30",
+  "GDRIVE_DOWNLOAD_TIMEOUT_SEC": "300",
+  "DICT_DIR": "/tmp/dicts"
 }

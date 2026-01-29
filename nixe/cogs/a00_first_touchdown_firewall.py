@@ -23,6 +23,10 @@ from nixe.helpers.phash_tools import dhash_bytes, hamming
 from nixe.helpers.phash_board import get_blacklist_hashes
 
 URL_RE = re.compile(r"https?://[\w.-]+\.[a-z]{2,}(?:/\S*)?", re.I)
+DISCORD_INVITE_RE = re.compile(
+    r"https?://(?:www\.)?(?:discord\.gg|discord(?:app)?\.com)/(?:invite/)?([A-Za-z0-9-]{2,64})",
+    re.I,
+)
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 _PRESET_TEXT = {
@@ -141,6 +145,21 @@ class FirstTouchdownFirewall(commands.Cog):
             self.skip = {1400375184048787566, 936690788946030613}
 
         self.block = set(get("PHISH_BLOCK_DOMAINS", "").lower().replace(",", " ").split())
+
+        # Discord invite phishing (cheap heuristic): block only specific invite codes
+        # or codes matching a suspicious regex. Default is delete-only to avoid false positives.
+        self.invite_enable = get("PHISH_DISCORD_INVITE_ENABLE", "1") == "1"
+        self.invite_ban = get("PHISH_DISCORD_INVITE_BAN_ON_MATCH", "0") == "1"
+        raw_codes = get("PHISH_BLOCK_DISCORD_INVITE_CODES", "").lower().replace(",", " ").split()
+        self.invite_block_codes = {c.strip() for c in raw_codes if c.strip()}
+        self.invite_code_pat = get(
+            "PHISH_DISCORD_INVITE_CODE_PATTERNS",
+            r"(?i)(cheat|hack|crack|nitro|gift|airdrop|free|earn|crypto|casino|bet|stake)",
+        )
+        try:
+            self._invite_code_re = re.compile(self.invite_code_pat)
+        except re.error:
+            self._invite_code_re = re.compile(r"(?i)(cheat|hack|nitro|gift|airdrop|crypto|casino)")
         self.hash_thr = int(get_int("PHISH_HASH_HAMMING_MAX", 6))
         self.hash_ref = get_blacklist_hashes()
 
@@ -174,6 +193,20 @@ class FirstTouchdownFirewall(commands.Cog):
             if any(b and b in host for b in self.block):
                 return True
         return False
+
+    def _discord_invite_hit(self, content: str) -> str | None:
+        """Return invite code if a suspicious Discord invite link is detected."""
+        if not self.invite_enable:
+            return None
+        for m in DISCORD_INVITE_RE.finditer(content or ""):
+            code = (m.group(1) or "").strip().lower()
+            if not code:
+                continue
+            if code in self.invite_block_codes:
+                return code
+            if self._invite_code_re.search(code):
+                return code
+        return None
 
     async def _single_webp_valid(self, m: discord.Message) -> bool | None:
         """Return True if single WEBP and signature OK, False if single WEBP but signature invalid, None otherwise."""
@@ -264,6 +297,19 @@ class FirstTouchdownFirewall(commands.Cog):
         # High-confidence phishing blast: @everyone + 4 PNGs disguised as WEBP
         if m.attachments and _mass_blast_disguise(m):
             await self._banish(m, "mass mention + multi-image disguise")
+            return
+
+        # Discord invite phishing (e.g. scam/cheat servers). Default action is delete-only
+        # unless PHISH_DISCORD_INVITE_BAN_ON_MATCH=1.
+        inv_code = self._discord_invite_hit(m.content or "")
+        if inv_code:
+            if self.invite_ban:
+                await self._banish(m, f"discord invite:{inv_code}")
+            else:
+                try:
+                    await m.delete(reason=f"Suspicious Discord invite:{inv_code}")
+                except Exception:
+                    pass
             return
 
         # Link-based phishing is still high-confidence.

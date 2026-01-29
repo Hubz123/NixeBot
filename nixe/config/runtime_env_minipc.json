@@ -267,10 +267,14 @@
   "PHISH_TEXT_STRONG_MIN_TOKENS": "3",
   "PHISH_TEXT_AUTO_BAN_TOKENS": "5",
   "LPG_WHITELIST_THREAD_NAME": "Whitelist LPG (FP)",
+  "DICT_DIR": "./data/dicts",
   "DICT_GDRIVE_LANGS": "id",
   "DICT_GDRIVE_SPLIT_ONLY": "1",
   "DICT_GDRIVE_REFRESH": "1",
   "GDRIVE_HTTP_TIMEOUT_SEC": "30",
   "GDRIVE_DOWNLOAD_TIMEOUT_SEC": "300",
-  "DICT_DIR": "./data/dicts"
+  "PHISH_DISCORD_INVITE_ENABLE": "1",
+  "PHISH_DISCORD_INVITE_BAN_ON_MATCH": "0",
+  "PHISH_BLOCK_DISCORD_INVITE_CODES": "cheatcentral",
+  "PHISH_DISCORD_INVITE_CODE_PATTERNS": "(?i)(cheat|hack|crack|nitro|gift|airdrop|free|earn|crypto|casino|bet|stake)"
 }

@@ -15,6 +15,8 @@ No config changes; purely reads runtime_env.json/.env.
 from __future__ import annotations
 
 import os
+
+import hashlib
 import logging
 import contextlib
 import re
@@ -237,6 +239,82 @@ class FirstTouchdown(commands.Cog):
         except Exception:
             pass
 
+    
+    async def _compute_attachment_sig(self, msg: "discord.Message") -> str:
+        """Compute a stable signature for a single attachment. Prefers bytes hash (sha1)."""
+        try:
+            atts = list(getattr(msg, "attachments", []) or [])
+            if len(atts) != 1:
+                return ""
+            att = atts[0]
+            # Try bytes-based hash (stable across reupload)
+            data = None
+            try:
+                # discord.Attachment.read exists in discord.py 2.x
+                data = await att.read()
+            except Exception:
+                data = None
+            if data:
+                return hashlib.sha1(data).hexdigest()
+            # Fallback: url-based
+            u = (getattr(att, "url", "") or "").strip()
+            if u:
+                return hashlib.sha1(u.encode("utf-8", "ignore")).hexdigest()
+        except Exception:
+            pass
+        return ""
+
+    async def _send_webp_review(self, guild: "discord.Guild", msg: "discord.Message", sig: str, reason: str) -> None:
+        """Send review embed + buttons to the YT watchlist thread."""
+        try:
+            from nixe.cogs.phish_review_ui import resolve_review_thread, PhishReviewView
+        except Exception:
+            return
+
+        # Resolve destination
+        dest = None
+        try:
+            dest = await resolve_review_thread(self.bot, guild)
+        except Exception:
+            dest = None
+
+        if dest is None:
+            # fallback to log channel
+            try:
+                cid = int(os.getenv("LOG_CHANNEL_ID", "0") or "0")
+            except Exception:
+                cid = 0
+            if cid:
+                dest = self.bot.get_channel(cid)
+                if dest is None:
+                    with contextlib.suppress(Exception):
+                        dest = await self.bot.fetch_channel(cid)
+
+        if dest is None:
+            return
+
+        # Build embed
+        embed = discord.Embed(
+            title="RAGU: Single WEBP review",
+            description=reason,
+        )
+        embed.add_field(name="User", value=f"<@{msg.author.id}> (`{msg.author.id}`)", inline=False)
+        embed.add_field(name="Sig", value=f"`{sig[:16]}`", inline=True)
+        embed.add_field(name="Channel", value=f"<#{msg.channel.id}>", inline=True)
+        with contextlib.suppress(Exception):
+            if msg.jump_url:
+                embed.add_field(name="Jump", value=msg.jump_url, inline=False)
+        # attachment url (might still work after delete)
+        try:
+            att = (msg.attachments or [None])[0]
+            if att and getattr(att, "url", None):
+                embed.add_field(name="Attachment URL", value=att.url, inline=False)
+        except Exception:
+            pass
+
+        view = PhishReviewView(sig=sig, target_user_id=msg.author.id, delete_days=self.delete_days, reason_prefix="FirstTouchdown: review")
+        with contextlib.suppress(Exception):
+            await dest.send(embed=embed, view=view)
     async def _delete_only(self, channel: discord.abc.Messageable | None, message_id: int | None, *, reason: str = "") -> None:
         try:
             if not channel or not message_id or not hasattr(channel, "fetch_message"):
@@ -291,7 +369,24 @@ class FirstTouchdown(commands.Cog):
                 if webp_valid is True and is_image_hash_signal:
                     # If there are other high-confidence indicators, keep ban.
                     if not getattr(msg, "mention_everyone", False) and not _has_url(getattr(msg, "content", "") or ""):
-                        await self._delete_only(channel, mid, reason="FirstTouchdown: single WEBP gated (delete-only)")
+                        # RAGU path: single WEBP + image-hash-only signal => delete + send review (BAN/FALSE) in YT watchlist thread.
+                        sig = await self._compute_attachment_sig(msg)
+                        if sig:
+                            try:
+                                from nixe.helpers import phish_review_memory as _prm
+                                mem = _prm.load_memory()
+                                if sig in mem.get("false", set()):
+                                    # Known false-positive: do nothing.
+                                    return
+                                if sig in mem.get("banned", set()):
+                                    await self._ban_and_delete(guild, channel, uid, mid, "FirstTouchdown: known attack signature (auto-ban)")
+                                    return
+                            except Exception:
+                                pass
+                        await self._delete_only(channel, mid, reason="FirstTouchdown: single WEBP gated (deleted for review)")
+                        if sig:
+                            with contextlib.suppress(Exception):
+                                await self._send_webp_review(guild, msg, sig, "single WEBP + hash-only signal (needs mod decision)")
                         return
                 # If WEBP is invalid/unknown, do not *upgrade* to ban solely on that; continue default behavior.
 
@@ -335,7 +430,24 @@ class FirstTouchdown(commands.Cog):
                 webp_valid = await self._validate_single_webp(msg)
                 if webp_valid is True:
                     if not getattr(msg, "mention_everyone", False) and not _has_url(getattr(msg, "content", "") or ""):
-                        await self._delete_only(channel, mid, reason="FirstTouchdown: single WEBP gated (delete-only)")
+                        # RAGU path: single WEBP + image-hash-only signal => delete + send review (BAN/FALSE) in YT watchlist thread.
+                        sig = await self._compute_attachment_sig(msg)
+                        if sig:
+                            try:
+                                from nixe.helpers import phish_review_memory as _prm
+                                mem = _prm.load_memory()
+                                if sig in mem.get("false", set()):
+                                    # Known false-positive: do nothing.
+                                    return
+                                if sig in mem.get("banned", set()):
+                                    await self._ban_and_delete(guild, channel, uid, mid, "FirstTouchdown: known attack signature (auto-ban)")
+                                    return
+                            except Exception:
+                                pass
+                        await self._delete_only(channel, mid, reason="FirstTouchdown: single WEBP gated (deleted for review)")
+                        if sig:
+                            with contextlib.suppress(Exception):
+                                await self._send_webp_review(guild, msg, sig, "single WEBP + hash-only signal (needs mod decision)")
                         return
 
             try:

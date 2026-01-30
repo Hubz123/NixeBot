@@ -8,6 +8,30 @@ from discord.ext import commands
 
 log = logging.getLogger("nixe.cogs.phish_groq_guard")
 
+
+def _is_thread_channel(ch) -> bool:
+    """Return True if `ch` looks like a Discord thread.
+
+    Policy: ALL threads are excluded from phishing scanning.
+    """
+    if ch is None:
+        return False
+    # Prefer isinstance check when available (discord.py >= 2.x)
+    try:
+        Thread = getattr(discord, "Thread", None)
+        if Thread is not None and isinstance(ch, Thread):
+            return True
+    except Exception:
+        pass
+    # Fallback: infer from channel type string
+    try:
+        t = getattr(ch, "type", None)
+        if t and "thread" in str(t).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
 from nixe.helpers.ban_utils import emit_phish_detected
 
 PHISH_MIN_BYTES = int(os.getenv("PHISH_MIN_IMAGE_BYTES", "8192"))
@@ -303,6 +327,10 @@ class GroqPhishGuard(commands.Cog):
             ctype = getattr(ch, "type", None)
             ptype = getattr(parent, "type", None)
             if any("forum" in str(t).lower() for t in (ctype, ptype)):
+                return
+
+            # Global policy: skip ALL threads from Groq phishing scanning
+            if _is_thread_channel(ch):
                 return
 
             cid = int(getattr(ch, "id", 0) or 0)

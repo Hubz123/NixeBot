@@ -9,6 +9,30 @@ from nixe.shared import bus
 
 log = logging.getLogger("nixe.cogs.suspicious_attachment_guard")  # tag: [sus-attach]
 
+
+def _is_thread_channel(ch) -> bool:
+    """Return True if `ch` looks like a Discord thread.
+
+    Policy: ALL threads are excluded from phishing scanning.
+    """
+    if ch is None:
+        return False
+    # Prefer isinstance check when available (discord.py >= 2.x)
+    try:
+        Thread = getattr(discord, "Thread", None)
+        if Thread is not None and isinstance(ch, Thread):
+            return True
+    except Exception:
+        pass
+    # Fallback: infer from channel type string
+    try:
+        t = getattr(ch, "type", None)
+        if t and "thread" in str(t).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
 _IMG_EXT = {".png",".jpg",".jpeg",".gif",".bmp",".webp",".jfif",".pjpeg",".pjp",".tif",".tiff"}
 _LPG_GATE_EXT = {".png",".jpg",".jpeg"}  # only for suspicious-gate path
 _ARCHIVE_EXT = {".zip",".rar",".7z",".tar",".gz",".xz"}
@@ -239,6 +263,9 @@ class SuspiciousAttachmentGuard(commands.Cog):
         try:
             if not self.enable: return
             if message.author.bot: return
+            # Global policy: skip ALL threads from suspicious attachment scanning
+            if _is_thread_channel(getattr(message, 'channel', None)):
+                return
             if self.ignore_channels and str(message.channel.id) in self.ignore_channels: return
             # Optional skip: let LPA own these channels
             if self.skip_lpg_guard and self.lpg_guard_channels and str(message.channel.id) in self.lpg_guard_channels:

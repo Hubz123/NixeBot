@@ -18,6 +18,30 @@ from nixe.helpers.ban_utils import emit_phish_detected
 
 log = logging.getLogger("nixe.cogs.phish_link_guard")
 
+
+def _is_thread_channel(ch) -> bool:
+    """Return True if `ch` looks like a Discord thread.
+
+    Policy: ALL threads are excluded from phishing scanning.
+    """
+    if ch is None:
+        return False
+    # Prefer isinstance check when available (discord.py >= 2.x)
+    try:
+        Thread = getattr(discord, "Thread", None)
+        if Thread is not None and isinstance(ch, Thread):
+            return True
+    except Exception:
+        pass
+    # Fallback: infer from channel type string
+    try:
+        t = getattr(ch, "type", None)
+        if t and "thread" in str(t).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
 URL_RE = re.compile(r'https?://[^\s<>()]+' , re.I)
 # Default suspicious hosts; can be extended via PHISH_LINK_HOSTS (comma-separated)
 DEFAULT_HOSTS = {"i.ibb.co", "ibb.co", "postimg.cc", "postimg.cc", "imgbb.com", "tinypic.com", "imgur.com", "pinimg.com"}
@@ -72,6 +96,10 @@ class LinkPhishGuard(commands.Cog):
             ctype = getattr(ch,"type",None)
             ptype = getattr(parent,"type",None)
             if any("forum" in str(t).lower() for t in (ctype, ptype)):
+                return
+
+            # Global policy: skip ALL threads from link phishing scanning
+            if _is_thread_channel(ch):
                 return
             cid = int(getattr(ch,"id",0) or 0)
             pid = int(getattr(ch,"parent_id",0) or 0)

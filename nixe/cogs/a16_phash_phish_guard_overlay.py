@@ -17,6 +17,28 @@ from nixe.helpers.once import once_sync as _once
 
 log = logging.getLogger("nixe.cogs.phash_phish_guard")
 
+
+def _is_thread_channel(ch) -> bool:
+    """Return True if `ch` looks like a Discord thread.
+
+    Policy: ALL threads are excluded from phishing scanning.
+    """
+    if ch is None:
+        return False
+    try:
+        Thread = getattr(discord, "Thread", None)
+        if Thread is not None and isinstance(ch, Thread):
+            return True
+    except Exception:
+        pass
+    try:
+        t = getattr(ch, "type", None)
+        if t and "thread" in str(t).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
 try:
     from PIL import Image as _PIL_Image
 except Exception:
@@ -355,6 +377,9 @@ class PhashPhishGuard(commands.Cog):
             return
         ch = getattr(m, "channel", None)
         if ch is None:
+            return
+        # Global policy: skip ALL threads from phishing scanning
+        if _is_thread_channel(ch):
             return
         if not self._should_guard_channel(ch):
             return

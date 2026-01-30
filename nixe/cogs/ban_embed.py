@@ -5,6 +5,34 @@ from typing import Optional, Union
 import discord
 from datetime import datetime, timedelta
 
+
+import io, json
+from typing import Any, Dict
+
+def build_ban_evidence_payload(
+    *,
+    guild: Optional[discord.Guild],
+    target: Union[discord.User, discord.Member, None],
+    moderator: Union[discord.User, discord.Member, None],
+    reason: Optional[str],
+    evidence: Optional[dict],
+) -> Dict[str, Any]:
+    """Create a JSON-serializable evidence payload for ban logs.
+    Always returns a dict (may include empty evidence)."""
+    return {
+        "ts_wib": _now_wib_str(),
+        "guild_id": int(getattr(guild, "id", 0) or 0) if guild else 0,
+        "target_id": int(getattr(target, "id", 0) or 0) if target else 0,
+        "target_name": _safe_name(target),
+        "moderator_id": int(getattr(moderator, "id", 0) or 0) if moderator else 0,
+        "moderator_name": _safe_name(moderator),
+        "reason": (reason or "").strip(),
+        "evidence": evidence or {},
+    }
+
+def build_ban_evidence_file(payload: Dict[str, Any], *, filename: str) -> discord.File:
+    data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    return discord.File(fp=io.BytesIO(data), filename=filename)
 log = logging.getLogger(__name__)
 
 # Force WIB timestamp without relying on zoneinfo, so it always shows "WIB"
@@ -81,8 +109,15 @@ def build_ban_embed(
     # Best-effort; never raises and never affects ban flow.
     try:
         if guild and target and getattr(target, "id", None):
-            from nixe.helpers import phish_evidence_cache as _pec
-            ev = _pec.pop(int(getattr(guild, "id", 0) or 0), int(getattr(target, "id", 0) or 0))
+            # Prefer evidence passed from caller to avoid double-pop.
+            ev = None
+            try:
+                ev = kwargs.get("evidence", None)
+            except Exception:
+                ev = None
+            if not ev:
+                from nixe.helpers import phish_evidence_cache as _pec
+                ev = _pec.pop(int(getattr(guild, "id", 0) or 0), int(getattr(target, "id", 0) or 0))
             if ev:
                 lines_ev = []
                 j = str(ev.get("jump_url") or "").strip()

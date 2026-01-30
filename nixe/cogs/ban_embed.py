@@ -19,15 +19,39 @@ def build_ban_evidence_payload(
 ) -> Dict[str, Any]:
     """Create a JSON-serializable evidence payload for ban logs.
     Always returns a dict (may include empty evidence)."""
+    ev = dict(evidence or {})
+    # Resolve channel name for readability (best-effort).
+    try:
+        cid = int(ev.get('channel_id') or 0)
+    except Exception:
+        cid = 0
+    ch_name = ''
+    if cid and guild:
+        ch_obj = None
+        try:
+            get_cot = getattr(guild, 'get_channel_or_thread', None)
+            if callable(get_cot):
+                ch_obj = get_cot(cid)
+            if not ch_obj:
+                ch_obj = guild.get_channel(cid)
+        except Exception:
+            ch_obj = None
+        ch_name = str(getattr(ch_obj, 'name', '') or '').strip() if ch_obj else ''
+    if cid and ch_name:
+        ev['channel_name'] = ch_name
+    elif cid and 'channel_name' not in ev:
+        ev['channel_name'] = ''
     return {
         "ts_wib": _now_wib_str(),
         "guild_id": int(getattr(guild, "id", 0) or 0) if guild else 0,
+        "channel_id": int(ev.get("channel_id") or 0) if isinstance(ev, dict) else 0,
+        "channel_name": str(ev.get("channel_name") or "") if isinstance(ev, dict) else "",
         "target_id": int(getattr(target, "id", 0) or 0) if target else 0,
         "target_name": _safe_name(target),
         "moderator_id": int(getattr(moderator, "id", 0) or 0) if moderator else 0,
         "moderator_name": _safe_name(moderator),
         "reason": (reason or "").strip(),
-        "evidence": evidence or {},
+        "evidence": ev,
     }
 
 def build_ban_evidence_file(payload: Dict[str, Any], *, filename: str) -> discord.File:
@@ -120,6 +144,31 @@ def build_ban_embed(
                 ev = _pec.pop(int(getattr(guild, "id", 0) or 0), int(getattr(target, "id", 0) or 0))
             if ev:
                 lines_ev = []
+                # Include source channel (name, not raw ID) to make audits easier.
+                try:
+                    cid = int(ev.get("channel_id") or 0)
+                except Exception:
+                    cid = 0
+                if cid and guild:
+                    ch_obj = None
+                    try:
+                        # discord.py 2.x provides get_channel_or_thread
+                        get_cot = getattr(guild, "get_channel_or_thread", None)
+                        if callable(get_cot):
+                            ch_obj = get_cot(cid)
+                        if not ch_obj:
+                            ch_obj = guild.get_channel(cid)
+                    except Exception:
+                        ch_obj = None
+                    ch_name = str(getattr(ch_obj, "name", "") or "").strip() if ch_obj else ""
+                    prov = str(ev.get("provider") or "").strip().lower()
+                    label = "Touchdown" if "touchdown" in prov or "first-touchdown" in prov else "Channel"
+                    if ch_name:
+                        lines_ev.append(f"{label}: #{ch_name}")
+                    else:
+                        # Fallback: still show mention if we cannot resolve name
+                        lines_ev.append(f"{label}: <#{cid}>")
+
                 j = str(ev.get("jump_url") or "").strip()
                 if j:
                     lines_ev.append(f"Message: {j}")

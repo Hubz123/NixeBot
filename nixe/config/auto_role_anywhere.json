@@ -1,11 +1,34 @@
 {
-  "text_channels": {
-    "1293199776824692766": 1371351189224030258
-  },
-  "threads": {},
-  "restrict_to_role_ids": [
-    1371351189224030258
-  ],
+  "auto_prune_enabled": true,
+  "auto_prune_interval_hours": 24,
+  "backfill_default_limit": 800,
   "grant_on_thread_member_join": false,
-  "thread_join_cooldown_s": 3600
+  "prune_default_days": 90,
+  "prune_exempt_role_ids": [
+    1373215321007329421,
+    1373213187956015204
+  ],
+  "prune_include_threads": false,
+  "prune_max_actions_per_run": 150,
+  "prune_pause_ms_between_channels": 800,
+  "prune_sleep_ms_per_action": 300,
+  "prune_use_deploy_grace": true,
+  "restrict_to_role_ids": [
+    1101118714792923168,
+    1371351189224030258,
+    1373215321007329421,
+    1373213187956015204
+  ],
+  "state_marker_channel_id": 1400375184048787566,
+  "state_marker_pin": false,
+  "text_channels": {
+    "1293199669249183917": 1101118714792923168,
+    "1293199776824692766": 1371351189224030258,
+    "1293207596173496390": 1371351189224030258
+  },
+  "thread_join_cooldown_s": 3600,
+  "threads": {
+    "1389138326698852432": 1373215321007329421,
+    "1403714881655668788": 1373213187956015204
+  }
 }

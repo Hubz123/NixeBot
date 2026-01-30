@@ -24,14 +24,14 @@ class BanTemplateUnifier(commands.Cog):
                 if entry.target and int(getattr(entry.target,"id",0) or 0) == int(user.id):
                     moderator = entry.user; reason = entry.reason or reason; break
         except Exception: pass
-        # Pull any cached evidence for this user/guild (best-effort).
+        # Pull any cached evidence for this user/guild (best-effort) and reuse it for both embed + attachment.
         ev = None
         try:
             from nixe.helpers import phish_evidence_cache as _pec
             ev = _pec.pop(int(getattr(guild,'id',0) or 0), int(getattr(user,'id',0) or 0))
         except Exception:
             ev = None
-        embed = build_ban_embed(target=user, moderator=moderator, reason=reason, guild=guild, evidence_url=None, simulate=False, evidence=ev)
+        embed = build_ban_embed(target=user, moderator=moderator, reason=reason, guild=guild, evidence_url=None, simulate=False, evidence=ev)(target=user, moderator=moderator, reason=reason, guild=guild, evidence_url=None, simulate=False, evidence=ev)
         try:
             cid = _pick_log_channel_id(guild)
             if cid:

@@ -23,6 +23,12 @@ from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
+# Avoid log spam on Render: the sweeper can run every few seconds when memory is
+# under pressure. Only emit WARNING when we actually freed memory or cleared
+# caches; otherwise stay quiet (or at most DEBUG, rate-limited).
+_LAST_NOOP_DEBUG_TS: float = 0.0
+_NOOP_DEBUG_EVERY_S: float = 60.0
+
 
 def rss_mb() -> float:
     """Return resident set size (RSS) in MB, best-effort."""
@@ -143,11 +149,30 @@ def sweep(bot: Optional[Any] = None, *, aggressive: bool = False) -> None:
 
     after = rss_mb()
     dt = int((time.time() - t0) * 1000)
-    log.warning(
-        "[mem-sweep] aggressive=%s cleared_msgs=%d rss_mb %.1f -> %.1f (dt=%dms)",
-        aggressive,
-        cleared_msgs,
-        before,
-        after,
-        dt,
-    )
+
+    freed = before - after
+    meaningful = (cleared_msgs > 0) or (freed >= 1.0)
+
+    if meaningful:
+        log.warning(
+            "[mem-sweep] aggressive=%s cleared_msgs=%d rss_mb %.1f -> %.1f (dt=%dms)",
+            aggressive,
+            cleared_msgs,
+            before,
+            after,
+            dt,
+        )
+        return
+
+    # No-op / tiny change: keep logs quiet to avoid spam.
+    global _LAST_NOOP_DEBUG_TS
+    now = time.monotonic()
+    if (now - _LAST_NOOP_DEBUG_TS) >= _NOOP_DEBUG_EVERY_S:
+        _LAST_NOOP_DEBUG_TS = now
+        log.debug(
+            "[mem-sweep] aggressive=%s no-op rss_mb %.1f -> %.1f (dt=%dms)",
+            aggressive,
+            before,
+            after,
+            dt,
+        )

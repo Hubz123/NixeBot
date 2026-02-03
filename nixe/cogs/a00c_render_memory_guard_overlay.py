@@ -54,13 +54,9 @@ def _read_cgroup_limit_bytes() -> Optional[int]:
             pass
     return None
 
-def _read_cgroup_usage_bytes() -> Optional[int]:
-    """Return current cgroup memory usage in bytes, best-effort.
 
-    Render enforces memory limits at the container/cgroup level. RSS can be
-    significantly lower than the cgroup usage due to page cache and native
-    allocations, so we prefer cgroup usage when available.
-    """
+
+def _read_cgroup_current_bytes() -> Optional[int]:
     # cgroup v2
     for p in ("/sys/fs/cgroup/memory.current",):
         try:
@@ -128,16 +124,16 @@ def _cap_mb() -> int:
     return cap
 
 
-async def _maybe_exit_for_usage(used_mb: float, exit_mb: int, cap_mb: int, kind: str) -> None:
+async def _maybe_exit_for_usage(usage_mb: float, exit_mb: int, cap_mb: int, source: str) -> None:
     if exit_mb <= 0:
         return
-    if used_mb < float(exit_mb):
+    if usage_mb < float(exit_mb):
         return
 
-    msg = f"[mem-guard] {kind}={used_mb:.1f}MB >= exit={exit_mb}MB (cap={cap_mb}MB). Exiting to avoid OOM-kill."
+    msg = f"[mem-guard] {source}={usage_mb:.1f}MB >= exit={exit_mb}MB (cap={cap_mb}MB). Exiting to avoid OOM-kill."
     log.error(msg)
 
-    # Best-effort: flush caches & GC once before exit (may or may not reduce RSS).
+    # Best-effort: flush caches & GC once before exit (may or may not reduce usage).
     try:
         from nixe.helpers import lpg_cache
         getattr(lpg_cache, "_CACHE", {}).clear()
@@ -171,29 +167,31 @@ async def _watchdog_loop() -> None:
 
     log.warning("[mem-guard] enabled on Render. cap=%dMB exit=%dMB check=%ds", cap, exit_mb, check_sec)
 
+    
+
     while True:
         await asyncio.sleep(check_sec)
 
-        # Prefer cgroup usage (Render kills based on container memory), fall back to RSS.
-        used_kind = "CGROUP"
-        used: Optional[float] = None
+        # Prefer cgroup "current" usage on Render since OOM-kill is enforced at container level.
+        use_cgroup = (os.getenv("NIXE_RAM_USE_CGROUP", "1") == "1")
+        usage_mb: Optional[float] = None
+        source = "RSS"
 
-        if os.getenv("NIXE_RAM_USE_CGROUP_USAGE", "1") == "1":
-            try:
-                cg_used = _read_cgroup_usage_bytes()
-                if cg_used is not None:
-                    used = float(cg_used) / (1024.0 * 1024.0)
-            except Exception:
-                used = None
+        if use_cgroup:
+            cur = _read_cgroup_current_bytes()
+            if cur is not None:
+                usage_mb = float(cur) / (1024.0 * 1024.0)
+                source = "CGROUP"
 
-        if used is None:
-            used_kind = "RSS"
-            used = _read_rss_mb()
+        if usage_mb is None:
+            rss = _read_rss_mb()
+            if rss is not None:
+                usage_mb = float(rss)
 
-        if used is None:
+        if usage_mb is None:
             continue
 
-        await _maybe_exit_for_usage(float(used), exit_mb, cap, used_kind)
+        await _maybe_exit_for_usage(usage_mb, exit_mb, cap, source)
 
 
 def _purge_marker_path() -> Path:

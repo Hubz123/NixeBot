@@ -54,6 +54,35 @@ def _read_cgroup_limit_bytes() -> Optional[int]:
             pass
     return None
 
+def _read_cgroup_usage_bytes() -> Optional[int]:
+    """Return current cgroup memory usage in bytes, best-effort.
+
+    Render enforces memory limits at the container/cgroup level. RSS can be
+    significantly lower than the cgroup usage due to page cache and native
+    allocations, so we prefer cgroup usage when available.
+    """
+    # cgroup v2
+    for p in ("/sys/fs/cgroup/memory.current",):
+        try:
+            s = Path(p).read_text().strip()
+            if not s:
+                continue
+            v = int(s)
+            if v >= 0 and v < (1 << 60):
+                return v
+        except Exception:
+            pass
+    # cgroup v1
+    for p in ("/sys/fs/cgroup/memory/memory.usage_in_bytes",):
+        try:
+            s = Path(p).read_text().strip()
+            v = int(s)
+            if v >= 0 and v < (1 << 60):
+                return v
+        except Exception:
+            pass
+    return None
+
 
 def _read_rss_mb() -> Optional[float]:
     # Prefer /proc (Linux, Render).
@@ -99,13 +128,13 @@ def _cap_mb() -> int:
     return cap
 
 
-async def _maybe_exit_for_rss(rss_mb: float, exit_mb: int, cap_mb: int) -> None:
+async def _maybe_exit_for_usage(used_mb: float, exit_mb: int, cap_mb: int, kind: str) -> None:
     if exit_mb <= 0:
         return
-    if rss_mb < float(exit_mb):
+    if used_mb < float(exit_mb):
         return
 
-    msg = f"[mem-guard] RSS={rss_mb:.1f}MB >= exit={exit_mb}MB (cap={cap_mb}MB). Exiting to avoid OOM-kill."
+    msg = f"[mem-guard] {kind}={used_mb:.1f}MB >= exit={exit_mb}MB (cap={cap_mb}MB). Exiting to avoid OOM-kill."
     log.error(msg)
 
     # Best-effort: flush caches & GC once before exit (may or may not reduce RSS).
@@ -144,10 +173,27 @@ async def _watchdog_loop() -> None:
 
     while True:
         await asyncio.sleep(check_sec)
-        rss = _read_rss_mb()
-        if rss is None:
+
+        # Prefer cgroup usage (Render kills based on container memory), fall back to RSS.
+        used_kind = "CGROUP"
+        used: Optional[float] = None
+
+        if os.getenv("NIXE_RAM_USE_CGROUP_USAGE", "1") == "1":
+            try:
+                cg_used = _read_cgroup_usage_bytes()
+                if cg_used is not None:
+                    used = float(cg_used) / (1024.0 * 1024.0)
+            except Exception:
+                used = None
+
+        if used is None:
+            used_kind = "RSS"
+            used = _read_rss_mb()
+
+        if used is None:
             continue
-        await _maybe_exit_for_rss(rss, exit_mb, cap)
+
+        await _maybe_exit_for_usage(float(used), exit_mb, cap, used_kind)
 
 
 def _purge_marker_path() -> Path:

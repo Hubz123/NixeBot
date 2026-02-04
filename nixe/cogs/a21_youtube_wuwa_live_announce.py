@@ -222,6 +222,20 @@ LOOP_DEADLINE_SECONDS = _env_float(
 )
 
 
+# ----------------------------
+# Discord send safety (Cloudflare cooldown + throttle queue)
+# ----------------------------
+DISCORD_SEND_THROTTLE_SECONDS = _env_float("NIXE_DISCORD_SEND_THROTTLE_SECONDS", 2.0)
+DISCORD_CLOUDFLARE_COOLDOWN_SECONDS = _env_int("NIXE_DISCORD_CLOUDFLARE_COOLDOWN_SECONDS", 900)
+DISCORD_ANNOUNCE_QUEUE_MAXSIZE = _env_int("NIXE_DISCORD_ANNOUNCE_QUEUE_MAXSIZE", 200)
+
+# ----------------------------
+# Discord send safety (Cloudflare cooldown + throttle queue)
+# ----------------------------
+DISCORD_SEND_THROTTLE_SECONDS = _env_float("NIXE_DISCORD_SEND_THROTTLE_SECONDS", 2.0)
+DISCORD_CLOUDFLARE_COOLDOWN_SECONDS = _env_int("NIXE_DISCORD_CLOUDFLARE_COOLDOWN_SECONDS", 900)
+DISCORD_ANNOUNCE_QUEUE_MAXSIZE = _env_int("NIXE_DISCORD_ANNOUNCE_QUEUE_MAXSIZE", 200)
+
 
 ONLY_NEW_AFTER_BOOT = os.getenv("NIXE_YT_WUWA_ONLY_NEW_AFTER_BOOT", "0").strip() == "1"
 BOOT_GRACE_SECONDS = _env_int("NIXE_YT_WUWA_BOOT_GRACE_SECONDS", 30)
@@ -594,6 +608,20 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Safety cap: keep this bounded to avoid long scans on very busy channels.
         self._announce_history_scan_limit: int = max(0, min(5000, _env_int("NIXE_YT_WUWA_ANNOUNCE_HISTORY_SCAN_LIMIT", 500)))
 
+        # --- Discord send safety ---
+        # Queue serializes all sends to avoid burst 429 / Cloudflare 1015.
+        self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(DISCORD_ANNOUNCE_QUEUE_MAXSIZE)))
+        self._send_worker_task: Optional[asyncio.Task] = None
+        self._send_last_ts: float = 0.0
+        self._cf_cooldown_until: float = 0.0
+
+        # --- Discord send safety ---
+        # Queue serializes all sends to avoid burst 429 / Cloudflare 1015.
+        self._send_queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, int(DISCORD_ANNOUNCE_QUEUE_MAXSIZE)))
+        self._send_worker_task: Optional[asyncio.Task] = None
+        self._send_last_ts: float = 0.0
+        self._cf_cooldown_until: float = 0.0
+
     @commands.Cog.listener()
     async def on_ready(self):
         if getattr(self, '_loop_started', False):
@@ -602,6 +630,20 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         try:
             if not self.loop.is_running():
                 self.loop.start()
+        except Exception:
+            pass
+
+        # Start send worker (serializes channel.send to avoid Cloudflare 1015 burst bans).
+        try:
+            if self._send_worker_task is None or self._send_worker_task.done():
+                self._send_worker_task = asyncio.create_task(self._send_worker())
+        except Exception:
+            pass
+
+        # Start send worker (serializes channel.send to avoid Cloudflare 1015 burst bans).
+        try:
+            if self._send_worker_task is None or self._send_worker_task.done():
+                self._send_worker_task = asyncio.create_task(self._send_worker())
         except Exception:
             pass
 
@@ -628,10 +670,238 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         except Exception:
             pass
         try:
+            if getattr(self, '_send_worker_task', None):
+                self._send_worker_task.cancel()
+        except Exception:
+            pass
+        try:
             if self.session and not self.session.closed:
                 asyncio.create_task(self.session.close())
         except Exception:
             pass
+
+    # -----------------------------------------------------------------------
+    # Discord send safety: queue + throttle + Cloudflare cooldown
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _is_cloudflare_1015(exc: BaseException) -> bool:
+        try:
+            s = str(exc) or ""
+            s_l = s.lower()
+            # Typical signature from logs: "429 Too Many Requests ... <html ... Cloudflare ... Error 1015 ..."
+            if "cloudflare" in s_l:
+                return True
+            if "error 1015" in s_l:
+                return True
+            if "<!doctype html" in s_l and "rate limited" in s_l:
+                return True
+            if "access denied" in s_l and "discord.com" in s_l:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _engage_cloudflare_cooldown(self, reason: str = "") -> None:
+        try:
+            now = asyncio.get_event_loop().time()
+        except Exception:
+            now = 0.0
+        cd = max(60, int(DISCORD_CLOUDFLARE_COOLDOWN_SECONDS))
+        self._cf_cooldown_until = max(float(self._cf_cooldown_until or 0.0), float(now) + float(cd))
+        if reason:
+            log.warning("[yt-wuwa] Cloudflare cooldown engaged for %ss (%s)", cd, reason)
+        else:
+            log.warning("[yt-wuwa] Cloudflare cooldown engaged for %ss", cd)
+
+        # Drain queued sends so we don't backlog and then burst later.
+        try:
+            while True:
+                self._send_queue.get_nowait()
+                self._send_queue.task_done()
+        except Exception:
+            pass
+
+    async def _send_queued(self, channel: discord.abc.Messageable, **send_kwargs) -> Optional[discord.Message]:
+        # Fast-fail if we are in cooldown window.
+        try:
+            now = asyncio.get_event_loop().time()
+        except Exception:
+            now = 0.0
+        if self._cf_cooldown_until and now < float(self._cf_cooldown_until):
+            return None
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        item = (channel, send_kwargs, fut)
+        try:
+            self._send_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # Best-effort: drop if queue is full to avoid memory growth.
+            if DEBUG:
+                log.warning("[yt-wuwa] send queue full; dropping message")
+            return None
+        try:
+            return await fut
+        except Exception:
+            raise
+
+    async def _send_worker(self) -> None:
+        # Single worker: sends one message at a time, enforcing throttle.
+        while True:
+            channel, send_kwargs, fut = await self._send_queue.get()
+            try:
+                # If cooldown active, drop quickly.
+                try:
+                    now = asyncio.get_event_loop().time()
+                except Exception:
+                    now = 0.0
+                if self._cf_cooldown_until and now < float(self._cf_cooldown_until):
+                    if not fut.done():
+                        fut.set_result(None)
+                    continue
+
+                # Throttle between sends.
+                throttle = float(DISCORD_SEND_THROTTLE_SECONDS or 0.0)
+                if throttle > 0:
+                    gap = throttle - (now - float(self._send_last_ts or 0.0))
+                    if gap > 0:
+                        await asyncio.sleep(gap)
+
+                # Attempt send.
+                msg = await channel.send(**send_kwargs)
+
+                # Update last send time.
+                try:
+                    self._send_last_ts = asyncio.get_event_loop().time()
+                except Exception:
+                    self._send_last_ts = now
+
+                if not fut.done():
+                    fut.set_result(msg)
+            except Exception as e:
+                # Engage Cloudflare cooldown on signature HTML/1015 responses.
+                try:
+                    if self._is_cloudflare_1015(e):
+                        self._engage_cloudflare_cooldown("send worker detected 1015/HTML 429")
+                except Exception:
+                    pass
+                if not fut.done():
+                    fut.set_exception(e)
+            finally:
+                try:
+                    self._send_queue.task_done()
+                except Exception:
+                    pass
+
+
+    # -----------------------------------------------------------------------
+    # Discord send safety: queue + throttle + Cloudflare cooldown
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def _is_cloudflare_1015(exc: BaseException) -> bool:
+        try:
+            s = str(exc) or ""
+            s_l = s.lower()
+            # Typical signature from logs: "429 Too Many Requests ... <html ... Cloudflare ... Error 1015 ..."
+            if "cloudflare" in s_l:
+                return True
+            if "error 1015" in s_l:
+                return True
+            if "<!doctype html" in s_l and "rate limited" in s_l:
+                return True
+            if "access denied" in s_l and "discord.com" in s_l:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _engage_cloudflare_cooldown(self, reason: str = "") -> None:
+        try:
+            now = asyncio.get_event_loop().time()
+        except Exception:
+            now = 0.0
+        cd = max(60, int(DISCORD_CLOUDFLARE_COOLDOWN_SECONDS))
+        self._cf_cooldown_until = max(float(self._cf_cooldown_until or 0.0), float(now) + float(cd))
+        if reason:
+            log.warning("[yt-wuwa] Cloudflare cooldown engaged for %ss (%s)", cd, reason)
+        else:
+            log.warning("[yt-wuwa] Cloudflare cooldown engaged for %ss", cd)
+
+        # Drain queued sends so we don't backlog and then burst later.
+        try:
+            while True:
+                self._send_queue.get_nowait()
+                self._send_queue.task_done()
+        except Exception:
+            pass
+
+    async def _send_queued(self, channel: discord.abc.Messageable, **send_kwargs) -> Optional[discord.Message]:
+        # Fast-fail if we are in cooldown window.
+        try:
+            now = asyncio.get_event_loop().time()
+        except Exception:
+            now = 0.0
+        if self._cf_cooldown_until and now < float(self._cf_cooldown_until):
+            return None
+
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        item = (channel, send_kwargs, fut)
+        try:
+            self._send_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # Best-effort: drop if queue is full to avoid memory growth.
+            if DEBUG:
+                log.warning("[yt-wuwa] send queue full; dropping message")
+            return None
+        return await fut
+
+    async def _send_worker(self) -> None:
+        # Single worker: sends one message at a time, enforcing throttle.
+        while True:
+            channel, send_kwargs, fut = await self._send_queue.get()
+            try:
+                # If cooldown active, drop quickly.
+                try:
+                    now = asyncio.get_event_loop().time()
+                except Exception:
+                    now = 0.0
+                if self._cf_cooldown_until and now < float(self._cf_cooldown_until):
+                    if not fut.done():
+                        fut.set_result(None)
+                    continue
+
+                # Throttle between sends.
+                throttle = float(DISCORD_SEND_THROTTLE_SECONDS or 0.0)
+                if throttle > 0:
+                    gap = throttle - (now - float(self._send_last_ts or 0.0))
+                    if gap > 0:
+                        await asyncio.sleep(gap)
+
+                # Attempt send.
+                msg = await channel.send(**send_kwargs)
+
+                # Update last send time.
+                try:
+                    self._send_last_ts = asyncio.get_event_loop().time()
+                except Exception:
+                    self._send_last_ts = now
+
+                if not fut.done():
+                    fut.set_result(msg)
+            except Exception as e:
+                # Engage Cloudflare cooldown on signature HTML/1015 responses.
+                try:
+                    if self._is_cloudflare_1015(e):
+                        self._engage_cloudflare_cooldown("send worker detected 1015/HTML 429")
+                except Exception:
+                    pass
+                if not fut.done():
+                    fut.set_exception(e)
+            finally:
+                try:
+                    self._send_queue.task_done()
+                except Exception:
+                    pass
+
 
 
     def _reload_watchlist(self):
@@ -2514,10 +2784,15 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Native embed mode: do NOT attach a custom embed/image; let Discord unfurl the YouTube link.
         if ANNOUNCE_NATIVE_EMBED:
             try:
-                msg = await channel.send(
+                msg = await self._send_queued(
+                    channel,
                     content=content,
                     allowed_mentions=allowed_mentions,
                 )
+                if msg is None:
+                    return
+                if msg is None:
+                    return
                 try:
                     self._announce_vid_cache.add(str(video_id))
                 except Exception:
@@ -2542,12 +2817,17 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         view.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="Watch", url=video_link))
 
         try:
-            msg = await channel.send(
+            msg = await self._send_queued(
+                channel,
                 content=content,
                 embed=embed,
                 view=view,
                 allowed_mentions=allowed_mentions,
             )
+            if msg is None:
+                return
+            if msg is None:
+                return
             try:
                 self._announce_vid_cache.add(str(video_id))
             except Exception:

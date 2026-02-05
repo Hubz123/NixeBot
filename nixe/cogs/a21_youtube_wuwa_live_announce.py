@@ -16,6 +16,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, urlunparse, unquote
 
 import aiohttp
+
+# Optional adaptive network throttle (RTT/error-based)
+try:
+    from nixe.helpers import adaptive_limits as _adlim  # type: ignore
+except Exception:  # pragma: no cover
+    _adlim = None
 import discord
 from discord.ext import commands, tasks
 
@@ -221,13 +227,6 @@ LOOP_DEADLINE_SECONDS = _env_float(
     max(5.0, float(POLL_SECONDS) - 2.0),
 )
 
-
-# ----------------------------
-# Discord send safety (Cloudflare cooldown + throttle queue)
-# ----------------------------
-DISCORD_SEND_THROTTLE_SECONDS = _env_float("NIXE_DISCORD_SEND_THROTTLE_SECONDS", 2.0)
-DISCORD_CLOUDFLARE_COOLDOWN_SECONDS = _env_int("NIXE_DISCORD_CLOUDFLARE_COOLDOWN_SECONDS", 900)
-DISCORD_ANNOUNCE_QUEUE_MAXSIZE = _env_int("NIXE_DISCORD_ANNOUNCE_QUEUE_MAXSIZE", 200)
 
 # ----------------------------
 # Discord send safety (Cloudflare cooldown + throttle queue)
@@ -760,7 +759,8 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     continue
 
                 # Throttle between sends.
-                throttle = float(DISCORD_SEND_THROTTLE_SECONDS or 0.0)
+                base_throttle = float(DISCORD_SEND_THROTTLE_SECONDS or 0.0)
+                throttle = float(_adlim.get_send_throttle_seconds(base_throttle) if _adlim else base_throttle)
                 if throttle > 0:
                     gap = throttle - (now - float(self._send_last_ts or 0.0))
                     if gap > 0:
@@ -782,6 +782,14 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 try:
                     if self._is_cloudflare_1015(e):
                         self._engage_cloudflare_cooldown("send worker detected 1015/HTML 429")
+                except Exception:
+                    pass
+                try:
+                    if _adlim is not None:
+                        if self._is_cloudflare_1015(e):
+                            _adlim.record_cloudflare_1015("send worker")
+                        else:
+                            _adlim.record_error("send_exc")
                 except Exception:
                     pass
                 if not fut.done():

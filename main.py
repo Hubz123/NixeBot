@@ -190,6 +190,17 @@ async def start_web(port: int):
             await runner.cleanup()
 # --- glue --------------------------------------------------------------
 
+def _is_discord_cloudflare_1015(exc: Exception) -> bool:
+    s = (repr(exc) + " " + str(exc)).lower()
+    # Cloudflare 1015 HTML block (seen when discord.com rate-limits an IP)
+    if "cloudflare" in s and "1015" in s:
+        return True
+    if "<!doctype html" in s and "access denied" in s and "discord.com" in s:
+        return True
+    if "you are being rate limited" in s and "discord.com" in s:
+        return True
+    return False
+
 async def _run_bot(token: str):
     # Guard loop: if bot.start ever returns or crashes, we log and restart.
     while True:
@@ -204,14 +215,29 @@ async def _run_bot(token: str):
                 await bot.close()
             raise
         except Exception as exc:
-            log.exception("Bot crashed unexpectedly: %r — restarting in 10s", exc)
-            try:
-                bot.dispatch("nixe_bot_crash", exc)
-            except Exception:
-                log.debug("Failed to dispatch nixe_bot_crash event", exc_info=True)
-            with contextlib.suppress(Exception):
-                await bot.close()
-            await asyncio.sleep(10)
+            if _is_discord_cloudflare_1015(exc):
+                cooldown = int(os.getenv("NIXE_DISCORD_CLOUDFLARE_LOGIN_COOLDOWN_SECONDS") or 1800)
+                log.exception(
+                    "Discord Cloudflare 1015 detected during startup/login: %r — cooling down for %ss",
+                    exc,
+                    cooldown,
+                )
+                try:
+                    bot.dispatch("nixe_bot_cloudflare_cooldown", exc)
+                except Exception:
+                    log.debug("Failed to dispatch nixe_bot_cloudflare_cooldown event", exc_info=True)
+                with contextlib.suppress(Exception):
+                    await bot.close()
+                await asyncio.sleep(cooldown)
+            else:
+                log.exception("Bot crashed unexpectedly: %r — restarting in 10s", exc)
+                try:
+                    bot.dispatch("nixe_bot_crash", exc)
+                except Exception:
+                    log.debug("Failed to dispatch nixe_bot_crash event", exc_info=True)
+                with contextlib.suppress(Exception):
+                    await bot.close()
+                await asyncio.sleep(10)
         else:
             # bot.start() returned cleanly (e.g. graceful shutdown via cog or signal).
             # In this case we just close and exit the guard loop without restarting.

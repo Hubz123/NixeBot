@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Nixe Monitor</title>
+  <meta name="theme-color" content="#111111" />
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    body { margin: 0; background: #0b0b0b; color: #f2f2f2; }
+    .wrap { max-width: 1020px; margin: 0 auto; padding: 16px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 760px){ .row { grid-template-columns: 1fr 1fr; } }
+    .card { background: #111; border: 1px solid #222; border-radius: 14px; padding: 14px; }
+    .top { display:flex; align-items:center; justify-content:space-between; gap: 12px; }
+    .title { font-size: 18px; font-weight: 800; }
+    .badge { font-size: 12px; padding: 6px 10px; border-radius: 999px; border: 1px solid #2a2a2a; background:#141414; }
+    .ok { border-color:#1f6f3a; }
+    .bad { border-color:#7a1f1f; }
+    .muted { color:#b9b9b9; font-size: 12px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .k { font-size: 12px; color:#bdbdbd; }
+    .v { font-size: 20px; font-weight: 900; margin-top: 2px; }
+    .bar { height: 10px; background:#1a1a1a; border-radius: 999px; overflow:hidden; border:1px solid #222; }
+    .bar > div { height: 100%; background: #3a84ff; width: 0%; }
+    .footer { margin-top: 14px; display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; }
+    button { border:1px solid #2a2a2a; background:#141414; color:#f2f2f2; padding:8px 10px; border-radius: 10px; cursor:pointer; }
+    input { width: 100%; box-sizing:border-box; border:1px solid #2a2a2a; background:#0f0f0f; color:#f2f2f2; padding:10px; border-radius: 10px; }
+    a { color:#7fb2ff; text-decoration:none; }
+    code { background:#0f0f0f; padding:2px 6px; border-radius:8px; border:1px solid #222; }
+    .small { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="top">
+        <div>
+          <div class="title">Nixe Monitor (PC + Render)</div>
+          <div class="muted">Auto refresh 1 detik. PC ambil dari agent lokal, Render ambil dari endpoint publik.</div>
+        </div>
+        <div class="badge" id="globalStatus">INIT</div>
+      </div>
+
+      <div style="margin-top:12px">
+        <div class="k">Target URLs</div>
+        <div class="muted small" style="margin:6px 0 10px">
+          PC: <code id="pcUrlShow">http://127.0.0.1:9800/metrics.json</code> (butuh agent)<br/>
+          Render: <code id="renderUrlShow">https://nixeban.onrender.com/metrics.json</code> (fallback healthz kalau metrics belum ada)
+        </div>
+
+        <div class="k">Override (opsional)</div>
+        <input id="pcUrl" placeholder="PC metrics url (default http://127.0.0.1:9800/metrics.json)" />
+        <div style="height:8px"></div>
+        <input id="renderBase" placeholder="Render base url (default https://nixeban.onrender.com)" />
+        <div class="muted small" style="margin-top:6px">
+          Tips: kalau mau akses PC dari device lain, ganti PC URL ke IP Tailscale: <code>http://100.x.y.z:9800/metrics.json</code>
+        </div>
+      </div>
+
+      <div class="footer">
+        <div class="muted small" id="metaLine">—</div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button id="applyBtn">Apply</button>
+          <button id="pauseBtn">Pause</button>
+        </div>
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+    <div class="row" id="cards"></div>
+
+    <div style="height:18px"></div>
+    <div class="muted small">
+      Render butuh <code>/metrics.json</code> untuk tampil RAM/CPU. Kalau belum ada, kartu Render hanya akan menunjukkan status hidup via <code>/healthz</code>.
+    </div>
+  </div>
+
+<script>
+(() => {
+  const POLL_MS = 1000;
+  let paused = false;
+  let timer = null;
+
+  const elCards = document.getElementById("cards");
+  const elStatus = document.getElementById("globalStatus");
+  const elMeta = document.getElementById("metaLine");
+  const elApply = document.getElementById("applyBtn");
+  const elPause = document.getElementById("pauseBtn");
+  const elPcUrl = document.getElementById("pcUrl");
+  const elRenderBase = document.getElementById("renderBase");
+
+  const DEFAULT_PC = "http://127.0.0.1:9800/metrics.json";
+  const DEFAULT_RENDER_BASE = "https://nixeban.onrender.com";
+
+  elPcUrl.value = localStorage.getItem("nixe_pc_url") || "";
+  elRenderBase.value = localStorage.getItem("nixe_render_base") || "";
+
+  function setGlobal(txt, ok){
+    elStatus.textContent = txt;
+    elStatus.classList.toggle("ok", ok === true);
+    elStatus.classList.toggle("bad", ok === false);
+  }
+
+  function fmtMB(x){ return (x == null || isNaN(x)) ? "—" : (Math.round(x) + "MB"); }
+  function fmtPct(x){ return (x == null || isNaN(x)) ? "—" : (Math.round(x) + "%"); }
+
+  function cardTemplate(id, label){
+    const div = document.createElement("div");
+    div.className = "card";
+    div.id = "card_" + id;
+    div.innerHTML = `
+      <div class="top">
+        <div>
+          <div class="title">${label}</div>
+          <div class="muted small" id="sub_${id}">—</div>
+        </div>
+        <div class="badge" id="badge_${id}">INIT</div>
+      </div>
+
+      <div class="grid">
+        <div>
+          <div class="k">RAM</div>
+          <div class="v" id="ram_${id}">—</div>
+          <div class="bar"><div id="rambar_${id}"></div></div>
+          <div class="muted small" id="ramcap_${id}"></div>
+        </div>
+        <div>
+          <div class="k">CPU</div>
+          <div class="v" id="cpu_${id}">—</div>
+          <div class="bar"><div id="cpubar_${id}"></div></div>
+          <div class="muted small" id="bot_${id}"></div>
+        </div>
+      </div>
+
+      <div class="footer">
+        <div class="muted small" id="note_${id}">—</div>
+        <div class="muted small"><a href="#" id="open_${id}">open</a></div>
+      </div>
+    `;
+    return div;
+  }
+
+  async function fetchJson(url){
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  }
+
+  async function fetchHealth(url){
+    const r = await fetch(url, { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return await r.json();
+  }
+
+  function setCardOnline(id, sub, ramLine, ramPct, ramCap, cpuPct, botLine, note, openUrl){
+    document.getElementById("sub_" + id).textContent = sub;
+    document.getElementById("ram_" + id).textContent = ramLine;
+    document.getElementById("cpu_" + id).textContent = cpuPct;
+    document.getElementById("rambar_" + id).style.width = (ramPct ?? 0) + "%";
+    document.getElementById("cpubar_" + id).style.width = (parseFloat(cpuPct) || 0) + "%";
+    document.getElementById("ramcap_" + id).textContent = ramCap;
+    document.getElementById("bot_" + id).textContent = botLine;
+    document.getElementById("note_" + id).textContent = note;
+
+    const badge = document.getElementById("badge_" + id);
+    badge.textContent = "ONLINE";
+    badge.classList.add("ok");
+    badge.classList.remove("bad");
+
+    const open = document.getElementById("open_" + id);
+    open.onclick = (e) => { e.preventDefault(); window.open(openUrl, "_blank"); };
+  }
+
+  function setCardOffline(id, msg, openUrl){
+    document.getElementById("sub_" + id).textContent = msg;
+    document.getElementById("note_" + id).textContent = openUrl;
+
+    const badge = document.getElementById("badge_" + id);
+    badge.textContent = "OFFLINE";
+    badge.classList.add("bad");
+    badge.classList.remove("ok");
+
+    const open = document.getElementById("open_" + id);
+    open.onclick = (e) => { e.preventDefault(); window.open(openUrl, "_blank"); };
+  }
+
+  function build(){
+    elCards.innerHTML = "";
+    elCards.appendChild(cardTemplate("pc", "PC Tester (cap 4GB)"));
+    elCards.appendChild(cardTemplate("render", "Render (nixeban)"));
+  }
+
+  function getConfig(){
+    const pcUrl = (elPcUrl.value.trim() || localStorage.getItem("nixe_pc_url") || DEFAULT_PC).trim();
+    const renderBase = (elRenderBase.value.trim() || localStorage.getItem("nixe_render_base") || DEFAULT_RENDER_BASE).trim().replace(/\/+$/, "");
+    const renderMetrics = renderBase + "/metrics.json";
+    const renderHealth = renderBase + "/healthz";
+    return { pcUrl, renderBase, renderMetrics, renderHealth };
+  }
+
+  async function tick(){
+    const cfg = getConfig();
+    let anyOnline = false;
+
+    try {
+      const m = await fetchJson(cfg.pcUrl);
+      anyOnline = true;
+      const ram = m.ram || {};
+      const bot = m.bot_process || {};
+      const sub = `host=${m.host ?? "—"} · ${m.env?.platform ?? "—"}`;
+      const ramLine = `${fmtMB(ram.used_mb)} / ${fmtMB(ram.total_mb)} (${fmtPct(ram.percent)})`;
+      const ramPct = Math.max(0, Math.min(100, ram.percent ?? 0));
+      const cap = ram.target_cap_mb ? `Target cap: ${Math.round(ram.target_cap_mb)}MB` : "Target cap: 4096MB (tester)";
+      const cpuPct = fmtPct(m.cpu?.percent);
+      const botLine = `BOT RSS: ${fmtMB(bot.rss_mb)} · PID: ${bot.pid ?? "—"}`;
+      const note = `Updated: ${new Date(m.ts_ms || Date.now()).toLocaleString()}`;
+      setCardOnline("pc", sub, ramLine, ramPct, cap, cpuPct, botLine, note, cfg.pcUrl);
+    } catch (e) {
+      setCardOffline("pc", `agent error: ${String(e.message || e)}`, cfg.pcUrl);
+    }
+
+    try {
+      const m = await fetchJson(cfg.renderMetrics);
+      anyOnline = true;
+      const ram = m.ram || {};
+      const bot = m.bot_process || {};
+      const sub = `host=${m.host ?? "—"} · ${m.env?.platform ?? "—"} · Render`;
+      const ramLine = `${fmtMB(ram.used_mb)} / ${fmtMB(ram.total_mb)} (${fmtPct(ram.percent)})`;
+      const ramPct = Math.max(0, Math.min(100, ram.percent ?? 0));
+      const cap = ram.cgroup_limit_mb ? `Container limit: ${Math.round(ram.cgroup_limit_mb)}MB` : "Container limit: —";
+      const cpuPct = fmtPct(m.cpu?.percent);
+      const botLine = `BOT RSS: ${fmtMB(bot.rss_mb)} · PID: ${bot.pid ?? "—"}`;
+      const note = `Updated: ${new Date(m.ts_ms || Date.now()).toLocaleString()}`;
+      setCardOnline("render", sub, ramLine, ramPct, cap, cpuPct, botLine, note, cfg.renderMetrics);
+    } catch (eMetrics) {
+      try {
+        const h = await fetchHealth(cfg.renderHealth);
+        anyOnline = true;
+        setCardOnline(
+          "render",
+          "metrics not available (fallback healthz OK)",
+          "—",
+          0,
+          "Add /metrics.json to Render app",
+          "—",
+          "—",
+          `healthz ok: ${h.ok === true ? "true" : "?"} · ${new Date(h.ts_ms || Date.now()).toLocaleString()}`,
+          cfg.renderHealth
+        );
+      } catch (eHealth) {
+        setCardOffline("render", `offline: ${String(eHealth.message || eHealth)}`, cfg.renderBase);
+      }
+    }
+
+    setGlobal(anyOnline ? "ONLINE" : "OFFLINE", anyOnline ? true : false);
+    elMeta.textContent = `Polling: ${paused ? "paused" : "1s"} · PC=${cfg.pcUrl} · Render=${cfg.renderBase}`;
+  }
+
+  function loop(){
+    if (timer) clearTimeout(timer);
+    if (paused) return;
+    timer = setTimeout(async () => {
+      await tick();
+      loop();
+    }, POLL_MS);
+  }
+
+  function apply(){
+    const pc = elPcUrl.value.trim();
+    const rb = elRenderBase.value.trim();
+    if (pc) localStorage.setItem("nixe_pc_url", pc);
+    if (rb) localStorage.setItem("nixe_render_base", rb);
+    build();
+    tick().then(loop);
+  }
+
+  elApply.onclick = apply;
+  elPause.onclick = () => {
+    paused = !paused;
+    elPause.textContent = paused ? "Resume" : "Pause";
+    if (paused) {
+      if (timer) clearTimeout(timer);
+      setGlobal("PAUSED", null);
+      elMeta.textContent = "Polling paused";
+    } else {
+      tick().then(loop);
+    }
+  };
+
+  build();
+  tick().then(loop).catch(e => {
+    setGlobal("ERROR", false);
+    elMeta.textContent = String(e.message || e);
+  });
+})();
+</script>
+</body>
+</html>

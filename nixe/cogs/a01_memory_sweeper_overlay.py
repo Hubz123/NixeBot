@@ -49,6 +49,29 @@ def _runtime_profile() -> str:
 
 
 
+
+
+
+def _cgroup_mem_limit_mb() -> int | None:
+    """Best-effort cgroup memory limit detection (MB). Returns None if unlimited/unknown."""
+    paths = [
+        ("/sys/fs/cgroup/memory.max", "v2"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "v1"),
+    ]
+    for path, _ in paths:
+        try:
+            v = (open(path, "r", encoding="utf-8").read() or "").strip()
+        except Exception:
+            continue
+        if not v or v == "max":
+            continue
+        if v.isdigit():
+            b = int(v)
+            # ignore absurd "unlimited" values
+            if b > 0 and b < (1 << 60):
+                return max(1, int(b / 1024 / 1024))
+    return None
+
 class MemorySweeperOverlay(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -75,9 +98,10 @@ class MemorySweeperOverlay(commands.Cog):
 
         if self.auto_profile:
             if is_render:
-                # Render: default to 512MB protection if not explicitly set.
+                # Render: default to container memory limit if detectable; otherwise fall back to 512MB.
                 if self.cap_mb <= 0 and not cap_env_set:
-                    self.cap_mb = 512
+                    lim = _cgroup_mem_limit_mb()
+                    self.cap_mb = lim if lim else 512
             elif is_minipc:
                 # miniPC: if unset (or accidentally left at Render-tuned 512), upgrade to 2GB.
                 if (self.cap_mb <= 0 and not cap_env_set) or self.cap_mb == 512:
@@ -93,6 +117,15 @@ class MemorySweeperOverlay(commands.Cog):
         # - Otherwise compute from cap on_ready.
         self.trim_mb = _i("NIXE_RAM_TRIM_MB", 0 if not trim_env_set else 440)
         self.aggr_mb = _i("NIXE_RAM_TRIM_AGGRESSIVE_MB", 0 if not aggr_env_set else 480)
+
+        force_thr = (os.getenv("NIXE_RAM_FORCE_THRESHOLDS") or "").strip() in ("1","true","TRUE","yes","YES")
+        # If we're NOT on Render and the env thresholds look like Render-tuned leftovers (e.g., 430/450MB),
+        # ignore them and recompute from cap in on_ready. Set NIXE_RAM_FORCE_THRESHOLDS=1 to force honoring env.
+        if (not is_render) and self.auto_profile and (not force_thr) and (self.cap_mb >= 2048):
+            if trim_env_set and self.trim_mb > 0 and self.trim_mb < max(512, int(self.cap_mb * 0.5)):
+                self.trim_mb = 0
+            if aggr_env_set and self.aggr_mb > 0 and self.aggr_mb < max(640, int(self.cap_mb * 0.6)):
+                self.aggr_mb = 0
 
         # Check interval (seconds). Default depends on environment unless explicitly set.
         if check_env_set:

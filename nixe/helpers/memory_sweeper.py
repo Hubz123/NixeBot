@@ -29,6 +29,9 @@ log = logging.getLogger(__name__)
 _LAST_NOOP_DEBUG_TS: float = 0.0
 _NOOP_DEBUG_EVERY_S: float = 60.0
 
+_LAST_WARN_TS: float = 0.0
+_WARN_EVERY_S: float = 60.0  # at most 1 WARNING per minute
+
 
 def rss_mb() -> float:
     """Return resident set size (RSS) in MB, best-effort."""
@@ -151,17 +154,25 @@ def sweep(bot: Optional[Any] = None, *, aggressive: bool = False) -> None:
     dt = int((time.time() - t0) * 1000)
 
     freed = before - after
-    meaningful = (cleared_msgs > 0) or (freed >= 1.0)
 
-    if meaningful:
-        log.warning(
-            "[mem-sweep] aggressive=%s cleared_msgs=%d rss_mb %.1f -> %.1f (dt=%dms)",
-            aggressive,
-            cleared_msgs,
-            before,
-            after,
-            dt,
-        )
+    # Only warn when we *actually* freed meaningful RSS (to avoid log spam).
+    # Clearing discord.py message cache does not always reduce RSS immediately.
+    warn = (freed >= 1.0)
+
+    if warn:
+        global _LAST_WARN_TS
+        now = time.monotonic()
+        if (now - _LAST_WARN_TS) >= _WARN_EVERY_S:
+            _LAST_WARN_TS = now
+            log.warning(
+                "[mem-sweep] aggressive=%s cleared_msgs=%d rss_mb %.1f -> %.1f (freed=%.1fMB dt=%dms)",
+                aggressive,
+                cleared_msgs,
+                before,
+                after,
+                freed,
+                dt,
+            )
         return
 
     # No-op / tiny change: keep logs quiet to avoid spam.
@@ -170,9 +181,11 @@ def sweep(bot: Optional[Any] = None, *, aggressive: bool = False) -> None:
     if (now - _LAST_NOOP_DEBUG_TS) >= _NOOP_DEBUG_EVERY_S:
         _LAST_NOOP_DEBUG_TS = now
         log.debug(
-            "[mem-sweep] aggressive=%s no-op rss_mb %.1f -> %.1f (dt=%dms)",
+            "[mem-sweep] aggressive=%s cleared_msgs=%d rss_mb %.1f -> %.1f (freed=%.1fMB dt=%dms)",
             aggressive,
+            cleared_msgs,
             before,
             after,
+            freed,
             dt,
         )

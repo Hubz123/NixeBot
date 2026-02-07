@@ -86,7 +86,7 @@ def _soft_timeout_seconds() -> float:
     return soft
 
 
-class LPGClassifyTimeoutShieldOverlay(commands.Cog):
+class LPGClassifyTimeoutShieldOverlayV16(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._orig: Optional[Callable[..., Awaitable[Any]]] = None
@@ -147,4 +147,4 @@ class LPGClassifyTimeoutShieldOverlay(commands.Cog):
 
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(LPGClassifyTimeoutShieldOverlay(bot))
+    await bot.add_cog(LPGClassifyTimeoutShieldOverlayV16(bot))

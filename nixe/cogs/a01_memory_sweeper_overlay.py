@@ -189,9 +189,9 @@ class MemorySweeperOverlay(commands.Cog):
 
             # Aggressive sweep when close to cap.
             if cur >= float(self.aggr_mb):
-                sweep(self.bot, aggressive=True)
+                await asyncio.to_thread(sweep, self.bot, aggressive=True)
             elif cur >= float(self.trim_mb):
-                sweep(self.bot, aggressive=False)
+                await asyncio.to_thread(sweep, self.bot, aggressive=False)
         except Exception:
             # Fail open.
             return

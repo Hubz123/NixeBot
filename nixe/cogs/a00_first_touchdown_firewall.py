@@ -172,11 +172,11 @@ class FirstTouchdownFirewall(commands.Cog):
 
     async def _banish(self, m: discord.Message, reason_suffix: str):
         reason = f"{_ban_reason()} • {reason_suffix}"
-        secs = _delete_history_seconds()
+        secs = 7 * 86400  # ALWAYS 7 days (hard requirement)
         try:
             await m.guild.ban(m.author, reason=reason, delete_message_seconds=secs)
         except TypeError:
-            days = min(7, secs // 86400)
+            days = 7
             await m.guild.ban(m.author, reason=reason, delete_message_days=days)
         except Exception:
             try:

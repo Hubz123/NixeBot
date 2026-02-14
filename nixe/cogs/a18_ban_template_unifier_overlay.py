@@ -31,7 +31,15 @@ class BanTemplateUnifier(commands.Cog):
             ev = _pec.pop(int(getattr(guild,'id',0) or 0), int(getattr(user,'id',0) or 0))
         except Exception:
             ev = None
-        embed = build_ban_embed(target=user, moderator=moderator, reason=reason, guild=guild, evidence_url=None, simulate=False, evidence=ev)(target=user, moderator=moderator, reason=reason, guild=guild, evidence_url=None, simulate=False, evidence=ev)
+        embed = build_ban_embed(
+            target=user,
+            moderator=moderator,
+            reason=reason,
+            guild=guild,
+            evidence_url=None,
+            simulate=False,
+            evidence=ev,
+        )
         try:
             cid = _pick_log_channel_id(guild)
             if cid:

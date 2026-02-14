@@ -342,7 +342,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
                         try:
                             if bool(int(os.getenv("BAN_ON_FIRST_PHISH","0"))):
                                 if isinstance(message.author, discord.Member):
-                                    await message.author.ban(reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
+                                    try:
+                                        await message.author.ban(delete_message_seconds=7 * 86400, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
+                                    except TypeError:
+                                        await message.author.ban(delete_message_days=7, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
                                     log.warning("[sus-attach] banned user %s for phishing (conf=%.2f)", message.author, conf)
                         except Exception as e:
                             log.warning("[sus-attach] ban failed: %r", e)
@@ -367,7 +370,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
             if has_archive:
                 try:
                     if bool(int(os.getenv("BAN_ON_FIRST_PHISH","0"))) and isinstance(message.author, discord.Member):
-                        await message.author.ban(reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
+                        try:
+                            await message.author.ban(delete_message_seconds=7 * 86400, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
+                        except TypeError:
+                            await message.author.ban(delete_message_days=7, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
                         log.warning("[sus-attach] banned user %s for suspicious archive attachment (score=%s)", message.author, total_score)
                 except Exception as e:
                     log.warning("[sus-attach] archive-ban failed: %r", e)

@@ -63,14 +63,41 @@ async def _groq_gate():
             await asyncio.sleep(wait)
         _GROQ_LAST_CALL = asyncio.get_running_loop().time()
 
-def _groq_mark_429():
-    global _GROQ_COOLDOWN_UNTIL
+def _parse_retry_after(resp: aiohttp.ClientResponse, body_text: str | None) -> float | None:
+    # Prefer header
     try:
-        now = asyncio.get_running_loop().time()
-    except RuntimeError:
-        import time as _t; now = _t.monotonic()
-    cd = max(1, int(PHISH_GROQ_429_COOLDOWN_SEC))
-    _GROQ_COOLDOWN_UNTIL = now + float(cd)
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            return float(ra.strip())
+    except Exception:
+        pass
+    if body_text:
+        # Common Groq message: "Please try again in 28.5s"
+        m = re.search(r"try again in\s*([0-9]+(?:\.[0-9]+)?)s", body_text, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def _groq_mark_429(cooldown_s: float | None = None) -> float:
+    """Mark Groq cooldown window. Returns the applied cooldown seconds."""
+    global _GROQ_COOLDOWN_UNTIL
+    now = asyncio.get_running_loop().time()
+
+    # Default fallback: short pause; hard cap by PHISH_GROQ_429_COOLDOWN_SEC.
+    base = float(cooldown_s) if (cooldown_s is not None and cooldown_s > 0) else 15.0
+
+    # Add small jitter to avoid herd behavior
+    jitter = 0.15 * base
+    base = base + (jitter * (0.5 - (os.urandom(1)[0] / 255.0)))
+
+    cap = float(max(1, PHISH_GROQ_429_COOLDOWN_SEC))
+    applied = max(1.0, min(base, cap))
+    _GROQ_COOLDOWN_UNTIL = now + applied
+    return applied
 
 
 # URL dedupe across messages (avoid rescanning the same CDN URL repeatedly)
@@ -422,11 +449,14 @@ class GroqPhishGuard(commands.Cog):
                             async with sess.post(url, headers=headers, json=payload) as resp:
 
                                 if resp.status == 429:
-
-                                    _groq_mark_429()
-
-                                    log.warning('[phish-groq] 429 rate-limited; cooldown=%ss', PHISH_GROQ_429_COOLDOWN_SEC)
-
+                                    body_txt = None
+                                    try:
+                                        body_txt = await resp.text()
+                                    except Exception:
+                                        body_txt = None
+                                    ra = _parse_retry_after(resp, body_txt)
+                                    applied = _groq_mark_429(ra)
+                                    log.warning('[phish-groq] 429 rate-limited; cooldown=%.0fs%s', applied, (f" retry_after={ra:.1f}s" if ra else ''))
                                     continue
 
                                 data = await resp.json(content_type=None)

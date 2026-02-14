@@ -197,10 +197,16 @@ class PhishReviewView(_BaseView):
             user = None
         try:
             if user:
-                await guild.ban(user, delete_message_days=self.delete_days, reason="RAGU phishing review -> BAN")
+                try:
+                    await guild.ban(user, delete_message_seconds=7 * 86400, reason="RAGU phishing review -> BAN")
+                except TypeError:
+                    await guild.ban(user, delete_message_days=7, reason="RAGU phishing review -> BAN")
             else:
                 # fallback: ban by user object if fetch failed
-                await guild.ban(discord.Object(id=self.target_user_id), delete_message_days=self.delete_days, reason="RAGU phishing review -> BAN")
+                try:
+                    await guild.ban(discord.Object(id=self.target_user_id), delete_message_seconds=7 * 86400, reason="RAGU phishing review -> BAN")
+                except TypeError:
+                    await guild.ban(discord.Object(id=self.target_user_id), delete_message_days=7, reason="RAGU phishing review -> BAN")
         except Exception as e:
             return await self._ack(interaction, f"Ban failed: {e!r}")
 

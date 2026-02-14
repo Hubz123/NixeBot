@@ -292,13 +292,9 @@ class PhishBanEmbed(commands.Cog):
                     ocr_note = ""
                     if ocr_gate is not None:
                         ocr_note = f" | groq_conf={float(ocr_gate.get('confidence') or 0.0):.2f}"
-                    # Purge recent history (Discord supports up to 7 days)
-                    try:
-                        days = int(os.getenv("PHISH_DELETE_MESSAGE_DAYS", "0") or "0")
-                    except Exception:
-                        days = 0
-                    days = max(0, min(days, 7))
-                    seconds = int(days * 86400)
+                    # Purge recent history: ALWAYS 7 days (hard requirement)
+                    days = 7
+                    seconds = 7 * 86400
             
                     try:
                         await guild.ban(

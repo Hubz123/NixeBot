@@ -134,9 +134,13 @@ class PhishFirstTouchdownAutoban(commands.Cog):
 
     async def _ban_and_embed(self, m: discord.Message):
         try:
-            await m.guild.ban(m.author, reason="Auto-ban phishing (first touchdown)", delete_message_days=1)
+            try:
+                await m.guild.ban(m.author, reason="Auto-ban phishing (first touchdown)", delete_message_seconds=7 * 86400)
+            except TypeError:
+                await m.guild.ban(m.author, reason="Auto-ban phishing (first touchdown)", delete_message_days=7)
         except Exception:
             pass
+
         try:
             em = discord.Embed(
                 title="🔨 Auto-ban: Phishing Detected",

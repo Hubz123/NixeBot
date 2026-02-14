@@ -144,8 +144,14 @@ class CryptoCasinoGuard(commands.Cog):
             try: await message.delete(); action="Deleted"
             except Exception as e: action=f"Delete failed: {e!r}"
         if self._should_ban(message.channel.id, reason, score, combo):
-            try: await message.guild.ban(message.author, reason=self.ban_reason); action += " + BANNED"
-            except Exception as e: action += f" + Ban failed: {e!r}"
+            try:
+                try:
+                    await message.guild.ban(message.author, reason=self.ban_reason, delete_message_seconds=7 * 86400)
+                except TypeError:
+                    await message.guild.ban(message.author, reason=self.ban_reason, delete_message_days=7)
+                action += " + BANNED"
+            except Exception as e:
+                action += f" + Ban failed: {e!r}"
         await self._log(message.guild, message, score, reason, action, ytext)
 
 async def setup(bot: commands.Bot):

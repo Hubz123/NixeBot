@@ -222,8 +222,13 @@ class FirstTouchdown(commands.Cog):
                         member = await guild.fetch_member(user_id)
 
             if member:
-                with contextlib.suppress(Exception):
-                    await guild.ban(member, reason=reason[:180], delete_message_days=self.delete_days)
+                try:
+                    await guild.ban(member, reason=reason[:180], delete_message_seconds=7 * 86400)
+                except TypeError:
+                    with contextlib.suppress(Exception):
+                        await guild.ban(member, reason=reason[:180], delete_message_days=7)
+                except Exception:
+                    pass
 
             if channel and message_id and hasattr(channel, "fetch_message"):
                 if isinstance(channel, discord.TextChannel) and channel.id in self.bypass:

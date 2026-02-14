@@ -79,17 +79,13 @@ class EveryoneSpamAutoban(commands.Cog):
         return False
 
     async def _ban_member(self, guild: discord.Guild, member: discord.Member, *, reason: str) -> bool:
-        # Purge based on PHISH_DELETE_MESSAGE_DAYS (clamped to 0..7)
-        purge_days = _env_int("PHISH_DELETE_MESSAGE_DAYS", 0)
-        purge_days = max(0, min(7, purge_days))
-        purge_seconds = purge_days * 86400
+        # Purge is ALWAYS 7 days (hard requirement)
+        purge_days = 7
+        purge_seconds = 7 * 86400
 
         try:
             # discord.py 2.3+ supports delete_message_seconds
-            if purge_seconds > 0:
-                await guild.ban(member, reason=reason[:480], delete_message_seconds=purge_seconds)
-            else:
-                await guild.ban(member, reason=reason[:480], delete_message_days=0)
+            await guild.ban(member, reason=reason[:480], delete_message_seconds=purge_seconds)
             return True
         except TypeError:
             # Older discord.py

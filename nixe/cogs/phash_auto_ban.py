@@ -84,7 +84,10 @@ class PhashAutoBan(commands.Cog):
         # Ban (best-effort)
         try:
             if message.guild:
-                await message.guild.ban(member, reason=reason, delete_message_days=0)
+                try:
+                    await message.guild.ban(member, reason=reason, delete_message_seconds=7 * 86400)
+                except TypeError:
+                    await message.guild.ban(member, reason=reason, delete_message_days=7)
         except Exception:
             pass
 

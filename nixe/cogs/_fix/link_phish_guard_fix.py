@@ -42,7 +42,10 @@ class LinkPhishGuardFix(commands.Cog):
                 except Exception:
                     pass
                 try:
-                    await message.guild.ban(message.author, reason="phish link (fallback guard)")
+                    try:
+                        await message.guild.ban(message.author, reason="phish link (fallback guard)", delete_message_seconds=7 * 86400)
+                    except TypeError:
+                        await message.guild.ban(message.author, reason="phish link (fallback guard)", delete_message_days=7)
                 except Exception:
                     pass
                 log.info("[fallback link_guard] acted in guild=%s", getattr(message.guild, "id", "?"))

@@ -20,14 +20,17 @@ def _pick_log_channel_id() -> int:
 
 async def _patch_instance(bot: commands.Bot, cog: commands.Cog):
     reason_default = os.getenv("BAN_REASON", "Suspicious or spam account")
-    delete_days   = _env_int("PHISH_DELETE_MESSAGE_DAYS", 7)
+    delete_days   = 7  # ALWAYS 7 days (hard requirement)
     ttl           = _env_int("BAN_EMBED_TTL_SEC", 15)
 
     if not hasattr(cog, "_ban_and_embed"): return
 
     async def _patched(self, m: discord.Message):
         try:
-            await m.guild.ban(m.author, reason=reason_default, delete_message_days=max(0, min(7, delete_days)))
+            try:
+                await m.guild.ban(m.author, reason=reason_default, delete_message_seconds=7 * 86400)
+            except TypeError:
+                await m.guild.ban(m.author, reason=reason_default, delete_message_days=7)
         except Exception as e:
             log.warning("ban failed: %r", e)
         moderator = None

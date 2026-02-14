@@ -13,7 +13,10 @@ class BanCommandsFix(commands.Cog):
     async def banfix(self, ctx: commands.Context, user: discord.User, *, reason: str = "banfix"):
         """Fallback ban command in case slash commands or other flows fail."""
         try:
-            await ctx.guild.ban(user, reason=reason)
+            try:
+                await ctx.guild.ban(user, reason=reason, delete_message_seconds=7 * 86400)
+            except TypeError:
+                await ctx.guild.ban(user, reason=reason, delete_message_days=7)
             await ctx.reply(f"✅ Banned {user} (fallback).")
         except Exception as e:
             await ctx.reply(f"❌ Ban failed: {e}")

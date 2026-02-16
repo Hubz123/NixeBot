@@ -15,6 +15,7 @@ No config changes; reads env only.
 from __future__ import annotations
 
 import re
+import time
 import discord
 from discord.ext import commands
 
@@ -27,6 +28,46 @@ DISCORD_INVITE_RE = re.compile(
     r"https?://(?:www\.)?(?:discord\.gg|discord(?:app)?\.com)/(?:invite/)?([A-Za-z0-9-]{2,64})",
     re.I,
 )
+
+# In-memory spread tracker: (guild_id, user_id, kind) -> list[(ts, channel_id)]
+_SPREAD_TRACK = {}
+
+def _spread_unique_channels(gid: int, uid: int, kind: str, cid: int, window_s: int = 120) -> int:
+    """Return number of unique channels seen for this (gid,uid,kind) within window."""
+    now = time.time()
+    k = (int(gid), int(uid), str(kind))
+    lst = _SPREAD_TRACK.get(k) or []
+    lst = [(t, ch) for (t, ch) in lst if (now - float(t)) <= float(window_s)]
+    lst.append((now, int(cid)))
+    _SPREAD_TRACK[k] = lst[-50:]
+    return len({ch for _, ch in lst})
+
+# NSFW invite bait keywords visible in Discord invite preview embeds/cards
+_NSFW_KWS = re.compile(r"(?i)\b(nsfw|18\+|\+18|adult|porn|sex|hentai|onlyfans)\b|[🔞🍑🍒🍆💦]")
+def _invite_embed_nsfw(m: discord.Message) -> bool:
+    try:
+        for e in (getattr(m, 'embeds', None) or []):
+            parts = []
+            for attr in ('title', 'description'):
+                v = getattr(e, attr, None)
+                if v: parts.append(str(v))
+            try:
+                if e.author and e.author.name: parts.append(str(e.author.name))
+            except Exception:
+                pass
+            try:
+                for f in (getattr(e, 'fields', None) or []):
+                    if getattr(f, 'name', None): parts.append(str(f.name))
+                    if getattr(f, 'value', None): parts.append(str(f.value))
+            except Exception:
+                pass
+            blob = ' '.join(parts)
+            if blob and _NSFW_KWS.search(blob):
+                return True
+    except Exception:
+        return False
+    return False
+
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 
 _PRESET_TEXT = {
@@ -294,14 +335,35 @@ class FirstTouchdownFirewall(commands.Cog):
         if not self._in_scope(cid):
             return
 
-        # High-confidence phishing blast: @everyone + 4 PNGs disguised as WEBP
-        if m.attachments and _mass_blast_disguise(m):
-            await self._banish(m, "mass mention + multi-image disguise")
+        # High-confidence phishing blast:
+        # - @everyone/@here + 4+ image attachments => BAN (purge 7d)
+        # - If the classic PNG<->WEBP disguise is present, annotate the reason for audit.
+        if m.attachments:
+            try:
+                mass_ping = bool(getattr(m, "mention_everyone", False)) or ("@everyone" in (m.content or "")) or ("@here" in (m.content or ""))
+                if mass_ping:
+                    imgs = [a for a in (m.attachments or []) if _is_image_attachment(a)]
+                    if len(imgs) >= 4:
+                        suffix = "mass mention + 4+ image attachments"
+                        if _mass_blast_disguise(m):
+                            suffix += " (png/webp disguise)"
+                        await self._banish(m, suffix)
+                        return
+            except Exception:
+                pass
+
+        # Discord invite phishing (e.g. scam/cheat servers).
+        # Additionally treat NSFW invite preview embeds as a hit (NSFW+18 bait).
+        # Requirement: if this spreads to many channels, it MUST escalate to BAN (purge 7d), even if delete-only is configured.
+        inv_code = self._discord_invite_hit(m.content or "")
+        nsfw_embed = _invite_embed_nsfw(m)
+
+        # Hard policy: NSFW invite bait => BAN immediately (purge 7d). Do not wait for spread.
+        if nsfw_embed:
+            await self._banish(m, "discord invite:nsfw-embed")
             return
 
-        # Discord invite phishing (e.g. scam/cheat servers). Default action is delete-only
-        # unless PHISH_DISCORD_INVITE_BAN_ON_MATCH=1.
-        inv_code = self._discord_invite_hit(m.content or "")
+        # Non-NSFW invites follow existing config gate (delete-only unless PHISH_DISCORD_INVITE_BAN_ON_MATCH=1).
         if inv_code:
             if self.invite_ban:
                 await self._banish(m, f"discord invite:{inv_code}")

@@ -655,3 +655,4 @@ async def classify_lucky_pull_bytes_suspicious(image_bytes: bytes):
     return await _classify_lucky_pull_bytes_suspicious_core(image_bytes)
 
 classify_lucky_pull_bytes_suspicious_raw = _classify_lucky_pull_bytes_suspicious_core
+# patched: single-reveal lucky results handling

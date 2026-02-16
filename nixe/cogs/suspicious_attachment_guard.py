@@ -270,6 +270,51 @@ class SuspiciousAttachmentGuard(commands.Cog):
             # Optional skip: let LPA own these channels
             if self.skip_lpg_guard and self.lpg_guard_channels and str(message.channel.id) in self.lpg_guard_channels:
                 return
+
+            # Hard policy: 4+ attachments is a phishing burst indicator.
+            # - If combined with @everyone/@here => BAN immediately (purge 7d).
+            # - If no mass mention: BAN ONLY if the attachments *look* like phishing (Groq vision confirms).
+            atts = list(getattr(message, "attachments", []) or [])
+            if len(atts) >= 4:
+                try:
+                    mass_ping = bool(getattr(message, "mention_everyone", False)) or ("@everyone" in (message.content or "")) or ("@here" in (message.content or ""))
+                except Exception:
+                    mass_ping = False
+
+                if mass_ping:
+                    try:
+                        if isinstance(message.author, discord.Member):
+                            try:
+                                await message.guild.ban(message.author, delete_message_seconds=7 * 86400, reason="Phishing burst: 4+ attachments + mass mention")
+                            except TypeError:
+                                await message.guild.ban(message.author, delete_message_days=7, reason="Phishing burst: 4+ attachments + mass mention")
+                            log.warning("[sus-attach] HARD-BAN: 4+ attachments + mass mention user=%s msg=%s", message.author, message.id)
+                    except Exception as e:
+                        log.warning("[sus-attach] hard-ban failed: %r", e)
+                    return
+
+                # No mass mention: require phishing-looking confirmation to avoid false bans on normal image dumps.
+                try:
+                    imgs = await self._collect_images(message)
+                    if imgs:
+                        # Tighter timeout for burst checks to keep first-touchdown responsive
+                        timeout_ms = int(min(int(self.gem_timeout or 12000), 8000))
+                        hints = ((message.content or "") + " " + (self.gem_hints or "")).strip()
+                        label, conf = await classify_phish_image(imgs, hints=hints, timeout_ms=timeout_ms)
+                        log.info("[sus-attach] burst-4 groq classify: (%s, %.3f)", label, conf)
+                        if label == "phish" and float(conf or 0.0) >= float(self.gem_thr or 0.85):
+                            try:
+                                if isinstance(message.author, discord.Member):
+                                    try:
+                                        await message.guild.ban(message.author, delete_message_seconds=7 * 86400, reason=f"Phishing burst: 4+ attachments (vision {conf:.2f})")
+                                    except TypeError:
+                                        await message.guild.ban(message.author, delete_message_days=7, reason=f"Phishing burst: 4+ attachments (vision {conf:.2f})")
+                                log.warning("[sus-attach] HARD-BAN: 4+ attachments phish-looking conf=%.2f user=%s msg=%s", float(conf or 0.0), message.author, message.id)
+                            except Exception as e:
+                                log.warning("[sus-attach] burst-ban failed: %r", e)
+                            return
+                except Exception as e:
+                    log.debug("[sus-attach] burst-4 vision check skipped: %r", e)
         except Exception:
             return
 

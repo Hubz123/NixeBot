@@ -3,6 +3,7 @@ import os, re, time, random
 from typing import List, Tuple, Optional, Dict
 import discord
 from discord.ext import commands
+from nixe.helpers import phish_evidence_cache as _pec
 
 def _getenv(name: str, default: str = "") -> str:
     return os.getenv(name, default)
@@ -146,8 +147,16 @@ class CryptoCasinoGuard(commands.Cog):
         if self._should_ban(message.channel.id, reason, score, combo):
             try:
                 try:
+                    try:
+                        _pec.record_message(message, provider="crypto_casino_guard", reason=str(getattr(self, "ban_reason", "")))
+                    except Exception:
+                        pass
                     await message.guild.ban(message.author, reason=self.ban_reason, delete_message_seconds=7 * 86400)
                 except TypeError:
+                    try:
+                        _pec.record_message(message, provider="crypto_casino_guard", reason=str(getattr(self, "ban_reason", "")))
+                    except Exception:
+                        pass
                     await message.guild.ban(message.author, reason=self.ban_reason, delete_message_days=7)
                 action += " + BANNED"
             except Exception as e:

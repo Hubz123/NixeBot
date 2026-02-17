@@ -6,8 +6,15 @@ from typing import Tuple, Optional, List
 import discord
 from discord.ext import commands
 from nixe.shared import bus
+from nixe.helpers import phish_evidence_cache as _pec
 
 log = logging.getLogger("nixe.cogs.suspicious_attachment_guard")  # tag: [sus-attach]
+
+def _record_evidence(message: discord.Message, reason: str) -> None:
+    try:
+        _pec.record_message(message, provider="sus-attach", reason=reason)
+    except Exception:
+        pass
 
 
 def _is_thread_channel(ch) -> bool:
@@ -285,8 +292,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
                     try:
                         if isinstance(message.author, discord.Member):
                             try:
+                                _record_evidence(message, "ban")
                                 await message.guild.ban(message.author, delete_message_seconds=7 * 86400, reason="Phishing burst: 4+ attachments + mass mention")
                             except TypeError:
+                                _record_evidence(message, "ban")
                                 await message.guild.ban(message.author, delete_message_days=7, reason="Phishing burst: 4+ attachments + mass mention")
                             log.warning("[sus-attach] HARD-BAN: 4+ attachments + mass mention user=%s msg=%s", message.author, message.id)
                     except Exception as e:
@@ -306,8 +315,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
                             try:
                                 if isinstance(message.author, discord.Member):
                                     try:
+                                        _record_evidence(message, "ban")
                                         await message.guild.ban(message.author, delete_message_seconds=7 * 86400, reason=f"Phishing burst: 4+ attachments (vision {conf:.2f})")
                                     except TypeError:
+                                        _record_evidence(message, "ban")
                                         await message.guild.ban(message.author, delete_message_days=7, reason=f"Phishing burst: 4+ attachments (vision {conf:.2f})")
                                 log.warning("[sus-attach] HARD-BAN: 4+ attachments phish-looking conf=%.2f user=%s msg=%s", float(conf or 0.0), message.author, message.id)
                             except Exception as e:
@@ -388,8 +399,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
                             if bool(int(os.getenv("BAN_ON_FIRST_PHISH","0"))):
                                 if isinstance(message.author, discord.Member):
                                     try:
+                                        _record_evidence(message, "ban")
                                         await message.author.ban(delete_message_seconds=7 * 86400, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
                                     except TypeError:
+                                        _record_evidence(message, "ban")
                                         await message.author.ban(delete_message_days=7, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
                                     log.warning("[sus-attach] banned user %s for phishing (conf=%.2f)", message.author, conf)
                         except Exception as e:
@@ -416,8 +429,10 @@ class SuspiciousAttachmentGuard(commands.Cog):
                 try:
                     if bool(int(os.getenv("BAN_ON_FIRST_PHISH","0"))) and isinstance(message.author, discord.Member):
                         try:
+                            _record_evidence(message, "ban")
                             await message.author.ban(delete_message_seconds=7 * 86400, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
                         except TypeError:
+                            _record_evidence(message, "ban")
                             await message.author.ban(delete_message_days=7, reason=os.getenv("BAN_REASON","Phishing detected (auto)"))
                         log.warning("[sus-attach] banned user %s for suspicious archive attachment (score=%s)", message.author, total_score)
                 except Exception as e:

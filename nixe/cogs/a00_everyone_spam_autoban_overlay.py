@@ -10,6 +10,7 @@ from typing import Deque, Dict, Tuple
 
 import discord
 from discord.ext import commands
+from nixe.helpers import phish_evidence_cache as _pec
 
 from nixe.helpers.safe_delete import safe_delete
 
@@ -85,11 +86,19 @@ class EveryoneSpamAutoban(commands.Cog):
 
         try:
             # discord.py 2.3+ supports delete_message_seconds
+            try:
+                _pec.record_message(message, provider="everyone_spam_autoban", reason="@everyone spam")
+            except Exception:
+                pass
             await guild.ban(member, reason=reason[:480], delete_message_seconds=purge_seconds)
             return True
         except TypeError:
             # Older discord.py
             try:
+                try:
+                    _pec.record_message(message, provider="everyone_spam_autoban", reason="@everyone spam")
+                except Exception:
+                    pass
                 await guild.ban(member, reason=reason[:480], delete_message_days=purge_days)
                 return True
             except Exception as e:

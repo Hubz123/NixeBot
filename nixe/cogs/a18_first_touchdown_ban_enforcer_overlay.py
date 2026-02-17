@@ -4,6 +4,7 @@ import os, types, asyncio, logging
 import discord
 from discord.ext import commands
 from ..cogs.ban_embed import build_ban_embed
+from nixe.helpers import phish_evidence_cache as _pec
 from ..config_ids import LOG_BOTPHISHING, TESTBAN_CHANNEL_ID
 
 log = logging.getLogger("nixe.cogs.first_touchdown_ban_enforcer")
@@ -28,8 +29,16 @@ async def _patch_instance(bot: commands.Bot, cog: commands.Cog):
     async def _patched(self, m: discord.Message):
         try:
             try:
+                try:
+                    _pec.record_message(m, provider="ban_enforcer", reason=reason_default)
+                except Exception:
+                    pass
                 await m.guild.ban(m.author, reason=reason_default, delete_message_seconds=7 * 86400)
             except TypeError:
+                try:
+                    _pec.record_message(m, provider="ban_enforcer", reason=reason_default)
+                except Exception:
+                    pass
                 await m.guild.ban(m.author, reason=reason_default, delete_message_days=7)
         except Exception as e:
             log.warning("ban failed: %r", e)
@@ -41,7 +50,12 @@ async def _patch_instance(bot: commands.Bot, cog: commands.Cog):
                     break
         except Exception: pass
         try:
-            embed = build_ban_embed(target=m.author, moderator=moderator, reason=reason_default, evidence_url=None, simulate=False)
+            ev = None
+            try:
+                ev = _pec.peek(int(getattr(m.guild,'id',0) or 0), int(getattr(m.author,'id',0) or 0))
+            except Exception:
+                ev = None
+            embed = build_ban_embed(target=m.author, moderator=moderator, reason=reason_default, guild=m.guild, evidence_url=None, simulate=False, evidence=ev)
             cid = _pick_log_channel_id()
             if cid:
                 ch = m.guild.get_channel(cid) or await bot.fetch_channel(cid)

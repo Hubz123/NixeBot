@@ -22,6 +22,7 @@ from discord.ext import commands
 from nixe.helpers.env_reader import get, get_int
 from nixe.helpers.phash_tools import dhash_bytes, hamming
 from nixe.helpers.phash_board import get_blacklist_hashes
+from nixe.helpers import phish_evidence_cache as _pec
 
 URL_RE = re.compile(r"https?://[\w.-]+\.[a-z]{2,}(?:/\S*)?", re.I)
 DISCORD_INVITE_RE = re.compile(
@@ -214,6 +215,10 @@ class FirstTouchdownFirewall(commands.Cog):
     async def _banish(self, m: discord.Message, reason_suffix: str):
         reason = f"{_ban_reason()} • {reason_suffix}"
         secs = 7 * 86400  # ALWAYS 7 days (hard requirement)
+        try:
+            _pec.record_message(m, provider="first_touchdown", reason=reason_suffix)
+        except Exception:
+            pass
         try:
             await m.guild.ban(m.author, reason=reason, delete_message_seconds=secs)
         except TypeError:

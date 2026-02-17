@@ -223,9 +223,17 @@ class FirstTouchdown(commands.Cog):
 
             if member:
                 try:
+                    try:
+                        _pec.record_from_payload(payload, provider="first_touchdown_overlay", reason=str(payload.get("reason") or ""))
+                    except Exception:
+                        pass
                     await guild.ban(member, reason=reason[:180], delete_message_seconds=7 * 86400)
                 except TypeError:
                     with contextlib.suppress(Exception):
+                        try:
+                            _pec.record_from_payload(payload, provider="first_touchdown_overlay", reason=str(payload.get("reason") or ""))
+                        except Exception:
+                            pass
                         await guild.ban(member, reason=reason[:180], delete_message_days=7)
                 except Exception:
                     pass

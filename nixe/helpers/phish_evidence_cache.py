@@ -121,6 +121,8 @@ def record(
     attachments: Optional[List[str]] = None,
     embeds: Optional[List[str]] = None,
     provider: str = "",
+    score: Optional[float] = None,
+    kind: str = "",
     reason: str = "",
 ) -> None:
     """Record best-effort evidence for a (guild_id, user_id) pair."""
@@ -168,11 +170,79 @@ def record(
             "embeds": merged_embs,
             "image_url": _pick_image_url(merged_atts + merged_urls + merged_embs) or prev.get("image_url"),
             "provider": (provider or prev.get("provider") or "")[:48],
+            "score": float(score) if score is not None else prev.get("score"),
+            "kind": (kind or prev.get("kind") or "")[:32],
             "reason": (reason or prev.get("reason") or "")[:160],
         }
     except Exception:
         return
 
+
+
+def record_from_message(message: Any, *, provider: str = "", reason: str = "", score: Optional[float] = None, kind: str = "") -> None:
+    """Best-effort evidence extraction from a discord.Message-like object.
+
+    Captures:
+    - channel_id, message_id, jump_url
+    - snippet (content)
+    - urls in content
+    - attachment urls (filename|url) for readability
+    - embed urls + embed image/thumbnail urls
+    """
+    try:
+        gid = int(getattr(getattr(message, "guild", None), "id", 0) or 0)
+        uid = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+        cid = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        mid = int(getattr(message, "id", 0) or 0)
+        jump = str(getattr(message, "jump_url", "") or "")
+        content = str(getattr(message, "content", "") or "")
+        urls = extract_urls_from_text(content)
+
+        atts: List[str] = []
+        for a in (getattr(message, "attachments", None) or []):
+            try:
+                fn = str(getattr(a, "filename", "") or "")
+                u = str(getattr(a, "url", "") or "")
+                if u:
+                    atts.append(f"{fn}|{u}" if fn else u)
+            except Exception:
+                continue
+
+        embs: List[str] = []
+        for e in (getattr(message, "embeds", None) or []):
+            try:
+                u = str(getattr(e, "url", "") or "")
+                if u:
+                    embs.append(u)
+            except Exception:
+                pass
+            # try image/thumbnail URLs for SS
+            for attr in ("image", "thumbnail"):
+                try:
+                    obj = getattr(e, attr, None)
+                    u2 = str(getattr(obj, "url", "") or "")
+                    if u2:
+                        embs.append(u2)
+                except Exception:
+                    pass
+
+        record(
+            gid,
+            uid,
+            channel_id=cid,
+            message_id=mid,
+            jump_url=jump,
+            snippet=content,
+            urls=urls,
+            attachments=atts,
+            embeds=embs,
+            provider=provider,
+            score=score,
+            kind=kind,
+            reason=reason,
+        )
+    except Exception:
+        return
 
 def record_from_payload(payload: Dict[str, Any], *, provider: str = "", reason: str = "") -> None:
     """Record evidence based on internal event payloads."""

@@ -3,7 +3,7 @@
   "announce_channel_id": 1453036422465585283,
   "poll_seconds": 20,
   "concurrency": 8,
-  "title_whitelist_regex": "#?鳴潮|Wuthering\\s*Waves|WuWa",
+  "title_whitelist_regex": "#?鳴潮|Wuthering\\s*Waves|WuWa|鳴潮|Wuthering*waves",
   "message_template": "Hey, {creator.name} just posted a new video!\n{video.link}",
   "targets": [
     {
@@ -56,6 +56,13 @@
       "url": "https://www.youtube.com/@HizakuraMelia"
     },
     {
+      "name": "Kanae Ch.かなえ",
+      "query": "@kanaeCH_game",
+      "handle": "@kanaeCH_game",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@kanaeCH_game"
+    },
+    {
       "name": "Konbu Ch. 海埜こんぶ",
       "query": "@KonbuCh.海埜こんぶ",
       "handle": "@KonbuCh.海埜こんぶ",
@@ -105,11 +112,39 @@
       "url": "https://www.youtube.com/@chiyono_mero"
     },
     {
+      "name": "MERU Ch. 桜守メル",
+      "query": "@SakuramoriMeru",
+      "handle": "@SakuramoriMeru",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@SakuramoriMeru"
+    },
+    {
+      "name": "Misa ch. 桜樹美彩",
+      "query": "@MisaSakuragi",
+      "handle": "@MisaSakuragi",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@MisaSakuragi"
+    },
+    {
       "name": "Misaki Ch. 氷桜みさき",
       "query": "@Misaki_Hizakura",
       "handle": "@Misaki_Hizakura",
       "channel_id": "",
       "url": "https://www.youtube.com/@Misaki_Hizakura"
+    },
+    {
+      "name": "Mitsu Ch. 甘井みつ",
+      "query": "@MITSU_ch",
+      "handle": "@MITSU_ch",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@MITSU_ch"
+    },
+    {
+      "name": "Miu Ch ぷちみう【推しとのゲームlife】",
+      "query": "@miu_channel_",
+      "handle": "@miu_channel_",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@miu_channel_"
     },
     {
       "name": "Muni Ch. 紅茶むに",
@@ -140,11 +175,25 @@
       "url": "https://www.youtube.com/@PetrPetrichorCH"
     },
     {
+      "name": "Polka Ch. 尾丸ポルカ",
+      "query": "@OmaruPolka",
+      "handle": "@OmaruPolka",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@OmaruPolka"
+    },
+    {
       "name": "Remu Ch. 綺音れむ",
       "query": "@AnonRemu",
       "handle": "@AnonRemu",
       "channel_id": "",
       "url": "https://www.youtube.com/@AnonRemu"
+    },
+    {
+      "name": "Rica Ch. / 花宮莉歌",
+      "query": "@HanamiyaRica",
+      "handle": "@HanamiyaRica",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@HanamiyaRica"
     },
     {
       "name": "Sio ch.  蒼海しお",
@@ -166,6 +215,20 @@
       "handle": "@slnio_same0022",
       "channel_id": "",
       "url": "https://www.youtube.com/@slnio_same0022"
+    },
+    {
+      "name": "Tuki Channel コンヤノツキ",
+      "query": "@konyanotk",
+      "handle": "@konyanotk",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@konyanotk"
+    },
+    {
+      "name": "Yakko Ch.伊奈利やっこ",
+      "query": "@InariYakko",
+      "handle": "@InariYakko",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@InariYakko"
     },
     {
       "name": "Yona Ch. 獅ノ月ヨナ",
@@ -196,6 +259,13 @@
       "url": "https://www.youtube.com/@KonbuCh."
     },
     {
+      "name": "【TA】きなこ",
+      "query": "@きなこ_kina0063",
+      "handle": "@きなこ_kina0063",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@きなこ_kina0063"
+    },
+    {
       "name": "あまのみこ",
       "query": "@AmanoMiko",
       "handle": "@AmanoMiko",
@@ -208,6 +278,13 @@
       "handle": "@あや姉",
       "channel_id": "",
       "url": "https://www.youtube.com/@あや姉"
+    },
+    {
+      "name": "えだまめ おこめ",
+      "query": "@okome_0216",
+      "handle": "@okome_0216",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@okome_0216"
     },
     {
       "name": "くらまたぬ",
@@ -308,6 +385,13 @@
       "url": "https://www.youtube.com/@manmaruch-onigami"
     },
     {
+      "name": "みけねこch",
+      "query": "@mikenekoko",
+      "handle": "@mikenekoko",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@mikenekoko"
+    },
+    {
       "name": "みなせちゃん",
       "query": "@mii7se",
       "handle": "@mii7se",
@@ -350,11 +434,25 @@
       "url": "https://www.youtube.com/@CharlotteLilyVT"
     },
     {
+      "name": "ショコラ",
+      "query": "@shocora",
+      "handle": "@shocora",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@shocora"
+    },
+    {
       "name": "ミリ･ミラー / Mili Mirror",
       "query": "@milimirror",
       "handle": "@milimirror",
       "channel_id": "",
       "url": "https://www.youtube.com/@milimirror"
+    },
+    {
+      "name": "リダ  / Lida",
+      "query": "@Lida-midorin",
+      "handle": "@Lida-midorin",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@Lida-midorin"
     },
     {
       "name": "ルーチェ / Luce",
@@ -441,6 +539,13 @@
       "url": "https://www.youtube.com/@ghostdoll_y"
     },
     {
+      "name": "周/amane ch.",
+      "query": "UCLX50RggXektUK1-x9EaS8w",
+      "handle": "",
+      "channel_id": "UCLX50RggXektUK1-x9EaS8w",
+      "url": "https://www.youtube.com/channel/UCLX50RggXektUK1-x9EaS8w"
+    },
+    {
       "name": "咎神テトラ",
       "query": "@togamitetora",
       "handle": "@togamitetora",
@@ -495,6 +600,13 @@
       "handle": "@amagami_rika",
       "channel_id": "",
       "url": "https://www.youtube.com/@amagami_rika"
+    },
+    {
+      "name": "天月のやりたい放題ちゃんねる。",
+      "query": "@amatsuki_YHch",
+      "handle": "@amatsuki_YHch",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@amatsuki_YHch"
     },
     {
       "name": "天瀬ゅゅ / Amase Yuyu",
@@ -553,6 +665,13 @@
       "url": "https://www.youtube.com/@NHLala"
     },
     {
+      "name": "小幸たい / Tai Koyuki",
+      "query": "@KoyukiTai_ch",
+      "handle": "@KoyukiTai_ch",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@KoyukiTai_ch"
+    },
+    {
       "name": "小毬こまる",
       "query": "@Komari_Komaru",
       "handle": "@Komari_Komaru",
@@ -607,6 +726,13 @@
       "handle": "@konoyami_neko",
       "channel_id": "",
       "url": "https://www.youtube.com/@konoyami_neko"
+    },
+    {
+      "name": "愛猫はにゃ / enomiya hanya",
+      "query": "UCEI8rQTkygS9_hVt-F9F_-g",
+      "handle": "",
+      "channel_id": "UCEI8rQTkygS9_hVt-F9F_-g",
+      "url": "https://www.youtube.com/channel/UCEI8rQTkygS9_hVt-F9F_-g"
     },
     {
       "name": "早乙女ぱおら / Saotome Paola",
@@ -889,6 +1015,13 @@
       "url": "https://www.youtube.com/@nago38nayori"
     },
     {
+      "name": "花芽すみれ / Kaga Sumire",
+      "query": "@KagaSumire",
+      "handle": "@KagaSumire",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@KagaSumire"
+    },
+    {
       "name": "葫白ひな(cohakuhina)⛪🧄Vtuber",
       "query": "@cohakuhina",
       "handle": "@cohakuhina",
@@ -966,6 +1099,13 @@
       "url": "https://www.youtube.com/@yukisaki_yuuka"
     },
     {
+      "name": "雪白みかげ",
+      "query": "@yukishiromkg",
+      "handle": "@yukishiromkg",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@yukishiromkg"
+    },
+    {
       "name": "雪鈴ましろ / mashiro Ch.",
       "query": "@setsureimashiro",
       "handle": "@setsureimashiro",
@@ -985,6 +1125,13 @@
       "handle": "@HinanoShimotsuki",
       "channel_id": "",
       "url": "https://www.youtube.com/@HinanoShimotsuki"
+    },
+    {
+      "name": "音萌ねこ / otomo neco",
+      "query": "@音萌ねこ",
+      "handle": "@音萌ねこ",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@音萌ねこ"
     },
     {
       "name": "鷺原鈴音【SagiharaRinne】",

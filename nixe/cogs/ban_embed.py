@@ -249,3 +249,56 @@ from discord.ext import commands
 class _BanEmbedCog(commands.Cog): ...
 async def setup(bot: commands.Bot):
     await bot.add_cog(_BanEmbedCog(bot))
+
+def build_classification_embed(
+    *,
+    title: str,
+    result: str,
+    score: Optional[float],
+    provider: str,
+    reason: str,
+    message_id: int = 0,
+    channel_display: str = "",
+    jump_url: str = "",
+    image_attachment_name: Optional[str] = None,
+    extra_lines: Optional[list[str]] = None,
+) -> discord.Embed:
+    """Build a classification-style embed (similar layout to LPG classification cards)."""
+    embed = discord.Embed(title=title, color=discord.Color.red())
+    # Top row-like fields
+    embed.add_field(name="Result", value=str(result), inline=True)
+    if score is None:
+        embed.add_field(name="Score", value="—", inline=True)
+    else:
+        try:
+            embed.add_field(name="Score", value=f"{float(score):.3f}", inline=True)
+        except Exception:
+            embed.add_field(name="Score", value=str(score), inline=True)
+    embed.add_field(name="Provider", value=(provider or "—"), inline=True)
+
+    embed.add_field(name="Reason", value=(reason or "—"), inline=False)
+
+    if message_id:
+        embed.add_field(name="Message ID", value=str(int(message_id)), inline=True)
+    if channel_display:
+        embed.add_field(name="Channel", value=channel_display, inline=True)
+
+    if jump_url:
+        embed.add_field(name="Evidence", value=jump_url, inline=False)
+
+    if extra_lines:
+        txt = "\n".join([str(x) for x in extra_lines if str(x).strip()])
+        if txt:
+            if len(txt) > 900:
+                txt = txt[:897] + "…"
+            embed.add_field(name="Indicators", value=txt, inline=False)
+
+    if image_attachment_name:
+        try:
+            embed.set_image(url=f"attachment://{image_attachment_name}")
+        except Exception:
+            pass
+
+    embed.set_footer(text=f"external • {_now_wib_str()}")
+    return embed
+

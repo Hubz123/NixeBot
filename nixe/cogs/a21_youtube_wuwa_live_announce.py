@@ -2394,39 +2394,36 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     _write_json_best_effort(STATE_PATH, self.state)
             except Exception:
                 pass
-if not (vid and title and is_live_now):
-    # Some channels serve a /live page that includes ytInitialPlayerResponse but with
-    # incomplete liveBroadcastDetails (e.g., isLiveNow missing/false) while the watch
-    # page correctly reports live now. Fallback to the canonical watch page before
-    # declaring "not live".
-    cand_vid = vid or self._extract_video_id_fallback(html)
-    if not cand_vid:
-        return None
-    watch_url = f"https://www.youtube.com/watch?v={cand_vid}"
-    watch_html = await self._http_get_text(watch_url)
-    if not watch_html:
-        return None
-    player2 = _extract_yt_var_json(watch_html, 'ytInitialPlayerResponse') or _extract_json_blob(watch_html, _YTIPR_RE)
-    if not player2:
-        return None
-    vid2, title2, is_live_now2, start_ts2, ch_name2 = _yt_live_info(player2)
-    if not (vid2 and title2 and is_live_now2):
-        return None
-    vid, title, is_live_now, start_ts = vid2, title2, is_live_now2, start_ts2
-    # Prefer channel display name from the player response.
-    try:
-        nm0 = (ch_name2 or "").strip()
-        if nm0 and (not nm0.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm0)):
-            t.name = nm0
-            # cache resolved name for stability across restarts
-            res = self.state.setdefault("resolved", {})
-            for kk in [t.channel_id, t.url or t.base_url() or "", t.handle, t.query, t.name]:
-                if kk:
-                    res.setdefault(str(kk), {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url() or "")})
-            _write_json_best_effort(STATE_PATH, self.state)
-    except Exception:
-        pass
-
+            if not (vid and title and is_live_now):
+                # Some channels return an incomplete /live player response where isLiveNow is missing/false
+                # even though the stream is actually live. Fall back to the watch page before giving up.
+                vid_fb = self._extract_video_id_fallback(html)
+                if not vid_fb:
+                    return None
+                watch_url = f"https://www.youtube.com/watch?v={vid_fb}"
+                watch_html = await self._http_get_text(watch_url)
+                if not watch_html:
+                    return None
+                player_fb = _extract_yt_var_json(watch_html, 'ytInitialPlayerResponse') or _extract_json_blob(watch_html, _YTIPR_RE)
+                if not player_fb:
+                    return None
+                vid2, title2, is_live_now2, start_ts2, ch_name2 = _yt_live_info(player_fb)
+                if not (vid2 and title2 and is_live_now2):
+                    return None
+                # Override with authoritative watch-page data
+                vid, title, is_live_now, start_ts = vid2, title2, is_live_now2, start_ts2
+                # Prefer channel display name from watch-page player response.
+                try:
+                    nm0 = (ch_name2 or "").strip()
+                    if nm0 and (not nm0.startswith(("@", "＠"))) and (not _UC_ID_LIKE_RE.match(nm0)):
+                        t.name = nm0
+                        res = self.state.setdefault("resolved", {})
+                        for kk in [t.channel_id, t.url or t.base_url() or "", t.handle, t.query, t.name]:
+                            if kk:
+                                res.setdefault(str(kk), {"channel_id": t.channel_id, "title": t.name, "url": (t.url or t.base_url() or "")})
+                        _write_json_best_effort(STATE_PATH, self.state)
+                except Exception:
+                    pass
         else:
             # Fallback path (NO YouTube API):
             # - Extract a probable live videoId from the /live page HTML.

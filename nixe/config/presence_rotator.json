@@ -1,0 +1,32 @@
+{
+  "default_status": "online",
+  "timezone": "Asia/Jakarta",
+  "schedule": [
+    {
+      "type": "playing",
+      "name": "Wuthering Waves",
+      "duration_minutes": 180
+    },
+    {
+      "type": "playing",
+      "name": "Hoyo is Trash Company",
+      "duration_minutes": 60
+    },
+    {
+      "type": "playing",
+      "name": "Genshit is Trash Game",
+      "duration_minutes": 180
+    },
+    {
+      "type": "playing",
+      "name": "WuWa Numba 1",
+      "duration_minutes": 180
+    },
+    {
+      "type": "playing",
+      "name": "Genshit Fans Have Smoll PP",
+      "duration_minutes": 120
+    }
+  ],
+  "avoid_repeat": true
+}

@@ -100,6 +100,7 @@ except Exception:
 
 # --- discord bot --------------------------------------------------------------
 import discord
+from nixe.helpers.presence_rotator import ensure_rotator_started
 from discord.ext import commands
 
 INTENTS = discord.Intents.default()
@@ -144,6 +145,12 @@ class NixeBot(commands.Bot):
             log.info("🌐 Bot ready as %s (%s)", getattr(me, "name", "?"), getattr(me, "id", "?"))
         except Exception:
             log.info("🌐 Bot ready.")
+
+        # --- presence rotator (auto) ---
+        try:
+            ensure_rotator_started(self)
+        except Exception:
+            pass
 
     async def on_message(self, message: discord.Message):
         # Always forward to command processor, but ignore other bots

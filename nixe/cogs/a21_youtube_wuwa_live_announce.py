@@ -206,7 +206,8 @@ def _env_int(name: str, default: int) -> int:
 # Runtime toggles (runtime_env.json -> os.environ via env overlay)
 # ----------------------------
 ENABLE = os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"
-ANNOUNCE_CHANNEL_ID = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", 1453036422465585283)
+# Do not ship hard-coded IDs; prefer config from Discord watchlist store attachment.
+ANNOUNCE_CHANNEL_ID = _env_int("NIXE_YT_WUWA_ANNOUNCE_CHANNEL_ID", 0)
 POLL_SECONDS = _env_int("NIXE_YT_WUWA_ANNOUNCE_POLL_SECONDS", 20)
 CONCURRENCY = _env_int("NIXE_YT_WUWA_ANNOUNCE_CONCURRENCY", 8)
 NOTIFY_ROLE_ID = _env_int("NIXE_YT_WUWA_NOTIFY_ROLE_ID", 0)
@@ -250,10 +251,11 @@ YOUTUBE_API_KEY = ""  # hard-disabled: do not use YouTube API
 WATCHLIST_PATH = (os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json")
 STATE_PATH = (os.getenv("NIXE_YT_WUWA_STATE_PATH", "data/youtube_wuwa_state.json").strip() or "data/youtube_wuwa_state.json")
 
-# Watchlist via Discord thread (optional, but enabled by default when parent channel id is set)
-WATCHLIST_PARENT_CHANNEL_ID = _env_int("NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID", 1431178130155896882)
+# Watchlist via Discord thread (enabled when either thread id or parent channel id is configured).
+# IMPORTANT: do NOT ship hard-coded IDs. These vary per guild.
+WATCHLIST_PARENT_CHANNEL_ID = _env_int("NIXE_YT_WUWA_WATCHLIST_PARENT_CHANNEL_ID", 0)
 WATCHLIST_THREAD_NAME = os.getenv("NIXE_YT_WUWA_WATCHLIST_THREAD_NAME", "YT_WATCHLIST").strip() or "YT_WATCHLIST"
-WATCHLIST_THREAD_ID_OVERRIDE = _env_int("NIXE_YT_WUWA_WATCHLIST_THREAD_ID", 1453571893062926428)
+WATCHLIST_THREAD_ID_OVERRIDE = _env_int("NIXE_YT_WUWA_WATCHLIST_THREAD_ID", 0)
 WATCHLIST_THREAD_SCAN_LIMIT = _env_int("NIXE_YT_WUWA_WATCHLIST_THREAD_SCAN_LIMIT", 200)
 
 # Watchlist thread store message (keeps thread clean)
@@ -267,7 +269,9 @@ WATCHLIST_STORE_MAX_HISTORY_SCAN = _env_int("NIXE_YT_WUWA_WATCHLIST_STORE_MAX_HI
 ENV_REGEX_OVERRIDE = os.getenv("NIXE_YT_WUWA_TITLE_REGEX", "").strip()
 ENV_TEMPLATE_OVERRIDE = os.getenv("NIXE_YT_WUWA_MESSAGE_TEMPLATE", "").strip()
 
-DEFAULT_TITLE_REGEX = r"(?:#\s*)?(?:鳴潮|鸣潮)|Wuthering\s*Waves|WuWa|Wuwa|wuwa"
+# Default allow-list: tolerate bracketed prefixes like "【鳴潮】" / "[#鳴潮]" and spacing variants.
+# Note: we also normalize titles (strip common brackets + NFKC) before matching.
+DEFAULT_TITLE_REGEX = r"(?:[\[【(（]\s*#?\s*)?(?:鳴\s*潮|鸣\s*潮|Wuthering\s*Waves|WuWa)(?:\s*[】\](）)])?"
 DEFAULT_MESSAGE_TEMPLATE = "Hey, {creator.name} just posted a new video!\n{video.link}"
 
 # Normalize titles (brackets, fullwidth chars) to reduce regex misses.
@@ -582,6 +586,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
         self.watchlist_thread_id: int = 0
         self.watchlist_thread: Optional[discord.Thread] = None
+
+        # Announce channel id should follow the watchlist config (Discord thread store attachment).
+        # Fall back to env/default constant only if config is missing.
+        self.announce_channel_id: int = int(ANNOUNCE_CHANNEL_ID)
 
 
         # Pre-seed thread id so on_message can work even before _ensure_watchlist_thread() runs.
@@ -915,6 +923,12 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
     def _reload_watchlist(self):
         cfg = _read_json_any(WATCHLIST_PATH) or {}
         self.watch = cfg
+
+        # Thread store config is the source of truth for the announce channel.
+        try:
+            self.announce_channel_id = int(cfg.get("announce_channel_id") or ANNOUNCE_CHANNEL_ID)
+        except Exception:
+            self.announce_channel_id = int(ANNOUNCE_CHANNEL_ID)
 
         rx_str = (ENV_REGEX_OVERRIDE or cfg.get("title_whitelist_regex") or DEFAULT_TITLE_REGEX).strip()
         tpl = (ENV_TEMPLATE_OVERRIDE or cfg.get("message_template") or DEFAULT_MESSAGE_TEMPLATE)
@@ -1796,6 +1810,31 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             return None
         except Exception:
             return None
+
+    async def _pull_watchlist_from_thread_store(self) -> None:
+        """Refresh local watchlist JSON from the Discord thread attachment.
+
+        The Discord thread attachment is the source of truth (edits are done in Discord, not GitHub).
+        This method best-effort pulls the canonical JSON into WATCHLIST_PATH so the rest of the cog
+        can keep using the file-based loader without drifting.
+        """
+        try:
+            now = asyncio.get_running_loop().time()
+        except Exception:
+            now = 0.0
+        last = float(getattr(self, "_last_watchlist_store_pull_ts", 0.0) or 0.0)
+        # Avoid hammering Discord; once per poll tick is enough.
+        if now and last and (now - last) < max(5.0, float(POLL_SECONDS) * 0.9):
+            return
+        setattr(self, "_last_watchlist_store_pull_ts", now or last)
+
+        th = await self._ensure_watchlist_thread()
+        if not th:
+            return
+        cfg = await self._load_watchlist_from_store_attachment(th)
+        if not isinstance(cfg, dict) or not cfg:
+            return
+        _write_json_best_effort(WATCHLIST_PATH, cfg)
 
     async def _find_or_create_watchlist_store_message(self, th: discord.Thread) -> Optional[discord.Message]:
         if not th:
@@ -2853,7 +2892,13 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
 
     @tasks.loop(seconds=POLL_SECONDS)
     async def loop(self):
-        # Allow live edits to JSON
+        # Source of truth: Discord thread attachment. Pull it so edits in Discord take effect.
+        try:
+            await self._pull_watchlist_from_thread_store()
+        except Exception:
+            pass
+
+        # Reload from disk (also allows local hot-edits if present)
         try:
             self._reload_watchlist()
         except Exception:
@@ -2862,10 +2907,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         if not (os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"):
             return
 
-        ch = self.bot.get_channel(ANNOUNCE_CHANNEL_ID)
+        ch = self.bot.get_channel(self.announce_channel_id)
         if not isinstance(ch, discord.TextChannel):
             try:
-                ch = await self.bot.fetch_channel(ANNOUNCE_CHANNEL_ID)
+                ch = await self.bot.fetch_channel(self.announce_channel_id)
             except Exception:
                 return
         if not isinstance(ch, discord.TextChannel):
@@ -3044,10 +3089,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # One-time startup cleanup: remove duplicate announce messages already present (best-effort).
         try:
             if (os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1") and (not getattr(self, "_dedupe_sweep_done", False)):
-                ch = self.bot.get_channel(ANNOUNCE_CHANNEL_ID)
+                ch = self.bot.get_channel(self.announce_channel_id)
                 if not isinstance(ch, discord.TextChannel):
                     try:
-                        ch = await self.bot.fetch_channel(ANNOUNCE_CHANNEL_ID)
+                        ch = await self.bot.fetch_channel(self.announce_channel_id)
                     except Exception:
                         ch = None
                 if isinstance(ch, discord.TextChannel):

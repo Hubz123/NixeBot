@@ -42,6 +42,13 @@
       "url": "https://www.youtube.com/@fal_mika"
     },
     {
+      "name": "Gum Ch. 爽田がむ",
+      "query": "@soda_gumchi",
+      "handle": "@soda_gumchi",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@soda_gumchi"
+    },
+    {
       "name": "guruminn",
       "query": "@guruminndesu",
       "handle": "@guruminndesu",
@@ -82,6 +89,13 @@
       "handle": "@lulebel",
       "channel_id": "",
       "url": "https://www.youtube.com/@lulebel"
+    },
+    {
+      "name": "Luna Ch. 姫森ルーナ",
+      "query": "@HimemoriLuna",
+      "handle": "@HimemoriLuna",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@HimemoriLuna"
     },
     {
       "name": "Lunon ch. 月奏あず",
@@ -826,11 +840,25 @@
       "url": "https://www.youtube.com/@kanzakiaruuu"
     },
     {
+      "name": "比翼みおり / Hiyoku Miori",
+      "query": "@HiyokuMiori",
+      "handle": "@HiyokuMiori",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@HiyokuMiori"
+    },
+    {
       "name": "汐音りさ【Sion Risa】",
       "query": "@sion_risa",
       "handle": "@sion_risa",
       "channel_id": "",
       "url": "https://www.youtube.com/@sion_risa"
+    },
+    {
+      "name": "浮幽楽れむ〈Vtuber〉",
+      "query": "@FuyuraRem",
+      "handle": "@FuyuraRem",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@FuyuraRem"
     },
     {
       "name": "涼花みなせ / Suzuka Minase",
@@ -936,6 +964,13 @@
       "handle": "@ShirakumoRavi",
       "channel_id": "",
       "url": "https://www.youtube.com/@ShirakumoRavi"
+    },
+    {
+      "name": "百鬼夜行 / Hyakkiyako",
+      "query": "@hyakkiyako1953",
+      "handle": "@hyakkiyako1953",
+      "channel_id": "",
+      "url": "https://www.youtube.com/@hyakkiyako1953"
     },
     {
       "name": "碧海りん",

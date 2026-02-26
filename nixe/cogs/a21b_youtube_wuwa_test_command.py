@@ -21,7 +21,8 @@ log = logging.getLogger("nixe.cogs.a21b_youtube_wuwa_test_command")
 # Reuse the same defaults as the live announcer for consistent preview output.
 WATCHLIST_PATH = os.getenv("NIXE_YT_WUWA_WATCHLIST_PATH", "data/youtube_wuwa_watchlist.json").strip() or "data/youtube_wuwa_watchlist.json"
 TITLE_REGEX = (os.getenv("NIXE_YT_WUWA_TITLE_REGEX", "") or "").strip()
-DEFAULT_TITLE_REGEX = r"#?鳴潮|Wuthering\s*Waves|WuWa"
+# Keep consistent with a21: tolerate bracketed prefixes + spacing variants.
+DEFAULT_TITLE_REGEX = r"(?:[\[【(（]\s*#?\s*)?(?:鳴\s*潮|鸣\s*潮|Wuthering\s*Waves|WuWa)(?:\s*[】\](）)])?"
 
 ENV_TEMPLATE_OVERRIDE = os.getenv("NIXE_YT_WUWA_MESSAGE_TEMPLATE", "").strip()
 DEFAULT_MESSAGE_TEMPLATE = "Hey, {creator.name} just posted a new video!\n{video.link}"

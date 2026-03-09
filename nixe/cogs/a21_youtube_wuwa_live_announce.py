@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import hashlib
 import logging
 import os
 import pathlib
@@ -350,15 +351,25 @@ USER_AGENT = "Mozilla/5.0 (compatible; NixeBot/1.0; +https://github.com/Hubz123/
 # Helpers: safe JSON IO with multiple fallback paths
 # ----------------------------
 def _candidate_paths(p: str) -> List[str]:
+    """Return candidate JSON paths with repo-local targets preferred over cwd-relative paths.
+
+    This bot is often started from a launcher / service where cwd may not be the repo root.
+    Prefer the file inside this extracted repo first so watchlist/state writes stay in the
+    active bot folder (e.g. b2/data/...). Keep the legacy relative path as a final fallback.
+    """
     base = pathlib.Path(__file__).resolve().parents[2]  # repo root-ish (nixe/..)
-    cands = [p]
-    # common fallbacks in this repo
-    cands += [
-        str(base / p),
-        str(base / "data" / pathlib.Path(p).name),
-        str(base / "nixe" / "data" / pathlib.Path(p).name),
-    ]
-    # de-dup
+    raw = pathlib.Path(p)
+    cands: List[str] = []
+    if raw.is_absolute():
+        cands.append(str(raw))
+    else:
+        cands += [
+            str(base / p),
+            str(base / "data" / raw.name),
+            str(base / "nixe" / "data" / raw.name),
+            p,
+        ]
+    # de-dup while preserving order
     out: List[str] = []
     for x in cands:
         if x and x not in out:
@@ -386,6 +397,26 @@ def _write_json_best_effort(p: str, data: Dict[str, Any]) -> None:
             return
         except Exception:
             continue
+
+def _watchlist_cfg_digest(cfg: Optional[Dict[str, Any]]) -> str:
+    """Stable digest for canonical watchlist payload comparisons."""
+    try:
+        src = cfg if isinstance(cfg, dict) else {}
+        slim = {
+            "targets": list(src.get("targets") or []),
+            "enabled": src.get("enabled"),
+            "poll_seconds": src.get("poll_seconds"),
+            "concurrency": src.get("concurrency"),
+            "announce_channel_id": src.get("announce_channel_id"),
+            "announce_native_embed": src.get("announce_native_embed"),
+        }
+        raw = json.dumps(slim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+    except Exception:
+        return ""
+
+def _is_canonical_watchlist_store_marker(text: str) -> bool:
+    return ((text or "").strip() == WATCHLIST_STORE_MARKER)
 
 # ----------------------------
 # YouTube parsing
@@ -606,6 +637,8 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         self.template: str = DEFAULT_MESSAGE_TEMPLATE
 
         self._reload_watchlist()
+        self._watchlist_local_dirty_until: float = 0.0
+        self._last_watchlist_store_digest: str = ""
         self._loop_started = False
         self._dedupe_sweep_done = False
         # Announce de-dupe cache: warm from announce channel history once per boot so restarts
@@ -1750,15 +1783,17 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             if mid:
                 try:
                     msg = await th.fetch_message(mid)
+                    if not (msg and msg.author and self.bot.user and msg.author.id == self.bot.user.id and _is_canonical_watchlist_store_marker(msg.content or "")):
+                        msg = None
                 except Exception:
                     msg = None
 
-            # Fallback: scan recent messages for the marker
+            # Fallback: scan recent messages for the canonical marker
             if msg is None:
                 async for m in th.history(limit=max(20, WATCHLIST_STORE_MAX_HISTORY_SCAN), oldest_first=False):
                     if not m or not (m.author and self.bot.user and m.author.id == self.bot.user.id):
                         continue
-                    if (m.content or "").strip().startswith(WATCHLIST_STORE_MARKER):
+                    if _is_canonical_watchlist_store_marker(m.content or ""):
                         msg = m
                         self.state["watchlist_store_mid"] = m.id
                         _write_json_best_effort(STATE_PATH, self.state)
@@ -1775,6 +1810,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                         raw = await a.read()
                         obj = json.loads(raw.decode("utf-8", errors="replace"))
                         if isinstance(obj, dict):
+                            self._last_watchlist_store_digest = _watchlist_cfg_digest(obj)
                             return obj
                 except Exception:
                     continue
@@ -1826,6 +1862,10 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         # Avoid hammering Discord; once per poll tick is enough.
         if now and last and (now - last) < max(5.0, float(POLL_SECONDS) * 0.9):
             return
+        # Local ingest/save just happened; do not immediately overwrite it with a stale thread store.
+        dirty_until = float(getattr(self, "_watchlist_local_dirty_until", 0.0) or 0.0)
+        if now and dirty_until and now < dirty_until:
+            return
         setattr(self, "_last_watchlist_store_pull_ts", now or last)
 
         th = await self._ensure_watchlist_thread()
@@ -1834,7 +1874,14 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         cfg = await self._load_watchlist_from_store_attachment(th)
         if not isinstance(cfg, dict) or not cfg:
             return
+        local_cfg = _read_json_any(WATCHLIST_PATH) or {}
+        remote_digest = _watchlist_cfg_digest(cfg)
+        local_digest = _watchlist_cfg_digest(local_cfg)
+        if remote_digest and remote_digest == local_digest:
+            self._last_watchlist_store_digest = remote_digest
+            return
         _write_json_best_effort(WATCHLIST_PATH, cfg)
+        self._last_watchlist_store_digest = remote_digest
 
     async def _find_or_create_watchlist_store_message(self, th: discord.Thread) -> Optional[discord.Message]:
         if not th:
@@ -1844,19 +1891,19 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         if mid:
             try:
                 m = await th.fetch_message(mid)
-                if m and m.author and self.bot.user and m.author.id == self.bot.user.id:
+                if m and m.author and self.bot.user and m.author.id == self.bot.user.id and _is_canonical_watchlist_store_marker(m.content or ""):
                     return m
             except Exception:
                 pass
 
-        # Scan recent messages for marker
+        # Scan recent messages for the canonical marker only.
         try:
             async for m in th.history(limit=WATCHLIST_STORE_MAX_HISTORY_SCAN, oldest_first=False):
                 if not m:
                     continue
                 if not (m.author and self.bot.user and m.author.id == self.bot.user.id):
                     continue
-                if (m.content or "").strip().startswith(WATCHLIST_STORE_MARKER):
+                if _is_canonical_watchlist_store_marker(m.content or ""):
                     self.state["watchlist_store_mid"] = m.id
                     _write_json_best_effort(STATE_PATH, self.state)
                     return m
@@ -1952,17 +1999,40 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             except Exception:
                 pass
 
+            desired_digest = _watchlist_cfg_digest(cfg_out)
+            current_cfg: Optional[Dict[str, Any]] = None
+            try:
+                current_cfg = await self._load_watchlist_from_store_attachment(th)
+            except Exception:
+                current_cfg = None
+            current_digest = _watchlist_cfg_digest(current_cfg)
+
+            # If attachment payload is already current, do not create/swap store messages again.
+            if current_digest and desired_digest and current_digest == desired_digest:
+                try:
+                    await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, view=view, allowed_mentions=discord.AllowedMentions.none())
+                except Exception:
+                    pass
+                self._last_watchlist_store_digest = desired_digest
+                self.state["watchlist_store_mid"] = store.id
+                _write_json_best_effort(STATE_PATH, self.state)
+                return
+
             payload = self._build_watchlist_attachment_bytes(cfg_out)
             fp = io.BytesIO(payload)
             file = discord.File(fp=fp, filename=WATCHLIST_STORE_ATTACHMENT_NAME)
 
             try:
-                # discord.py 2.x supports replacing attachments via Message.edit(attachments=[...])
+                # discord.py 2.x may support replacing attachments via Message.edit(attachments=[...]).
                 await store.edit(content=WATCHLIST_STORE_MARKER, embed=emb, view=view, attachments=[file], allowed_mentions=discord.AllowedMentions.none())
-            except TypeError:
-                # Fallback: cannot edit attachments; create a new store message (do NOT delete the old one).
+                self._last_watchlist_store_digest = desired_digest
+                self.state["watchlist_store_mid"] = store.id
+                _write_json_best_effort(STATE_PATH, self.state)
+            except Exception:
+                # Fallback: cannot replace the attachment in-place; create one new canonical store message.
                 m2 = await th.send(WATCHLIST_STORE_MARKER, embed=emb, view=view, file=file, allowed_mentions=discord.AllowedMentions.none())
                 self.state["watchlist_store_mid"] = m2.id
+                self._last_watchlist_store_digest = desired_digest
                 _write_json_best_effort(STATE_PATH, self.state)
 
                 # Archive the previous store message in-place (keep it for safety; never delete thread history).
@@ -2185,6 +2255,14 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
         cfg["targets"] = merged
 
         _write_json_best_effort(WATCHLIST_PATH, cfg)
+        try:
+            loop_now = asyncio.get_running_loop().time()
+            self._watchlist_local_dirty_until = max(
+                float(getattr(self, "_watchlist_local_dirty_until", 0.0) or 0.0),
+                loop_now + max(15.0, float(POLL_SECONDS) * 3.0),
+            )
+        except Exception:
+            pass
         self._reload_watchlist()
         return added, added_items
     @commands.Cog.listener()
@@ -2261,6 +2339,20 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 await self._enrich_watchlist_names(added_items_all)
                 log.info("[yt-wuwa] watchlist ingest: +%d targets: %s (thread=%s)",
                          added_total, self._summarize_targets(added_items_all), self.watchlist_thread_id)
+                # Immediate live-check for newly-added targets so already-live channels broadcast
+                # right after ingest instead of waiting for the next poll tick.
+                try:
+                    just_added_targets: List[Target] = []
+                    for item in added_items_all:
+                        rt = await self._runtime_target_from_cfg(item)
+                        if rt:
+                            just_added_targets.append(rt)
+                    if just_added_targets:
+                        announced_now = await self._check_and_announce_targets_once(just_added_targets, source="ingest")
+                        if announced_now > 0:
+                            log.info("[yt-wuwa] ingest immediate announce: %s live target(s)", announced_now)
+                except Exception as e:
+                    log.warning("[yt-wuwa] ingest immediate live-check failed: %r", e)
 
             # Always refresh store embed and keep the thread clean
             try:
@@ -2890,91 +2982,60 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
             raise
 
 
-    @tasks.loop(seconds=POLL_SECONDS)
-    async def loop(self):
-        # Source of truth: Discord thread attachment. Pull it so edits in Discord take effect.
-        try:
-            await self._pull_watchlist_from_thread_store()
-        except Exception:
-            pass
+    async def _runtime_target_from_cfg(self, t: Any) -> Optional[Target]:
+        if not isinstance(t, dict):
+            return None
 
-        # Reload from disk (also allows local hot-edits if present)
-        try:
-            self._reload_watchlist()
-        except Exception:
-            pass
+        name = str(t.get("name") or t.get("channel_name") or "").strip()
+        handle = str(t.get("handle") or "").strip()
+        channel_id = str(t.get("channel_id") or "").strip()
+        url = str(t.get("url") or "").strip()
 
-        if not (os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"):
-            return
+        if name.startswith("@"):
+            name = name[1:].strip()
+        if not name:
+            name = ""
+        if not name and not handle and not channel_id and not url:
+            return None
 
+        url = self._canonicalize_youtube_channel_url(url) if url else ""
+        query = str(t.get("query") or handle or channel_id or name).strip()
+        if not query:
+            query = handle or channel_id or url or name
+        if not query:
+            return None
+
+        return Target(
+            name=name,
+            query=query,
+            handle=handle,
+            channel_id=channel_id,
+            url=url,
+        )
+
+    async def _resolve_announce_channel(self) -> Optional[discord.TextChannel]:
         ch = self.bot.get_channel(self.announce_channel_id)
         if not isinstance(ch, discord.TextChannel):
             try:
                 ch = await self.bot.fetch_channel(self.announce_channel_id)
             except Exception:
-                return
+                ch = None
         if not isinstance(ch, discord.TextChannel):
-            return
+            return None
+        return ch
 
-        # Run checks with per-target timeout and a hard loop deadline to avoid multi-minute stalls.
+    async def _maybe_announce_live_result(
+        self,
+        ch: discord.TextChannel,
+        res: Optional[Tuple[Target, str, str, Optional[datetime], str]],
+        *,
+        source: str = "poll",
+    ) -> bool:
+        if not res or isinstance(res, Exception):
+            return False
 
-        async def _run_one(tt):
-
-            try:
-
-                timeout = CHECK_TIMEOUT_SECONDS
-
-                return await asyncio.wait_for(self._check_live(tt), timeout=timeout)
-            except Exception as e:
-
-                if DEBUG:
-
-                    try:
-
-                        q = getattr(tt, "query", None) if isinstance(tt, dict) else 'unknown'
-
-                    except Exception:
-
-                        q = 'unknown'
-
-                    log.info('[yt-wuwa] check timeout/err for %s: %r', q, e)
-
-                return None
-
-
-        tasks_list = [asyncio.create_task(_run_one(t)) for t in list(self.targets)]
-
-        deadline = LOOP_DEADLINE_SECONDS
-
-        done, pending = await asyncio.wait(tasks_list, timeout=deadline)
-        for p in pending:
-
-            p.cancel()
-
-
-        results = []
-
-        for d in done:
-
-            if d.cancelled():
-
-                continue
-
-            try:
-
-                r = d.result()
-
-            except Exception:
-
-                continue
-
-            if r:
-
-                results.append(r)
-
-        for res in results:
-            if not res or isinstance(res, Exception):
-                continue
+        t: Optional[Target] = None
+        try:
             t, vid, title, start_ts, creator_name = res
 
             # Build stable keys to avoid duplicate posts when resolution improves (query->channel_id).
@@ -2993,7 +3054,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                 # keep keys aligned to the vid to prevent future re-announce with a new key
                 for k in keys:
                     ann_map[k] = vid
-                continue
+                return False
 
             now = datetime.now(timezone.utc)
 
@@ -3012,7 +3073,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     _write_json_best_effort(STATE_PATH, self.state)
                     age_min = int((now - start_ts).total_seconds() // 60)
                     log.info("[yt-wuwa] suppress old-live after boot: %s vid=%s age_min=%s", t.name, vid, age_min)
-                    continue
+                    return False
 
             # Optional: suppress "too old" lives even without restarts (0 disables)
             if ANNOUNCE_MAX_AGE_MINUTES > 0 and start_ts is not None:
@@ -3023,7 +3084,7 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                     _write_json_best_effort(STATE_PATH, self.state)
                     age_min = int((now - start_ts).total_seconds() // 60)
                     log.info("[yt-wuwa] suppress stale-live: %s vid=%s age_min=%s", t.name, vid, age_min)
-                    continue
+                    return False
 
             # Cross-instance de-dupe: if another instance already announced this video_id, align local state and skip.
             try:
@@ -3035,51 +3096,121 @@ class YouTubeWuWaLiveAnnouncer(commands.Cog):
                         ann_map[k] = vid
                     ann_vids[vid_s] = int(datetime.now(timezone.utc).timestamp())
                     _write_json_best_effort(STATE_PATH, self.state)
-                    continue
+                    return False
+            except Exception:
+                pass
+
+            if not creator_name:
+                log.warning("[yt-wuwa] cannot resolve channel display name (target=%s vid=%s). Set NIXE_YT_WUWA_YT_API_KEY (YouTube API v3) or set an explicit display name in watchlist.", getattr(t, "name", "unknown"), vid)
+                return False
+
+            # In-flight de-dupe: prevents double-post if multiple loop instances race on the same video_id.
+            vid_s = str(vid)
+            try:
+                async with _ANNOUNCE_LOCK:
+                    if vid_s in _INFLIGHT_VIDS:
+                        return False
+                    _INFLIGHT_VIDS.add(vid_s)
             except Exception:
                 pass
 
             try:
-                if not creator_name:
-                    log.warning("[yt-wuwa] cannot resolve channel display name (target=%s vid=%s). Set NIXE_YT_WUWA_YT_API_KEY (YouTube API v3) or set an explicit display name in watchlist.", getattr(t, "name", "unknown"), vid)
-                    continue
-                # In-flight de-dupe: prevents double-post if multiple loop instances race on the same video_id.
-                vid_s = str(vid)
+                await self._post(ch, creator_name, title, vid)
+            finally:
                 try:
                     async with _ANNOUNCE_LOCK:
-                        if vid_s in _INFLIGHT_VIDS:
-                            continue
-                        _INFLIGHT_VIDS.add(vid_s)
+                        _INFLIGHT_VIDS.discard(vid_s)
                 except Exception:
                     pass
 
+            # write to all keys to prevent key-change dupes after restart/resolve
+            ann_map = self.state.setdefault("announced", {})
+            ann_vids = self.state.setdefault("announced_vids", {})
+            for k in keys:
+                ann_map[k] = vid
+            ann_vids[str(vid)] = int(datetime.now(timezone.utc).timestamp())
+            _write_json_best_effort(STATE_PATH, self.state)
+            delay_min = None
+            if start_ts is not None:
                 try:
-                    await self._post(ch, creator_name, title, vid)
-                finally:
-                    try:
-                        async with _ANNOUNCE_LOCK:
-                            _INFLIGHT_VIDS.discard(vid_s)
-                    except Exception:
-                        pass
-                # write to all keys to prevent key-change dupes after restart/resolve
-                ann_map = self.state.setdefault("announced", {})
-                ann_vids = self.state.setdefault("announced_vids", {})
-                for k in keys:
-                    ann_map[k] = vid
-                ann_vids[str(vid)] = int(datetime.now(timezone.utc).timestamp())
-                _write_json_best_effort(STATE_PATH, self.state)
-                delay_min = None
-                if start_ts is not None:
-                    try:
-                        delay_min = int((now - start_ts).total_seconds() // 60)
-                    except Exception:
-                        delay_min = None
-                if delay_min is None:
-                    log.info("[yt-wuwa] announced live: %s vid=%s", t.name, vid)
-                else:
-                    log.info("[yt-wuwa] announced live: %s vid=%s delay_min=%s", t.name, vid, delay_min)
+                    delay_min = int((now - start_ts).total_seconds() // 60)
+                except Exception:
+                    delay_min = None
+            if delay_min is None:
+                log.info("[yt-wuwa] announced live: %s vid=%s source=%s", t.name, vid, source)
+            else:
+                log.info("[yt-wuwa] announced live: %s vid=%s delay_min=%s source=%s", t.name, vid, delay_min, source)
+            return True
+        except Exception as e:
+            log.warning("[yt-wuwa] post failed (%s): %r", getattr(t, "name", "unknown"), e)
+            return False
+
+    async def _check_and_announce_targets_once(self, targets: List[Target], *, source: str = "poll") -> int:
+        if not (os.getenv("NIXE_YT_WUWA_ANNOUNCE_ENABLE", "0").strip() == "1"):
+            return 0
+
+        ch = await self._resolve_announce_channel()
+        if not isinstance(ch, discord.TextChannel):
+            return 0
+
+        items = [t for t in list(targets or []) if isinstance(t, Target)]
+        if not items:
+            return 0
+
+        try:
+            await self._ensure_session()
+        except Exception:
+            pass
+
+        async def _run_one(tt: Target):
+            try:
+                timeout = CHECK_TIMEOUT_SECONDS
+                return await asyncio.wait_for(self._check_live(tt), timeout=timeout)
             except Exception as e:
-                log.warning("[yt-wuwa] post failed (%s): %r", t.name, e)
+                if DEBUG:
+                    try:
+                        q = getattr(tt, "query", None) or "unknown"
+                    except Exception:
+                        q = "unknown"
+                    log.info('[yt-wuwa] check timeout/err for %s: %r', q, e)
+                return None
+
+        tasks_list = [asyncio.create_task(_run_one(t)) for t in items]
+        deadline = LOOP_DEADLINE_SECONDS
+        done, pending = await asyncio.wait(tasks_list, timeout=deadline)
+        for p in pending:
+            p.cancel()
+
+        announced = 0
+        for d in done:
+            if d.cancelled():
+                continue
+            try:
+                r = d.result()
+            except Exception:
+                continue
+            if await self._maybe_announce_live_result(ch, r, source=source):
+                announced += 1
+        return announced
+
+    @tasks.loop(seconds=POLL_SECONDS)
+    async def loop(self):
+        # Source of truth: Discord thread attachment. Pull it so edits in Discord take effect.
+        try:
+            await self._pull_watchlist_from_thread_store()
+        except Exception:
+            pass
+
+        # Reload from disk (also allows local hot-edits if present)
+        try:
+            self._reload_watchlist()
+        except Exception:
+            pass
+
+        try:
+            await self._check_and_announce_targets_once(list(self.targets), source="poll")
+        except Exception:
+            pass
 
     @loop.before_loop
     async def before_loop(self):
